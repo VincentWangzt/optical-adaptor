@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-from optical_agent.token_utils import count_tokens
+from optical_adaptor.token_utils import count_tokens
 
 
 class InferenceConfigError(ValueError):

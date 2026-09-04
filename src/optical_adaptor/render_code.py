@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from optical_agent.renderer import RenderConfigError, load_render_config, render_file
+from optical_adaptor.renderer import RenderConfigError, load_render_config, render_file
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,4 +50,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

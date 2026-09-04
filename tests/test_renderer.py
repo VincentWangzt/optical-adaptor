@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from optical_agent.renderer import (
+from optical_adaptor.renderer import (
     Margins,
     OutputConfig,
     PagesConfig,

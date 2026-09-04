@@ -1,4 +1,4 @@
-# Optical Agent
+# Optical Adaptor
 
 This uv project has four commands:
 
@@ -125,7 +125,7 @@ uv run ocr-edit-distance reference.py outputs/result.md
 uv run ocr-edit-distance reference.py outputs/result.md --unit word --json
 ```
 
-The reusable helpers are in [`src/optical_agent/token_utils.py`](src/optical_agent/token_utils.py):
+The reusable helpers are in [`src/optical_adaptor/token_utils.py`](src/optical_adaptor/token_utils.py):
 `count_tokens`, `truncate_to_tokens`, and `count_and_truncate` accept a Hugging Face tokenizer;
 `load_tokenizer` loads one without loading model weights.
 

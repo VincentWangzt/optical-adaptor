@@ -1,4 +1,4 @@
-from optical_agent.edit_distance import evaluate_edit_distance, levenshtein_distance
+from optical_adaptor.edit_distance import evaluate_edit_distance, levenshtein_distance
 
 
 def test_levenshtein_distance() -> None:

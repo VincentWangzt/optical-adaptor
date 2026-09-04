@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from optical_agent.infer_ocr import load_inference_config
+from optical_adaptor.infer_ocr import load_inference_config
 
 
 def test_inference_yaml_has_qwen3_5_4b() -> None:

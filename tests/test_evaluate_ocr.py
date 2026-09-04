@@ -2,8 +2,8 @@ from pathlib import Path
 
 from PIL import Image
 
-from optical_agent.evaluate_ocr import _source_portion
-from optical_agent.infer_ocr import ModelConfig, count_deepseek_image_tokens
+from optical_adaptor.evaluate_ocr import _source_portion
+from optical_adaptor.infer_ocr import ModelConfig, count_deepseek_image_tokens
 
 
 def test_source_portion_uses_inclusive_line_numbers() -> None:

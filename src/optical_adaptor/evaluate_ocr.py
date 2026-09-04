@@ -8,15 +8,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from optical_agent.edit_distance import evaluate_edit_distance
-from optical_agent.infer_ocr import (
+from optical_adaptor.edit_distance import evaluate_edit_distance
+from optical_adaptor.infer_ocr import (
     InferenceConfigError,
     load_inference_config,
     run_ocr_images,
     validate_inference_runtime,
 )
-from optical_agent.renderer import RenderConfigError, load_render_config, render_source
-from optical_agent.token_utils import count_and_truncate, count_tokens, load_tokenizer
+from optical_adaptor.renderer import RenderConfigError, load_render_config, render_source
+from optical_adaptor.token_utils import count_and_truncate, count_tokens, load_tokenizer
 
 
 def _positive_int(value: int, name: str) -> int:

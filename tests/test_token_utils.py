@@ -1,6 +1,6 @@
 import pytest
 
-from optical_agent.token_utils import count_and_truncate, count_tokens, truncate_to_tokens
+from optical_adaptor.token_utils import count_and_truncate, count_tokens, truncate_to_tokens
 
 
 class CharacterTokenizer:

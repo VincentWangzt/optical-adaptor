@@ -1,5 +1,5 @@
 [project]
-name = "optical-agent"
+name = "optical-adaptor"
 version = "0.1.0"
 description = "Render source code as paginated images and run multimodal OCR models."
 readme = "README.md"
@@ -13,10 +13,10 @@ dependencies = [
 ]
 
 [project.scripts]
-render-code = "optical_agent.render_code:main"
-ocr-infer = "optical_agent.infer_ocr:main"
-ocr-edit-distance = "optical_agent.edit_distance:main"
-ocr-evaluate = "optical_agent.evaluate_ocr:main"
+render-code = "optical_adaptor.render_code:main"
+ocr-infer = "optical_adaptor.infer_ocr:main"
+ocr-edit-distance = "optical_adaptor.edit_distance:main"
+ocr-evaluate = "optical_adaptor.evaluate_ocr:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -29,7 +29,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/optical_agent"]
+packages = ["src/optical_adaptor"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
