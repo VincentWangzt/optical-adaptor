@@ -1,0 +1,23 @@
+pages:
+  resolution: [1280, 1280]
+  dpi: 96
+  margins: "1%"
+  background: "#ffffff"
+  max_pages: null
+  start_number: 1
+  draw_page_number: false
+
+text:
+  font: ../assets/fonts/jetbrains-mono/JetBrainsMonoNL-Regular.ttf
+  font_size: 20
+  color: "#111827"
+  line_height: 28
+  line_width: 100
+  tab_width: 4
+  wrap_long_lines: true
+  line_numbers: false
+  encoding: "utf-8"
+
+output:
+  format: PNG
+  filename_pattern: "{stem}-jetbrains-mono-nl-1280-page-{page:03d}.{ext}"

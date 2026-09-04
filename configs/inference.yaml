@@ -1,0 +1,20 @@
+inference:
+  prompt: >-
+    Transcribe all visible text in this image exactly. Preserve line breaks, indentation,
+    punctuation, and code formatting. Return only the transcription without commentary or
+    Markdown fences.
+  dtype: bfloat16
+  max_new_tokens: 8192
+  # Qwen3.5 thinks by default; direct responses are cleaner for OCR.
+  enable_thinking: false
+  gpu: 0
+  enforce_eager: true
+  gpu_memory_utilization: 0.92
+  trust_remote_code: false
+
+models:
+  qwen3.5-4b:
+    backend: qwen
+    model_id: Qwen/Qwen3.5-4B
+    revision: null
+    max_model_len: 32768

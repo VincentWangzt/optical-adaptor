@@ -1,0 +1,44 @@
+[project]
+name = "optical-agent"
+version = "0.1.0"
+description = "Render source code as paginated images and run multimodal OCR models."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=2.0,<3",
+    "pillow>=11.1,<12",
+    "pyyaml>=6.0.2,<7",
+    "transformers==5.16.1",
+    "vllm==0.28.0",
+]
+
+[project.scripts]
+render-code = "optical_agent.render_code:main"
+ocr-infer = "optical_agent.infer_ocr:main"
+ocr-edit-distance = "optical_agent.edit_distance:main"
+ocr-evaluate = "optical_agent.evaluate_ocr:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/optical_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = [".huggingface", ".venv-*", "outputs"]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

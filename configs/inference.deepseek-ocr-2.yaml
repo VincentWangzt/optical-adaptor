@@ -1,0 +1,22 @@
+inference:
+  prompt: |-
+    <image>
+    Free OCR.
+  dtype: bfloat16
+  max_new_tokens: 8192
+  enable_thinking: false
+  gpu: 0
+  enforce_eager: true
+  gpu_memory_utilization: 0.92
+  trust_remote_code: true
+
+models:
+  deepseek-ocr-2:
+    backend: deepseek
+    model_id: deepseek-ai/DeepSeek-OCR-2
+    revision: null
+    base_size: 1024
+    image_size: 768
+    crop_mode: false
+    max_crops: 6
+    max_model_len: 8192
