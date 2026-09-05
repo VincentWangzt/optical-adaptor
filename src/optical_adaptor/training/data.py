@@ -4,9 +4,12 @@ import argparse
 import hashlib
 import html
 import json
+import multiprocessing
+import os
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -229,7 +232,64 @@ def load_manifest(pipeline: Pipeline) -> list[dict]:
     return records
 
 
-def prepare(pipeline: Pipeline) -> None:
+_worker_state = None
+
+
+def initialize_selection_worker(pipeline: Pipeline) -> None:
+    global _worker_state
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    tokenizer = load_tokenizer(
+        pipeline.config.models.qwen_id, revision=pipeline.config.models.qwen_revision
+    )
+    coverage = frozenset().union(
+        *(
+            font_codepoints(path)
+            for path in (pipeline.render.text.font, *pipeline.render.text.fallback_fonts)
+        )
+    )
+    _worker_state = pipeline, tokenizer, coverage
+
+
+def select_candidate(candidate: tuple[str, str, int], split: str):
+    if _worker_state is None:
+        raise RuntimeError("selection worker was not initialized")
+    _, source_path, offset = candidate
+    with Path(source_path).open("rb") as stream:
+        stream.seek(offset)
+        row = json.loads(stream.readline())
+    pipeline, tokenizer, coverage = _worker_state
+    return make_record(row, split, pipeline, tokenizer, coverage)
+
+
+def selected_candidates(pipeline: Pipeline, ordered, split: str, start: int, workers: int):
+    """Bound outstanding work while consuming results in deterministic candidate order."""
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=initialize_selection_worker,
+        initargs=(pipeline,),
+    )
+    pending = deque()
+    submitted = start
+    try:
+        while submitted < min(len(ordered), start + workers * 2):
+            pending.append((submitted, pool.submit(select_candidate, ordered[submitted], split)))
+            submitted += 1
+        while pending:
+            index, future = pending.popleft()
+            yield index, future.result()
+            if submitted < len(ordered):
+                pending.append(
+                    (submitted, pool.submit(select_candidate, ordered[submitted], split))
+                )
+                submitted += 1
+    finally:
+        for _, future in pending:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def prepare(pipeline: Pipeline, workers: int) -> None:
     config = pipeline.config
     load_credentials(pipeline, wandb=False)
     if pipeline.manifest.exists():
@@ -238,13 +298,6 @@ def prepare(pipeline: Pipeline) -> None:
         return
     directory = pipeline.manifest.parent
     directory.mkdir(parents=True, exist_ok=True)
-    tokenizer = load_tokenizer(config.models.qwen_id, revision=config.models.qwen_revision)
-    coverage = frozenset().union(
-        *(
-            font_codepoints(path)
-            for path in (pipeline.render.text.font, *pipeline.render.text.fallback_fonts)
-        )
-    )
     info = HfApi().dataset_info(config.data.dataset_id, revision=config.data.revision)
     files = sorted(
         item.rfilename for item in info.siblings if item.rfilename.endswith("/data.json")
@@ -285,29 +338,27 @@ def prepare(pipeline: Pipeline) -> None:
         seen.update(row["record_id"] for row in chosen)
         ordered = sorted(candidates[split])
         resume_cursor = cursor
-        for cursor in range(resume_cursor, len(ordered)):
+        candidates_iterator = selected_candidates(pipeline, ordered, split, resume_cursor, workers)
+        for index, (record, reason) in candidates_iterator:
             if len(chosen) == config.data.split_sizes[split]:
                 break
-            _, source_path, offset = ordered[cursor]
-            with Path(source_path).open("rb") as stream:
-                stream.seek(offset)
-                row = json.loads(stream.readline())
-            record, reason = make_record(row, split, pipeline, tokenizer, coverage)
+            cursor = index + 1
             counts[reason] += 1
             if record is not None and record["record_id"] not in seen:
                 seen.add(record["record_id"])
                 chosen.append(record)
-            if (cursor + 1) % 250 == 0:
+            if cursor % 250 == 0:
                 write_json(
                     partial,
                     {
                         "fingerprint": pipeline.data_fingerprint,
                         "records": chosen,
                         "counts": dict(counts),
-                        "cursor": cursor + 1,
+                        "cursor": cursor,
                     },
                 )
-                print(f"{split}: selected={len(chosen)} scanned={cursor + 1}", flush=True)
+                print(f"{split}: selected={len(chosen)} scanned={cursor}", flush=True)
+        candidates_iterator.close()
         write_json(
             partial,
             {
@@ -372,8 +423,11 @@ def prepare(pipeline: Pipeline) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare deterministic optical-adapter manifests")
     parser.add_argument("--config", type=Path, default=Path("configs/training.yaml"))
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
-    prepare(load_pipeline(args.config))
+    if args.workers < 1:
+        raise ValueError("workers must be positive")
+    prepare(load_pipeline(args.config), args.workers)
 
 
 if __name__ == "__main__":
