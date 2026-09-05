@@ -34,6 +34,10 @@ geometry, offsets, configuration, split integrity, cache corruption, first/last
 prediction alignment, full-vocabulary FP32 KL, metric-only continuation CE, chunked
 gradients, independent task permutations, and partial-update coverage.
 
+A subsequent focused generation-reporting test also passed. It verifies summed
+edit-count weighting across ranks and strata, duplicate detection, and complete
+reaggregation from saved prediction files without repeating generation.
+
 The two-process CPU validation compares accumulated gradients directly with a
 single-process reference before AdamW normalization, using unequal reconstruction
 lengths. It also verifies exact checkpoint replay and RNG restoration.

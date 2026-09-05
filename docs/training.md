@@ -153,6 +153,8 @@ server. Authentication errors never silently switch to offline logging.
 
 Measured checks, profile results, and overfit gates are recorded in
 [training-validation.md](training-validation.md).
+Experiment measurements and completion audits are recorded in
+[training-results.md](training-results.md).
 
 ```bash
 uv run --locked pytest
