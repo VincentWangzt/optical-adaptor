@@ -10,6 +10,7 @@ from transformers import AutoConfig, AutoProcessor, Qwen3_5ForConditionalGenerat
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
 from optical_adaptor.renderer import render_pages
+from optical_adaptor.training.config import fingerprint, write_json
 
 
 class NativeQwen:
@@ -52,6 +53,26 @@ class NativeQwen:
         image_ids = processed["input_ids"][0].tolist()
         if image_ids[0] != self.qwen.vision_start or image_ids[-1] != self.qwen.vision_end:
             raise ValueError("unexpected native image placeholder template")
+        metadata = {
+            "fingerprint": fingerprint(
+                {"data": self.pipeline.data_fingerprint, "record": record["record_hash"]}
+            ),
+            "record_id": record["record_id"],
+            "image_grid_thw": processed["image_grid_thw"].tolist(),
+            "visual_tokens": len(image_ids) - 2,
+        }
+        metadata_path = (
+            self.pipeline.output
+            / "references"
+            / "native"
+            / "inputs"
+            / f"{record['record_id']}.json"
+        )
+        if metadata_path.exists():
+            if json.loads(metadata_path.read_text()) != metadata:
+                raise ValueError("native processor geometry changed for a reference record")
+        else:
+            write_json(metadata_path, metadata)
         if task == "continuation":
             ids = record["prefix_ids"] + image_ids
             target = record["continuation_ids"]

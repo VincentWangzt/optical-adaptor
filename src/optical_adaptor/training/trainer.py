@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import time
+from importlib.metadata import version
 from pathlib import Path
 
 import torch
@@ -91,6 +92,9 @@ def runtime_identity(pipeline: Pipeline, kind: str, world_size: int) -> dict:
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "accelerate": accelerate.__version__,
+        "fla_core": version("fla-core"),
+        "flash_linear_attention": version("flash-linear-attention"),
+        "triton": version("triton"),
     }
 
 

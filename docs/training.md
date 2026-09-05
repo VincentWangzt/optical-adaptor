@@ -70,6 +70,9 @@ CE and token accuracy. Losses use FP32 log probabilities and reductions; the fro
 model computation uses BF16. Chunked vocabulary projection and non-reentrant
 checkpointing bound memory. Only the adapter is wrapped in DDP and checkpointed as
 a trainable model. One gradient synchronization and optimizer step occur per update.
+The pinned FLA package supplies Qwen's linear-attention kernels; model loading fails
+if Transformers selects its slow PyTorch fallback. Torch, Transformers, and vLLM
+versions remain unchanged. Kernel versions participate in profile and resume identities.
 
 Profile each candidate separately so an out-of-memory failure cannot leave another
 candidate with a damaged CUDA/DDP process. Use the same commands for
@@ -129,7 +132,8 @@ CUDA_VISIBLE_DEVICES=8 uv run --locked evaluate-adapter \
 
 References are fingerprinted, evaluated once, and reused across experiments. Native
 Qwen uses its official image processor and spatial positions on the same rendered
-images; its actual visual-token count is used for compression metrics. Adapter
+images; its actual grid and visual-token count are recorded under
+`references/native/inputs/` and used for compression metrics. Adapter
 embeddings use sequential pseudo-language positions instead of a native spatial grid.
 The final checkpoint is the primary result; evaluation metrics do not select a best
 checkpoint. These repeatedly inspected sets are evaluation sets, not held-out tests.

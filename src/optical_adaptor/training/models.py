@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 from pathlib import Path
@@ -11,6 +12,19 @@ from torch import nn
 from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
 
 from optical_adaptor.training.config import AdapterConfig, AdapterKind, Pipeline
+
+
+def qwen_kernel_identity() -> dict[str, str]:
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    kernels = {}
+    for name in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule"):
+        selected = inspect.getclosurevars(getattr(modeling_qwen3_5, name)).nonlocals
+        implementation = selected["implementation"].__module__
+        if not selected["is_new_implementation"] or not implementation.startswith("fla."):
+            raise RuntimeError(f"Qwen requires the locked FLA kernel for {name}")
+        kernels[name] = implementation
+    return kernels
 
 
 class MLPAdapter(nn.Module):
@@ -73,6 +87,7 @@ def build_adapter(kind: AdapterKind, config: AdapterConfig) -> nn.Module:
 class FrozenQwen:
     def __init__(self, pipeline: Pipeline, device: torch.device):
         config = pipeline.config.models
+        self.kernels = qwen_kernel_identity()
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.qwen_id, revision=config.qwen_revision
