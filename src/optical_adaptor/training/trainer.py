@@ -95,6 +95,7 @@ def runtime_identity(pipeline: Pipeline, kind: str, world_size: int) -> dict:
         "fla_core": version("fla-core"),
         "flash_linear_attention": version("flash-linear-attention"),
         "triton": version("triton"),
+        "nccl_p2p_disable": os.environ.get("NCCL_P2P_DISABLE", "0"),
     }
 
 
@@ -263,6 +264,11 @@ def train_main(kind: AdapterKind) -> None:
             torch.cuda.synchronize()
             elapsed = torch.tensor(time.perf_counter() - start, device=accelerator.device)
             elapsed = accelerator.gather(elapsed).max().item()
+            if accelerator.is_main_process:
+                print(
+                    f"profile microbatch={microbatch} update={index + 1} seconds={elapsed:.3f}",
+                    flush=True,
+                )
             if index >= config.training.profile_warmup_updates:
                 timings.append(elapsed)
         peak = (
