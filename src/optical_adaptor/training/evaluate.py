@@ -174,6 +174,72 @@ def reference_identity(pipeline, reference: str, *, generation: bool) -> str:
     )
 
 
+def generation_totals(predictions: list[dict], records_by_id: dict[str, dict]) -> dict:
+    totals = defaultdict(lambda: torch.zeros(7, dtype=torch.float64))
+    seen = set()
+    for prediction in predictions:
+        record_id = prediction["record_id"]
+        if record_id in seen:
+            raise ValueError(f"duplicate generation record: {record_id}")
+        seen.add(record_id)
+        values = torch.tensor(
+            [
+                1,
+                prediction["character_distance"],
+                prediction["characters"],
+                prediction["word_distance"],
+                prediction["words"],
+                prediction["exact_match"],
+                prediction["truncated"],
+            ],
+            dtype=torch.float64,
+        )
+        for stratum in strata(records_by_id[record_id]):
+            totals[stratum] += values
+    return {key: value.tolist() for key, value in totals.items()}
+
+
+def generation_metrics(parts: list[dict]) -> dict[str, float]:
+    merged = defaultdict(lambda: torch.zeros(7, dtype=torch.float64))
+    for part in parts:
+        for key, values in part.items():
+            merged[key] += torch.tensor(values, dtype=torch.float64)
+    result = {}
+    for group, values in merged.items():
+        count, cd, chars, wd, words, exact, truncated = values.tolist()
+        if count <= 0:
+            raise ValueError("generation groups must contain records")
+        prefix = f"{group}/" if group else ""
+        result.update(
+            {
+                f"{prefix}records": count,
+                f"{prefix}character_edit_distance": cd / count,
+                f"{prefix}cer": cd / max(chars, 1),
+                f"{prefix}word_edit_distance": wd / count,
+                f"{prefix}wer": wd / max(words, 1),
+                f"{prefix}exact_match": exact / count,
+                f"{prefix}truncation_rate": truncated / count,
+            }
+        )
+    return result
+
+
+def refresh_generation_metrics(pipeline, records, output_dir: Path, step: int, *, final: bool):
+    """Reaggregate saved server-side predictions without repeating generation."""
+    chosen = reconstruction_records(pipeline, records, final=final)
+    by_id = {row["record_id"]: row for row in chosen}
+    predictions = []
+    for path in sorted(output_dir.glob(f"predictions-{step:06d}-rank-*.json")):
+        predictions.extend(json.loads(path.read_text()))
+    if {row["record_id"] for row in predictions} != set(by_id):
+        raise ValueError("saved generation records do not match the evaluation subset")
+    metrics = generation_metrics([generation_totals(predictions, by_id)])
+    if metrics["records"] != len(chosen):
+        raise ValueError("saved generation record count mismatch")
+    write_json(output_dir / f"generation-{step:06d}.json", metrics)
+    return metrics
+
+
 @torch.no_grad()
 def greedy_adapters(pipeline, qwen, adapter, cache, records) -> list[tuple[str, bool]]:
     visual = cache.batch(records, "encoder", qwen.device)
@@ -261,33 +327,10 @@ def generate_reconstructions(
         Path(output_dir) / f"predictions-{step:06d}-rank-{accelerator.process_index}.json", local
     )
     # Predictions stay local; distributed reduction exchanges only aggregate statistics.
-    sums = torch.tensor(
-        [
-            len(local),
-            sum(row["character_distance"] for row in local),
-            sum(row["characters"] for row in local),
-            sum(row["word_distance"] for row in local),
-            sum(row["words"] for row in local),
-            sum(row["exact_match"] for row in local),
-            sum(row["truncated"] for row in local),
-        ],
-        device=accelerator.device,
-        dtype=torch.float64,
-    )
-    count, cd, chars, wd, words, exact, truncated = accelerator.reduce(
-        sums, reduction="sum"
-    ).tolist()
-    if count != len(chosen):
+    totals = generation_totals(local, {row["record_id"]: row for row in chosen})
+    result = generation_metrics(gather_object([totals]))
+    if result["records"] != len(chosen):
         raise RuntimeError("generation evaluation record count mismatch")
-    result = {
-        "records": count,
-        "character_edit_distance": cd / count,
-        "cer": cd / max(chars, 1),
-        "word_edit_distance": wd / count,
-        "wer": wd / max(words, 1),
-        "exact_match": exact / count,
-        "truncation_rate": truncated / count,
-    }
     if accelerator.is_main_process:
         write_json(Path(output_dir) / f"generation-{step:06d}.json", result)
     return result
