@@ -149,3 +149,7 @@ Upstream references:
 - <https://huggingface.co/deepseek-ai/DeepSeek-OCR>
 - <https://huggingface.co/deepseek-ai/DeepSeek-OCR-2>
 - <https://docs.vllm.ai/en/stable/models/supported_models/>
+
+## Adapter training
+
+The Accelerate/DDP training pipeline, frozen caches, and evaluation commands are documented in [docs/training.md](docs/training.md). Its canonical configuration is [configs/training.yaml](configs/training.yaml).
