@@ -50,7 +50,7 @@ training:
   keep_periodic: 3
 evaluation:
   batch_size: 4
-  generation_batch_size: 4
+  generation_batch_size: 16
   every: 100
   generation_every: 500
   generation_subset: 50

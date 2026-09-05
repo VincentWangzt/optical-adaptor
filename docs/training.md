@@ -117,8 +117,9 @@ The final checkpoint and latest three periodic checkpoints are retained.
 
 Teacher-forced evaluation runs at initialization, every 100 updates, and completion.
 Greedy reconstruction uses a fixed 50-record subset every 500 updates and all 500
-records at completion, with a 4,096-token generation cap. Four examples are batched
-by default for evaluation and generation. Metrics are token-weighted and stratified
+records at completion, with a 4,096-token generation cap. Teacher-forced evaluation
+batches four records; generation batches 16 records per rank, grouped by target
+length after selecting the fixed evaluation subset. Metrics are token-weighted and stratified
 by language, aspect ratio, logical lines, and display lines. Generation reports
 character/word edit distance, CER/WER, exact match, and truncation rate. Edit distance
 is exact unit-cost Levenshtein, using RapidFuzz through the existing metric helper.
@@ -149,6 +150,11 @@ uv run --locked pytest
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 uv run --locked python -m torch.distributed.run \
   --standalone --nproc_per_node=2 tests/test_training_distributed.py \
   --output outputs/validation/ddp
+
+CUDA_VISIBLE_DEVICES=8,9 uv run --locked accelerate launch \
+  --multi_gpu --num_processes 2 --mixed_precision bf16 \
+  --num_cpu_threads_per_process 4 --main_process_port 29571 \
+  tests/test_training_gpu_resume.py --output outputs/validation/gpu-resume
 ```
 
 Focused tests cover canonicalization, render geometry, configuration, repository

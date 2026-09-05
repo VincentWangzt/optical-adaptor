@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from importlib.metadata import version
 from pathlib import Path
 
 import torch
@@ -167,6 +168,7 @@ def reference_identity(pipeline, reference: str, *, generation: bool) -> str:
             "evaluation": pipeline.config.evaluation.model_dump(),
             "reference": reference,
             "generation": generation,
+            "runtime": {name: version(name) for name in ("torch", "transformers", "fla-core")},
         }
     )
 
@@ -223,7 +225,10 @@ def generate_reconstructions(
         adapter.eval()
     chosen = reconstruction_records(pipeline, records, final=final)
     local = []
-    assigned = chosen[accelerator.process_index :: accelerator.num_processes]
+    assigned = sorted(
+        chosen[accelerator.process_index :: accelerator.num_processes],
+        key=lambda row: (len(row["visual_ids"]), row["record_id"]),
+    )
     for start in range(0, len(assigned), pipeline.config.evaluation.generation_batch_size):
         batch = assigned[start : start + pipeline.config.evaluation.generation_batch_size]
         with accelerator.autocast():
