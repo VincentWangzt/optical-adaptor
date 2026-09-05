@@ -20,6 +20,7 @@ dependencies = [
     "fonttools>=4.60,<5",
     "pydantic>=2.11,<3",
     "rapidfuzz>=3.14,<4",
+    "flash-linear-attention==0.5.2",
 ]
 
 [project.scripts]
