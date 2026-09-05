@@ -182,6 +182,8 @@ def train_main(kind: AdapterKind) -> None:
         "--stop-after", type=int, help="save and exit after this update for resume validation"
     )
     args = parser.parse_args()
+    if args.max_updates < 1 or (args.stop_after is not None and args.stop_after < 1):
+        raise ValueError("update limits must be positive")
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
         raise RuntimeError("select idle GPUs explicitly with CUDA_VISIBLE_DEVICES")
     pipeline = load_pipeline(args.config)
@@ -279,7 +281,11 @@ def train_main(kind: AdapterKind) -> None:
     from optical_adaptor.training.evaluate import evaluate_teacher_forced, generate_reconstructions
 
     if args.mode == "overfit":
-        if args.overfit_records < 2 or args.overfit_records % accelerator.num_processes:
+        if (
+            args.overfit_records < 2
+            or args.overfit_records > len(train_records)
+            or args.overfit_records % accelerator.num_processes
+        ):
             raise ValueError("overfit record count must be positive and divisible by world size")
         train_records = train_records[: args.overfit_records]
         total_updates = args.max_updates

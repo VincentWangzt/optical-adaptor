@@ -87,9 +87,9 @@ def evaluate_teacher_forced(
     qwen.model.eval()
     local = defaultdict(lambda: torch.zeros(8, dtype=torch.float64))
     cases = evaluation_cases(records, overfit=overfit)
-    cases = sorted(
-        cases[accelerator.process_index :: accelerator.num_processes], key=lambda case: case[0]
-    )
+    cases = sorted(cases, key=lambda case: case[0])[
+        accelerator.process_index :: accelerator.num_processes
+    ]
     cursor = 0
     while cursor < len(cases):
         task = cases[cursor][0]
