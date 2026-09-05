@@ -59,6 +59,8 @@ class AdapterConfig(StrictConfig):
 
 
 class TrainingConfig(StrictConfig):
+    deterministic: Literal[True]
+    cublas_workspace_config: Literal[":4096:8"]
     epochs: PositiveInt
     global_pairs: PositiveInt
     lr: PositiveFloat

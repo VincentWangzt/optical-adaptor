@@ -31,6 +31,14 @@ from optical_adaptor.training.objectives import mean_metrics, task_loss
 from optical_adaptor.training.sampling import TaskWindow, epoch_windows
 
 
+def configure_training_runtime(pipeline: Pipeline) -> None:
+    config = pipeline.config.training
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
+    torch.use_deterministic_algorithms(config.deterministic)
+    torch.backends.cudnn.deterministic = config.deterministic
+    torch.backends.cudnn.benchmark = False
+
+
 def run_update(
     accelerator: Accelerator,
     adapter,
@@ -193,6 +201,7 @@ def train_main(kind: AdapterKind) -> None:
         raise RuntimeError("select idle GPUs explicitly with CUDA_VISIBLE_DEVICES")
     pipeline = load_pipeline(args.config)
     config = pipeline.config
+    configure_training_runtime(pipeline)
     load_credentials(pipeline, wandb=args.mode != "profile")
     accelerator = Accelerator(
         mixed_precision="bf16",

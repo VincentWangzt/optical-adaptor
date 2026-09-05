@@ -73,12 +73,17 @@ a trainable model. One gradient synchronization and optimizer step occur per upd
 The pinned FLA package supplies Qwen's linear-attention kernels; model loading fails
 if Transformers selects its slow PyTorch fallback. Torch, Transformers, and vLLM
 versions remain unchanged. Kernel versions participate in profile and resume identities.
+Deterministic GPU algorithms and the configured cuBLAS workspace make repeated
+backward passes reproducible, including checkpoint replay.
 
 Profile each candidate separately so an out-of-memory failure cannot leave another
 candidate with a damaged CUDA/DDP process. Use the same commands for
 `train_transformer_adapter.py`. Check `nvidia-smi` before each job.
 
 ```bash
+# This server's GPU 8/9 peer-to-peer path hangs during the first NCCL collective.
+# Shared-memory transport works; apply this only to our launch environment.
+export NCCL_P2P_DISABLE=1
 CUDA_VISIBLE_DEVICES=8,9 uv run --locked accelerate launch \
   --multi_gpu --num_processes 2 --mixed_precision bf16 \
   --num_cpu_threads_per_process 4 --main_process_port 29571 \

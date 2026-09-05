@@ -33,6 +33,8 @@ adapter:
   transformer_ffn_dim: 5120
   dropout: 0.0
 training:
+  deterministic: true
+  cublas_workspace_config: ":4096:8"
   epochs: 3
   global_pairs: 32
   lr: 0.0002

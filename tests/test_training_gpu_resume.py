@@ -15,13 +15,15 @@ from optical_adaptor.training.config import load_credentials, load_pipeline, wri
 from optical_adaptor.training.data import load_manifest
 from optical_adaptor.training.models import FrozenQwen, build_adapter
 from optical_adaptor.training.sampling import epoch_windows
-from optical_adaptor.training.trainer import run_update
+from optical_adaptor.training.trainer import configure_training_runtime, run_update
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    pipeline = load_pipeline("configs/training.yaml")
+    configure_training_runtime(pipeline)
     accelerator = Accelerator(
         mixed_precision="bf16",
         step_scheduler_with_optimizer=False,
@@ -31,7 +33,6 @@ def main() -> None:
         raise ValueError("run this validation on two CUDA ranks with Accelerate")
     if args.output.exists():
         raise FileExistsError(args.output)
-    pipeline = load_pipeline("configs/training.yaml")
     load_credentials(pipeline, wandb=False)
     set_seed(pipeline.config.seed)
     records = load_manifest(pipeline)
@@ -97,7 +98,7 @@ def main() -> None:
         "expected_statistics": expected_statistics.tolist(),
         "actual_statistics": actual_statistics.tolist(),
         "weights_max_abs": [
-            float((parameter - expected).abs().max())
+            float((parameter.detach() - expected).abs().max())
             for parameter, expected in zip(adapter.parameters(), expected_weights, strict=True)
         ],
         "moment_relative_l2": [
@@ -113,7 +114,7 @@ def main() -> None:
     error = 0.0
     for parameter, expected in zip(adapter.parameters(), expected_weights, strict=True):
         torch.testing.assert_close(parameter, expected, rtol=0, atol=2e-6)
-        error = max(error, float((parameter - expected).abs().max()))
+        error = max(error, float((parameter.detach() - expected).abs().max()))
     for state, expected in zip(optimizer.state.values(), expected_moments, strict=True):
         assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
         torch.testing.assert_close(state["exp_avg"], expected, rtol=1e-4, atol=1e-7)
