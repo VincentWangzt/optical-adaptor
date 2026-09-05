@@ -77,7 +77,7 @@ def validate_distributed(output: Path):
             window,
             microbatch_size=1,
             chunk_size=2,
-            max_grad_norm=1.0,
+            max_grad_norm=1000.0,
         )
         scheduler.step()
         return statistics
@@ -94,12 +94,19 @@ def validate_distributed(output: Path):
                 hidden, targets, mask, head=qwen.model.lm_head, teacher=teacher, chunk_size=99
             )
             (0.5 * result.loss / getattr(window, f"{task}_tokens")).backward()
-        torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(reference.parameters(), 1000.0)
         reference_optimizer.step()
         reference_scheduler.step()
 
     update(windows[0])
     reference_update(full_windows[0])
+    # Compare gradients themselves: AdamW parameter deltas alone can hide a uniform
+    # scaling bug because its first/second moments normalize that scale away.
+    reference_parameters = dict(reference.named_parameters())
+    for name, value in accelerator.unwrap_model(adapter).named_parameters():
+        torch.testing.assert_close(
+            value.grad, reference_parameters[name].grad, rtol=1e-5, atol=1e-7
+        )
     accelerator.save_state(str(output), safe_serialization=True)
     next_rng = (random.random(), np.random.rand(), torch.rand(4))
     expected_statistics = update(windows[1])
