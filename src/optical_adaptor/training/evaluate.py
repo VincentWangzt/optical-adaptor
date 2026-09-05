@@ -159,6 +159,18 @@ def reconstruction_records(pipeline, records, *, final: bool):
     return ordered if final else ordered[: pipeline.config.evaluation.generation_subset]
 
 
+def reference_identity(pipeline, reference: str, *, generation: bool) -> str:
+    return fingerprint(
+        {
+            "data": pipeline.data_fingerprint,
+            "models": pipeline.config.models.model_dump(),
+            "evaluation": pipeline.config.evaluation.model_dump(),
+            "reference": reference,
+            "generation": generation,
+        }
+    )
+
+
 @torch.no_grad()
 def greedy_adapters(pipeline, qwen, adapter, cache, records) -> list[tuple[str, bool]]:
     visual = cache.batch(records, "encoder", qwen.device)
@@ -291,14 +303,7 @@ def main() -> None:
         raise ValueError("evaluation requires a selected CUDA device")
     records = load_manifest(pipeline)
     cache = TensorCache(pipeline, records)
-    identity = fingerprint(
-        {
-            "data": pipeline.data_fingerprint,
-            "models": pipeline.config.models.model_dump(),
-            "reference": args.reference,
-            "generation": args.generate,
-        }
-    )
+    identity = reference_identity(pipeline, args.reference, generation=args.generate)
     output = (
         args.checkpoint / "evaluation"
         if args.checkpoint
@@ -362,10 +367,24 @@ def main() -> None:
             {key: value.tolist() for key, value in local.items()}, accelerator
         )
     else:
-        metrics = evaluate_teacher_forced(
-            pipeline, qwen, adapter, cache, records, accelerator, native=native
+        precomputed = None
+        partial_path = output / "reconstruction-stage.json"
+        if args.reference == "native" and args.generate and partial_path.exists():
+            precomputed = json.loads(partial_path.read_text())
+            if precomputed["identity"] != identity:
+                raise ValueError("native reconstruction reference fingerprint mismatch")
+        pending_records = (
+            [row for row in records if row["split"] != "reconstruction"]
+            if precomputed is not None
+            else records
         )
-    if args.generate and args.reference != "teacher":
+        metrics = evaluate_teacher_forced(
+            pipeline, qwen, adapter, cache, pending_records, accelerator, native=native
+        )
+        if precomputed is not None:
+            metrics.update(precomputed["metrics"])
+    generation_cached = args.reference == "native" and "generation/records" in metrics
+    if args.generate and args.reference != "teacher" and not generation_cached:
         generation = generate_reconstructions(
             pipeline,
             qwen,
