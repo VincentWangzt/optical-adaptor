@@ -78,13 +78,34 @@ def main() -> None:
         )
 
     update(0)
+    saved_weights = [parameter.detach().clone() for parameter in adapter.parameters()]
+    saved_moments = [state["exp_avg"].clone() for state in optimizer.state.values()]
+    saved_lr = scheduler.get_last_lr()
     accelerator.save_state(str(args.output / "after-one"))
     expected_statistics, expected_c, expected_r = update(1)
     expected_weights = [parameter.detach().clone() for parameter in adapter.parameters()]
     expected_moments = [state["exp_avg"].clone() for state in optimizer.state.values()]
     expected_random = torch.rand(4, device=accelerator.device)
     accelerator.load_state(str(args.output / "after-one"))
+    assert scheduler.get_last_lr() == saved_lr
+    for parameter, saved in zip(adapter.parameters(), saved_weights, strict=True):
+        torch.testing.assert_close(parameter, saved, rtol=0, atol=0)
+    for state, saved in zip(optimizer.state.values(), saved_moments, strict=True):
+        torch.testing.assert_close(state["exp_avg"], saved, rtol=0, atol=0)
     actual_statistics, actual_c, actual_r = update(1)
+    diagnostic = {
+        "expected_statistics": expected_statistics.tolist(),
+        "actual_statistics": actual_statistics.tolist(),
+        "weights_max_abs": [
+            float((parameter - expected).abs().max())
+            for parameter, expected in zip(adapter.parameters(), expected_weights, strict=True)
+        ],
+        "moment_relative_l2": [
+            float((state["exp_avg"] - expected).norm() / expected.norm().clamp_min(1e-12))
+            for state, expected in zip(optimizer.state.values(), expected_moments, strict=True)
+        ],
+    }
+    write_json(args.output / f"diagnostic-{accelerator.process_index}.json", diagnostic)
     assert actual_c == expected_c and actual_r == expected_r
     assert scheduler.last_epoch == 2
     assert all(parameter.dtype == torch.float32 for parameter in adapter.parameters())
