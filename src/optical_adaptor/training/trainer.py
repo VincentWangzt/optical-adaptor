@@ -351,7 +351,6 @@ def train_main(kind: AdapterKind) -> None:
         metadata = json.loads((args.resume / "state.json").read_text())
         if metadata["identity"] != identity_hash:
             raise ValueError("checkpoint data/configuration/runtime/topology mismatch")
-        accelerator.load_state(str(args.resume))
         step, start_epoch, start_update = metadata["step"], metadata["epoch"], metadata["update"]
         wandb_id, initial = metadata["wandb_id"], metadata["initial_metrics"]
     elif (run_dir / "run.json").exists():
@@ -369,6 +368,9 @@ def train_main(kind: AdapterKind) -> None:
             run_dir / "run.json",
             {"identity": identity_hash, "resolved": identity, "wandb_id": wandb_id},
         )
+    if args.resume:
+        # Restore RNG after tracker setup, which may itself consume random state.
+        accelerator.load_state(str(args.resume))
     evaluation_records = train_records if args.mode == "overfit" else records
     if initial is None:
         initial = evaluate_teacher_forced(
