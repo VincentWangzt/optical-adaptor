@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import multiprocessing
 import os
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -74,7 +78,11 @@ def verify_shard(pipeline: Pipeline, kind: str, index: int, records: list[dict])
     return True
 
 
-def build_cache(pipeline: Pipeline, kind: str, batch_size: int) -> None:
+def render_encoder_image(text: str, *, config, image_size: int):
+    return render_pages(text, config=config)[0][0].resize((image_size, image_size))
+
+
+def build_cache(pipeline: Pipeline, kind: str, batch_size: int, workers: int) -> None:
     if kind not in {"encoder", "teacher"} or batch_size < 1:
         raise ValueError("invalid cache kind or batch size")
     if not os.environ.get("CUDA_VISIBLE_DEVICES") or not torch.cuda.is_available():
@@ -90,35 +98,57 @@ def build_cache(pipeline: Pipeline, kind: str, batch_size: int) -> None:
         return
     device = torch.device("cuda:0")
     model = DeepSeekVision(pipeline, device) if kind == "encoder" else FrozenQwen(pipeline, device)
-    for index in pending:
-        rows, values = groups[index], []
-        for start in range(0, len(rows), batch_size):
-            batch = rows[start : start + batch_size]
-            if kind == "encoder":
-                images = [
-                    render_pages(row["visual"], config=pipeline.render)[0][0] for row in batch
-                ]
-                output = model(images)
-            else:
-                output = model.teacher_hidden(batch)
-            if not torch.isfinite(output).all():
-                raise RuntimeError("non-finite cache values")
-            values.append(output.detach().to(device="cpu", dtype=torch.bfloat16))
-        path = shard_path(pipeline, kind, index)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        save_file(
-            {"values": torch.cat(values).contiguous()},
-            str(temporary),
-            metadata={"fingerprint": shard_fingerprint(pipeline, kind, rows)},
-        )
-        temporary.replace(path)
-        write_json(
-            path.with_suffix(".json"),
-            {"fingerprint": shard_fingerprint(pipeline, kind, rows), "sha256": file_sha256(path)},
-        )
-        verify_shard(pipeline, kind, index, rows)
-        print(f"{kind} shard {index + 1}/{len(groups)} complete", flush=True)
+    with contextlib.ExitStack() as stack:
+        pool = None
+        if kind == "encoder":
+            stack.callback(model.close)
+            pool = stack.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+                )
+            )
+        for index in pending:
+            rows, values = groups[index], []
+            rendered = (
+                pool.map(
+                    partial(
+                        render_encoder_image,
+                        config=pipeline.render,
+                        image_size=pipeline.config.models.image_size,
+                    ),
+                    [row["visual"] for row in rows],
+                )
+                if pool is not None
+                else None
+            )
+            for start in range(0, len(rows), batch_size):
+                batch = rows[start : start + batch_size]
+                if kind == "encoder":
+                    images = [next(rendered) for _ in batch]
+                    output = model(images)
+                else:
+                    output = model.teacher_hidden(batch)
+                if not torch.isfinite(output).all():
+                    raise RuntimeError("non-finite cache values")
+                values.append(output.detach().to(device="cpu", dtype=torch.bfloat16))
+            path = shard_path(pipeline, kind, index)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            save_file(
+                {"values": torch.cat(values).contiguous()},
+                str(temporary),
+                metadata={"fingerprint": shard_fingerprint(pipeline, kind, rows)},
+            )
+            temporary.replace(path)
+            write_json(
+                path.with_suffix(".json"),
+                {
+                    "fingerprint": shard_fingerprint(pipeline, kind, rows),
+                    "sha256": file_sha256(path),
+                },
+            )
+            verify_shard(pipeline, kind, index, rows)
+            print(f"{kind} shard {index + 1}/{len(groups)} complete", flush=True)
 
 
 class TensorCache:
@@ -147,8 +177,11 @@ def cache_main(kind: str) -> None:
     parser = argparse.ArgumentParser(description=f"Build verified frozen {kind} cache")
     parser.add_argument("--config", type=Path, default=Path("configs/training.yaml"))
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
-    build_cache(load_pipeline(args.config), kind, args.batch_size)
+    if args.workers < 1:
+        raise ValueError("workers must be positive")
+    build_cache(load_pipeline(args.config), kind, args.batch_size, args.workers)
 
 
 def extract_main() -> None:
