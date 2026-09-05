@@ -392,6 +392,12 @@ def train_main(kind: AdapterKind) -> None:
                     "system/peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
                 }
             )
+            metrics["train/reconstruction/objective"] = float(
+                statistics[1, 0] / window.reconstruction_tokens
+            )
+            metrics["system/pairs_per_second"] = (
+                window.global_pairs / metrics["system/seconds_per_update"]
+            )
             if run:
                 run.log(metrics, step=step)
             if accelerator.is_main_process:
@@ -442,7 +448,8 @@ def train_main(kind: AdapterKind) -> None:
                 if args.mode == "overfit" and accelerator.is_main_process:
                     passed = (
                         evaluation["continuation/kl"] < initial["continuation/kl"]
-                        and evaluation["reconstruction/ce"] < initial["reconstruction/ce"]
+                        and evaluation["reconstruction/objective"]
+                        < initial["reconstruction/objective"]
                     )
                     write_json(
                         run_dir / "gate.json",

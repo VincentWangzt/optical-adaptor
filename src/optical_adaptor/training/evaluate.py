@@ -66,6 +66,8 @@ def aggregate_records(local: dict, accelerator: Accelerator) -> dict[str, float]
         )
         metrics[f"{key}/compression_ratio"] = float(value[6] / value[7])
         metrics[f"{key}/records"] = float(value[7])
+        if not continuation:
+            metrics[f"{key}/objective"] = float(value[0] / (value[5] + value[7]))
     return metrics
 
 
