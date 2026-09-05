@@ -3,30 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 from pathlib import Path
 from typing import Any
 
+from rapidfuzz.distance.Levenshtein import distance
 
-def levenshtein_distance(reference: Sequence[Any], hypothesis: Sequence[Any]) -> int:
-    """Return insertion/deletion/substitution distance using linear memory."""
 
-    if len(reference) < len(hypothesis):
-        reference, hypothesis = hypothesis, reference
-    previous = list(range(len(hypothesis) + 1))
-    for reference_index, reference_item in enumerate(reference, start=1):
-        current = [reference_index]
-        for hypothesis_index, hypothesis_item in enumerate(hypothesis, start=1):
-            current.append(
-                min(
-                    current[-1] + 1,
-                    previous[hypothesis_index] + 1,
-                    previous[hypothesis_index - 1]
-                    + (reference_item != hypothesis_item),
-                )
-            )
-        previous = current
-    return previous[-1]
+def levenshtein_distance(reference: Sequence[Hashable], hypothesis: Sequence[Hashable]) -> int:
+    """Exact unit-cost edit distance, accelerated for full-document evaluation."""
+    return distance(reference, hypothesis, weights=(1, 1, 1), processor=None)
 
 
 def evaluate_edit_distance(reference: str, hypothesis: str, *, unit: str) -> dict[str, Any]:

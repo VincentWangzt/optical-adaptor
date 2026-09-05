@@ -87,43 +87,65 @@ def evaluate_teacher_forced(
     qwen.model.eval()
     local = defaultdict(lambda: torch.zeros(8, dtype=torch.float64))
     cases = evaluation_cases(records, overfit=overfit)
-    for index, (task, record, group) in enumerate(
-        cases[accelerator.process_index :: accelerator.num_processes]
-    ):
+    cases = sorted(
+        cases[accelerator.process_index :: accelerator.num_processes], key=lambda case: case[0]
+    )
+    cursor = 0
+    while cursor < len(cases):
+        task = cases[cursor][0]
+        end = cursor
+        while (
+            end < min(len(cases), cursor + pipeline.config.evaluation.batch_size)
+            and cases[end][0] == task
+        ):
+            end += 1
+        selected = cases[cursor:end]
+        batch = [case[1] for case in selected]
         with accelerator.autocast():
             if native is not None:
-                hidden, targets, text_mask, visual_tokens = native.hidden(record, task)
+                hidden, targets, masks, visual_counts = native.hidden_batch(batch, task)
             else:
-                visual = cache.batch([record], "encoder", accelerator.device)
-                adapted = adapter(visual).to(visual.dtype)
-                hidden, targets, text_mask = qwen.student_hidden([record], adapted, task)
-                visual_tokens = pipeline.config.adapter.sequence_length
+                visual = cache.batch(batch, "encoder", accelerator.device)
+                hidden, targets, masks = qwen.student_hidden(
+                    batch, adapter(visual).to(visual.dtype), task
+                )
+                visual_counts = [pipeline.config.adapter.sequence_length] * len(batch)
             teacher = (
-                cache.batch([record], "teacher", accelerator.device)
+                cache.batch(batch, "teacher", accelerator.device).flatten(0, 1)
                 if task == "continuation"
                 else None
             )
-            result = task_loss(
-                hidden,
-                targets,
-                text_mask,
-                head=qwen.model.lm_head,
-                teacher=teacher,
-                chunk_size=pipeline.config.training.loss_chunk_tokens,
-            )
-        values = torch.cat(
-            [
-                result.statistics.cpu(),
-                torch.tensor(
-                    [record["visual_token_count"] / visual_tokens, 1], dtype=torch.float64
-                ),
-            ]
-        )
-        for stratum in strata(record):
-            key = group + (f"/{stratum}" if stratum else "")
-            local[key] += values
-        if (index + 1) % 100 == 0 and accelerator.is_main_process:
-            print(f"evaluation: {index + 1} local records", flush=True)
+            position = 0
+            for (_, record, group), visual_tokens in zip(selected, visual_counts, strict=True):
+                count = (
+                    len(record["continuation_ids"])
+                    if task == "continuation"
+                    else len(record["visual_ids"]) + 1
+                )
+                stop = position + count
+                result = task_loss(
+                    hidden[position:stop],
+                    targets[position:stop],
+                    masks[position:stop],
+                    head=qwen.model.lm_head,
+                    teacher=teacher[position:stop] if teacher is not None else None,
+                    chunk_size=pipeline.config.training.loss_chunk_tokens,
+                )
+                values = torch.cat(
+                    [
+                        result.statistics.cpu(),
+                        torch.tensor(
+                            [record["visual_token_count"] / visual_tokens, 1], dtype=torch.float64
+                        ),
+                    ]
+                )
+                for stratum in strata(record):
+                    key = group + (f"/{stratum}" if stratum else "")
+                    local[key] += values
+                position = stop
+        if end // 100 != cursor // 100 and accelerator.is_main_process:
+            print(f"evaluation: {end} local records", flush=True)
+        cursor = end
     return aggregate_records({key: value.tolist() for key, value in local.items()}, accelerator)
 
 
@@ -136,14 +158,14 @@ def reconstruction_records(pipeline, records, *, final: bool):
 
 
 @torch.no_grad()
-def greedy_adapter(pipeline, qwen, adapter, cache, record) -> tuple[str, bool]:
-    visual = cache.batch([record], "encoder", qwen.device)
-    adapted = adapter(visual).to(visual.dtype)[0]
-    inputs = torch.cat(
-        [qwen.embed(qwen.reconstruction_before), adapted, qwen.embed(qwen.reconstruction_after)]
-    )[None]
+def greedy_adapters(pipeline, qwen, adapter, cache, records) -> list[tuple[str, bool]]:
+    visual = cache.batch(records, "encoder", qwen.device)
+    adapted = adapter(visual).to(visual.dtype)
+    before = qwen.embed(qwen.reconstruction_before)[None].expand(len(records), -1, -1)
+    after = qwen.embed(qwen.reconstruction_after)[None].expand(len(records), -1, -1)
+    inputs = torch.cat([before, adapted, after], dim=1)
     qwen.model.eval()
-    output = qwen.model.generate(
+    outputs = qwen.model.generate(
         inputs_embeds=inputs,
         attention_mask=torch.ones(inputs.shape[:2], device=qwen.device, dtype=torch.long),
         max_new_tokens=pipeline.config.evaluation.max_new_tokens,
@@ -151,13 +173,21 @@ def greedy_adapter(pipeline, qwen, adapter, cache, record) -> tuple[str, bool]:
         use_cache=True,
         eos_token_id=qwen.assistant_end,
         pad_token_id=qwen.tokenizer.pad_token_id,
-    )[0].tolist()
-    stopped = bool(output and output[-1] == qwen.assistant_end)
-    if stopped:
-        output = output[:-1]
-    return qwen.tokenizer.decode(
-        output, skip_special_tokens=False, clean_up_tokenization_spaces=False
-    ), not stopped
+    ).tolist()
+    results = []
+    for output in outputs:
+        stopped = qwen.assistant_end in output
+        if stopped:
+            output = output[: output.index(qwen.assistant_end)]
+        results.append(
+            (
+                qwen.tokenizer.decode(
+                    output, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                ),
+                not stopped,
+            )
+        )
+    return results
 
 
 @torch.no_grad()
@@ -179,29 +209,34 @@ def generate_reconstructions(
         adapter.eval()
     chosen = reconstruction_records(pipeline, records, final=final)
     local = []
-    for record in chosen[accelerator.process_index :: accelerator.num_processes]:
+    assigned = chosen[accelerator.process_index :: accelerator.num_processes]
+    for start in range(0, len(assigned), pipeline.config.evaluation.generation_batch_size):
+        batch = assigned[start : start + pipeline.config.evaluation.generation_batch_size]
         with accelerator.autocast():
-            prediction, truncated = (
-                native.generate(record)
+            predictions = (
+                native.generate_batch(batch)
                 if native is not None
-                else greedy_adapter(pipeline, qwen, adapter, cache, record)
+                else greedy_adapters(pipeline, qwen, adapter, cache, batch)
             )
-        reference = record["visual"]
-        characters = evaluate_edit_distance(reference, prediction, unit="character")
-        words = evaluate_edit_distance(reference, prediction, unit="word")
-        local.append(
-            {
-                "record_id": record["record_id"],
-                "prediction": prediction,
-                "reference": reference,
-                "truncated": truncated,
-                "character_distance": characters["distance"],
-                "characters": characters["reference_units"],
-                "word_distance": words["distance"],
-                "words": words["reference_units"],
-                "exact_match": prediction == reference,
-            }
-        )
+        for record, (prediction, truncated) in zip(batch, predictions, strict=True):
+            reference = record["visual"]
+            characters = evaluate_edit_distance(reference, prediction, unit="character")
+            words = evaluate_edit_distance(reference, prediction, unit="word")
+            local.append(
+                {
+                    "record_id": record["record_id"],
+                    "prediction": prediction,
+                    "reference": reference,
+                    "truncated": truncated,
+                    "character_distance": characters["distance"],
+                    "characters": characters["reference_units"],
+                    "word_distance": words["distance"],
+                    "words": words["reference_units"],
+                    "exact_match": prediction == reference,
+                }
+            )
+        if accelerator.is_main_process:
+            print(f"generation: {start + len(batch)}/{len(assigned)} local records", flush=True)
     write_json(
         Path(output_dir) / f"predictions-{step:06d}-rank-{accelerator.process_index}.json", local
     )

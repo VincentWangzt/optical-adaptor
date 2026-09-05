@@ -70,37 +70,69 @@ class NativeQwen:
         }
         return values, target, len(image_ids) - 2
 
+    def batch_inputs(self, records, task, *, targets: bool):
+        rows = [self.inputs(record, task, targets=targets) for record in records]
+        lengths = [row[0]["input_ids"].shape[1] for row in rows]
+        side = "right" if targets else "left"
+        ids = torch.nn.utils.rnn.pad_sequence(
+            [row[0]["input_ids"][0] for row in rows],
+            batch_first=True,
+            padding_value=self.qwen.tokenizer.pad_token_id,
+            padding_side=side,
+        )
+        positions = torch.arange(ids.shape[1], device=self.qwen.device)[None]
+        counts = torch.tensor(lengths, device=self.qwen.device)[:, None]
+        mask = positions < counts if targets else positions >= ids.shape[1] - counts
+        values = {
+            "input_ids": ids,
+            "attention_mask": mask.long(),
+            "pixel_values": torch.cat([row[0]["pixel_values"] for row in rows]),
+            "image_grid_thw": torch.cat([row[0]["image_grid_thw"] for row in rows]),
+            "mm_token_type_ids": (ids == self.model.config.image_token_id).long(),
+        }
+        return values, [row[1] for row in rows], [row[2] for row in rows], lengths
+
     @torch.no_grad()
-    def hidden(self, record, task):
-        values, target, visual_tokens = self.inputs(record, task, targets=True)
+    def hidden_batch(self, records, task):
+        values, target_rows, visual_counts, lengths = self.batch_inputs(records, task, targets=True)
         self.model.eval()
-        hidden = self.model.model(**values, use_cache=False).last_hidden_state[0, -len(target) :]
-        mask = [True] * len(target)
-        if task == "reconstruction":
-            mask[-1] = False
+        hidden = self.model.model(**values, use_cache=False).last_hidden_state
+        selected, targets, masks = [], [], []
+        for index, (target, length) in enumerate(zip(target_rows, lengths, strict=True)):
+            selected.append(hidden[index, length - len(target) : length])
+            targets.extend(target)
+            masks.extend([True] * (len(target) - 1) + [task == "continuation"])
         return (
-            hidden,
-            torch.tensor(target, device=self.qwen.device),
-            torch.tensor(mask, device=self.qwen.device),
-            visual_tokens,
+            torch.cat(selected),
+            torch.tensor(targets, device=self.qwen.device),
+            torch.tensor(masks, device=self.qwen.device),
+            visual_counts,
         )
 
     @torch.no_grad()
-    def generate(self, record):
-        values, _, _ = self.inputs(record, "reconstruction", targets=False)
+    def generate_batch(self, records):
+        values, _, _, _ = self.batch_inputs(records, "reconstruction", targets=False)
         prefix_length = values["input_ids"].shape[1]
         self.model.eval()
-        output = self.model.generate(
+        outputs = self.model.generate(
             **values,
             do_sample=False,
             use_cache=True,
             max_new_tokens=self.pipeline.config.evaluation.max_new_tokens,
             eos_token_id=self.qwen.assistant_end,
             pad_token_id=self.qwen.tokenizer.pad_token_id,
-        )[0, prefix_length:].tolist()
-        stopped = bool(output and output[-1] == self.qwen.assistant_end)
-        if stopped:
-            output = output[:-1]
-        return self.qwen.tokenizer.decode(
-            output, skip_special_tokens=False, clean_up_tokenization_spaces=False
-        ), not stopped
+        )[:, prefix_length:].tolist()
+        results = []
+        for output in outputs:
+            stopped = self.qwen.assistant_end in output
+            if stopped:
+                output = output[: output.index(self.qwen.assistant_end)]
+            results.append(
+                (
+                    self.qwen.tokenizer.decode(
+                        output, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                    ),
+                    not stopped,
+                )
+            )
+        return results
