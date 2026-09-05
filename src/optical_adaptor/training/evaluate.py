@@ -163,6 +163,7 @@ def reconstruction_records(pipeline, records, *, final: bool):
 def reference_identity(pipeline, reference: str, *, generation: bool) -> str:
     return fingerprint(
         {
+            "metric_schema": 2,
             "data": pipeline.data_fingerprint,
             "models": pipeline.config.models.model_dump(),
             "evaluation": pipeline.config.evaluation.model_dump(),
@@ -365,7 +366,7 @@ def main() -> None:
                 local[key] += torch.cat(
                     [
                         result.statistics.cpu(),
-                        torch.tensor([row["visual_token_count"] / 111, 1], dtype=torch.float64),
+                        torch.tensor([1, 1], dtype=torch.float64),
                     ]
                 )
         metrics = aggregate_records(
@@ -421,7 +422,10 @@ def main() -> None:
         )
         run.log(metrics)
         run.finish()
-        write_json(output / "complete.json", {"identity": identity, "metrics": metrics})
+        write_json(
+            output / "complete.json",
+            {"identity": identity, "metrics": metrics, "wandb_id": run.id},
+        )
         print(json.dumps(metrics), flush=True)
     accelerator.end_training()
 
