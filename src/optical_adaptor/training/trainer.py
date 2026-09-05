@@ -111,15 +111,28 @@ def profile_path(pipeline: Pipeline, kind: str, microbatch: int) -> Path:
     return pipeline.output / "profiles" / kind / f"microbatch-{microbatch}.json"
 
 
-def choose_microbatch(pipeline: Pipeline, kind: str, world_size: int) -> int:
+def profile_workload(records: list[dict], count: int) -> list[dict]:
+    if not 2 <= count <= len(records):
+        raise ValueError("profile workload size must be between two and the dataset size")
+    ordered = sorted(records, key=lambda row: (len(row["visual_ids"]), row["record_id"]))
+    return [ordered[round(index * (len(ordered) - 1) / (count - 1))] for index in range(count)]
+
+
+def choose_microbatch(pipeline: Pipeline, kind: str, world_size: int, records: list[dict]) -> int:
     identity = fingerprint(runtime_identity(pipeline, kind, world_size))
+    workload = fingerprint(
+        [
+            row["record_hash"]
+            for row in profile_workload(records, pipeline.config.training.global_pairs)
+        ]
+    )
     results = []
     for candidate in pipeline.config.training.microbatch_candidates:
         path = profile_path(pipeline, kind, candidate)
         if path.exists():
             result = json.loads(path.read_text())
-            if result["identity"] != identity:
-                raise ValueError("profile configuration/runtime mismatch")
+            if result["identity"] != identity or result["workload"] != workload:
+                raise ValueError("profile configuration/runtime/workload mismatch")
             if result["passed"]:
                 results.append(result)
     if not results:
@@ -223,7 +236,7 @@ def train_main(kind: AdapterKind) -> None:
     if microbatch is None:
         if args.mode == "profile":
             raise ValueError("profile mode requires --microbatch-size")
-        microbatch = choose_microbatch(pipeline, kind, accelerator.num_processes)
+        microbatch = choose_microbatch(pipeline, kind, accelerator.num_processes, train_records)
     if microbatch < 1 or config.training.global_pairs % (microbatch * accelerator.num_processes):
         raise ValueError("microbatch must divide global pairs across ranks")
     cache = TensorCache(pipeline, records)
@@ -238,12 +251,10 @@ def train_main(kind: AdapterKind) -> None:
     )
     if args.mode == "profile":
         adapter, optimizer = accelerator.prepare(adapter, optimizer)
-        longest = sorted(
-            train_records, key=lambda row: (-len(row["visual_ids"]), row["record_id"])
-        )[: config.training.global_pairs]
+        workload = profile_workload(train_records, config.training.global_pairs)
         window = next(
             epoch_windows(
-                longest,
+                workload,
                 seed=config.seed,
                 epoch=0,
                 global_pairs=config.training.global_pairs,
@@ -293,7 +304,7 @@ def train_main(kind: AdapterKind) -> None:
             "seconds_per_update": sum(timings) / len(timings),
             "peak_reserved_gib": peak,
             "passed": peak < config.training.memory_limit_gib,
-            "workload": fingerprint([row["record_hash"] for row in longest]),
+            "workload": fingerprint([row["record_hash"] for row in workload]),
         }
         if accelerator.is_main_process:
             write_json(profile_path(pipeline, kind, microbatch), result)

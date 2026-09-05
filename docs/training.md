@@ -91,8 +91,9 @@ CUDA_VISIBLE_DEVICES=8,9 uv run --locked accelerate launch \
 # Repeat with --microbatch-size 2, 4, and 8.
 ```
 
-Profiles include the longest training reconstructions, two warmup updates and three
-timed updates. The trainer chooses the lowest measured time among passing profiles
+Profiles sample evenly spaced length quantiles, including the shortest and longest
+training reconstructions, with two warmup updates and three timed updates. Every
+candidate must match the same workload fingerprint. The trainer chooses the lowest measured time among passing profiles
 below 40 GiB peak reserved memory. Results are locked per adapter and configuration.
 
 ```bash
