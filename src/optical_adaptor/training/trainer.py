@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, DistributedType, set_seed
 from safetensors.torch import save_file
 from transformers import get_constant_schedule_with_warmup
 
@@ -195,7 +195,11 @@ def train_main(kind: AdapterKind) -> None:
         step_scheduler_with_optimizer=False,
         kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)],
     )
-    if accelerator.device.type != "cuda" or accelerator.num_processes != 2:
+    if (
+        accelerator.device.type != "cuda"
+        or accelerator.num_processes != 2
+        or accelerator.distributed_type != DistributedType.MULTI_GPU
+    ):
         raise ValueError("v1 launch requires exactly two CUDA ranks through Accelerate")
     set_seed(config.seed)
     records = load_manifest(pipeline)
