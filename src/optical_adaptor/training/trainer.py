@@ -152,6 +152,7 @@ def save_checkpoint(
     # All ranks save their RNG state. Only the prepared adapter and optimizer are registered.
     temporary = directory.with_name(directory.name + ".incomplete")
     accelerator.save_state(str(temporary), safe_serialization=True)
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         model = accelerator.unwrap_model(adapter)
         save_file(
