@@ -109,9 +109,10 @@ class FrozenQwen:
                 ],
             }
         ]
-        template = self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, enable_thinking=False
+        rendered_template = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
+        template = self.tokenizer.encode(rendered_template, add_special_tokens=False)
         image_token = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         if template.count(image_token) != 1:
             raise ValueError("expected one image placeholder in Qwen reconstruction template")
@@ -283,3 +284,9 @@ class DeepSeekVision(nn.Module):
         if result.shape[1:] != (111, 1280) or result.dtype != torch.bfloat16:
             raise RuntimeError(f"unexpected DeepSeek embeddings: {result.shape}, {result.dtype}")
         return result
+
+    def close(self) -> None:
+        from vllm.distributed import cleanup_dist_env_and_memory
+
+        cleanup_dist_env_and_memory()
+        self.rendezvous.cleanup()
