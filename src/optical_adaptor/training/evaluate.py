@@ -367,22 +367,28 @@ def main() -> None:
             {key: value.tolist() for key, value in local.items()}, accelerator
         )
     else:
-        precomputed = None
-        partial_path = output / "reconstruction-stage.json"
-        if args.reference == "native" and args.generate and partial_path.exists():
-            precomputed = json.loads(partial_path.read_text())
-            if precomputed["identity"] != identity:
-                raise ValueError("native reconstruction reference fingerprint mismatch")
-        pending_records = (
-            [row for row in records if row["split"] != "reconstruction"]
-            if precomputed is not None
-            else records
-        )
+        precomputed, completed_splits = {}, set()
+        if args.reference == "native" and args.generate:
+            for stage, splits in (
+                ("reconstruction", {"reconstruction"}),
+                ("continuation", {"front_continuation", "middle_continuation"}),
+            ):
+                partial_path = output / f"{stage}-stage.json"
+                if partial_path.exists():
+                    partial = json.loads(partial_path.read_text())
+                    if partial["identity"] != identity:
+                        raise ValueError(f"native {stage} reference fingerprint mismatch")
+                    for split in splits:
+                        expected = pipeline.config.data.split_sizes[split]
+                        if partial["metrics"].get(f"{split}/records") != expected:
+                            raise ValueError(f"incomplete native reference split: {split}")
+                    precomputed.update(partial["metrics"])
+                    completed_splits.update(splits)
+        pending_records = [row for row in records if row["split"] not in completed_splits]
         metrics = evaluate_teacher_forced(
             pipeline, qwen, adapter, cache, pending_records, accelerator, native=native
         )
-        if precomputed is not None:
-            metrics.update(precomputed["metrics"])
+        metrics.update(precomputed)
     generation_cached = args.reference == "native" and "generation/records" in metrics
     if args.generate and args.reference != "teacher" and not generation_cached:
         generation = generate_reconstructions(
@@ -413,3 +419,7 @@ def main() -> None:
         write_json(output / "complete.json", {"identity": identity, "metrics": metrics})
         print(json.dumps(metrics), flush=True)
     accelerator.end_training()
+
+
+if __name__ == "__main__":
+    main()
