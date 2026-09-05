@@ -151,6 +151,9 @@ server. Authentication errors never silently switch to offline logging.
 
 ## Validation
 
+Measured checks, profile results, and overfit gates are recorded in
+[training-validation.md](training-validation.md).
+
 ```bash
 uv run --locked pytest
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 uv run --locked python -m torch.distributed.run \
