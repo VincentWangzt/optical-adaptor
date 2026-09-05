@@ -49,6 +49,8 @@ training:
   checkpoint_every: 250
   keep_periodic: 3
 evaluation:
+  batch_size: 4
+  generation_batch_size: 4
   every: 100
   generation_every: 500
   generation_subset: 50

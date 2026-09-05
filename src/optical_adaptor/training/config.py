@@ -77,6 +77,8 @@ class TrainingConfig(StrictConfig):
 
 
 class EvaluationConfig(StrictConfig):
+    batch_size: PositiveInt
+    generation_batch_size: PositiveInt
     every: PositiveInt
     generation_every: PositiveInt
     generation_subset: PositiveInt

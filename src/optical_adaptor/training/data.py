@@ -81,6 +81,21 @@ def encode(tokenizer: Any, text: str) -> list[int]:
     return list(tokenizer.encode(text, add_special_tokens=False))
 
 
+def bounded_tokens(tokenizer: Any, text: str, count: int, *, suffix: bool = False):
+    """Read enough source for a token boundary without tokenizing a giant remaining file."""
+    characters = min(len(text), max(2048, count * 16))
+    while True:
+        offset = len(text) - characters if suffix else 0
+        value = tokenizer(
+            text[offset : offset + characters],
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        if len(value["input_ids"]) > count + 32 or characters == len(text):
+            return value, offset
+        characters = min(len(text), characters * 2)
+
+
 def make_record(
     row: dict, split: str, pipeline: Pipeline, tokenizer: Any, coverage: frozenset[int]
 ) -> tuple[dict | None, str]:
@@ -114,7 +129,7 @@ def make_record(
         if not visual_ids or len(visual_ids) > config.data.max_visual_tokens:
             reason = "visual_tokens"
             continue
-        following = tokenizer(text[end:], add_special_tokens=False, return_offsets_mapping=True)
+        following, _ = bounded_tokens(tokenizer, text[end:], config.data.continuation_tokens)
         continuation_ids = following["input_ids"][: config.data.continuation_tokens]
         if len(continuation_ids) != config.data.continuation_tokens:
             reason = "continuation_tokens"
@@ -127,12 +142,13 @@ def make_record(
             continue
         prefix, prefix_ids, prefix_start = "", [], start
         if first:
-            preceding = tokenizer(
-                text[:start], add_special_tokens=False, return_offsets_mapping=True
+            preceding, preceding_offset = bounded_tokens(
+                tokenizer, text[:start], config.data.prefix_tokens, suffix=True
             )
             prefix_start = preceding["offset_mapping"][
                 max(0, len(preceding["input_ids"]) - config.data.prefix_tokens)
             ][0]
+            prefix_start += preceding_offset
             prefix = text[prefix_start:start]
             prefix_ids = encode(tokenizer, prefix)
             if len(prefix_ids) > config.data.prefix_tokens:
