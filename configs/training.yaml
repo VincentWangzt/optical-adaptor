@@ -1,0 +1,62 @@
+seed: 42
+output_dir: outputs/adapter-v1
+render_config: configs/render.training.yaml
+models:
+  encoder_id: deepseek-ai/DeepSeek-OCR
+  encoder_revision: 9f30c71f441d010e5429c532364a86705536c53a
+  qwen_id: Qwen/Qwen3.5-4B
+  qwen_revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  encoder_tensor_count: 476
+  image_size: 640
+data:
+  dataset_id: bigcode/the-stack-smol
+  revision: 4a6938ce94446f324c6629e7de00ac591710044b
+  split_sizes:
+    train: 10000
+    front_continuation: 500
+    middle_continuation: 500
+    reconstruction: 500
+  min_lines: 40
+  max_lines: 60
+  max_visual_tokens: 2048
+  max_display_lines: 80
+  continuation_tokens: 128
+  prefix_tokens: 256
+  shard_rows: 512
+  debug_images: 4
+adapter:
+  input_dim: 1280
+  output_dim: 2560
+  sequence_length: 111
+  transformer_layers: 2
+  transformer_heads: 8
+  transformer_ffn_dim: 5120
+  dropout: 0.0
+training:
+  epochs: 3
+  global_pairs: 32
+  lr: 0.0002
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  epsilon: 0.00000001
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  loss_chunk_tokens: 128
+  microbatch_candidates: [1, 2, 4, 8]
+  memory_limit_gib: 40.0
+  profile_warmup_updates: 2
+  profile_measured_updates: 3
+  checkpoint_every: 250
+  keep_periodic: 3
+evaluation:
+  every: 100
+  generation_every: 500
+  generation_subset: 50
+  max_new_tokens: 4096
+  instruction: >-
+    Transcribe all visible text in this image exactly. Preserve line breaks, indentation,
+    punctuation, and code formatting. Return only the transcription without commentary or
+    Markdown fences.
+logging:
+  entity: 2162681069-peking-university
+  project: optical-adaptor

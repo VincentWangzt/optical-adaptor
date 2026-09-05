@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ class Margins:
 
 @dataclass(frozen=True)
 class PagesConfig:
-    resolution: tuple[int, int] | None = (1600, 2200)
+    resolution: tuple[int, int | None] | None = (1600, 2200)
     dpi: tuple[int, int] = (144, 144)
     margins: Margins = Margins()
     background: str = "#ffffff"
@@ -43,6 +44,7 @@ class PagesConfig:
 @dataclass(frozen=True)
 class TextConfig:
     font: str | None = None
+    fallback_fonts: tuple[str, ...] = ()
     font_size: int = 30
     color: str = "#111827"
     line_height: int = 42
@@ -111,9 +113,11 @@ def _pair(value: Any, name: str) -> tuple[int, int]:
     return _positive_int(value[0], f"{name}[0]"), _positive_int(value[1], f"{name}[1]")
 
 
-def _resolution(value: Any, name: str) -> tuple[int, int] | None:
+def _resolution(value: Any, name: str) -> tuple[int, int | None] | None:
     if isinstance(value, str) and value.strip().lower() == "auto":
         return None
+    if isinstance(value, (list, tuple)) and len(value) == 2 and value[1] == "auto":
+        return _positive_int(value[0], f"{name}[0]"), None
     return _pair(value, name)
 
 
@@ -123,9 +127,7 @@ def _margin_value(value: Any, name: str) -> MarginValue:
         try:
             percent = float(rendered)
         except ValueError as exc:
-            raise RenderConfigError(
-                f"{name} must be a positive integer or percentage"
-            ) from exc
+            raise RenderConfigError(f"{name} must be a positive integer or percentage") from exc
         if not math.isfinite(percent) or percent <= 0 or percent >= 100:
             raise RenderConfigError(f"{name} percentage must be greater than 0 and below 100")
         return Percentage(percent / 100)
@@ -186,6 +188,7 @@ def load_render_config(path: str | Path) -> RenderConfig:
         text_raw,
         {
             "font",
+            "fallback_fonts",
             "font_size",
             "color",
             "line_height",
@@ -214,10 +217,14 @@ def load_render_config(path: str | Path) -> RenderConfig:
                 candidate = config_path.parent / candidate
             font = str(candidate.resolve())
 
+    fallback_fonts = text_raw.get("fallback_fonts", [])
+    if not isinstance(fallback_fonts, list) or not all(
+        isinstance(item, str) and item for item in fallback_fonts
+    ):
+        raise RenderConfigError("text.fallback_fonts must be a list of font paths")
+    fallback_fonts = tuple(str((config_path.parent / item).resolve()) for item in fallback_fonts)
     pages = PagesConfig(
-        resolution=_resolution(
-            pages_raw.get("resolution", [1600, 2200]), "pages.resolution"
-        ),
+        resolution=_resolution(pages_raw.get("resolution", [1600, 2200]), "pages.resolution"),
         dpi=_pair(pages_raw.get("dpi", 144), "pages.dpi"),
         margins=margins,
         background=str(pages_raw.get("background", "#ffffff")),
@@ -227,6 +234,7 @@ def load_render_config(path: str | Path) -> RenderConfig:
     )
     text = TextConfig(
         font=font,
+        fallback_fonts=fallback_fonts,
         font_size=_positive_int(text_raw.get("font_size", 30), "text.font_size"),
         color=str(text_raw.get("color", "#111827")),
         line_height=_positive_int(text_raw.get("line_height", 42), "text.line_height"),
@@ -238,9 +246,7 @@ def load_render_config(path: str | Path) -> RenderConfig:
     )
     output = OutputConfig(
         format=str(output_raw.get("format", "PNG")).upper(),
-        filename_pattern=str(
-            output_raw.get("filename_pattern", "{stem}-page-{page:03d}.{ext}")
-        ),
+        filename_pattern=str(output_raw.get("filename_pattern", "{stem}-page-{page:03d}.{ext}")),
     )
     config = RenderConfig(pages=pages, text=text, output=output)
     _validate_render_config(config)
@@ -253,6 +259,8 @@ def _validate_render_config(config: RenderConfig) -> None:
     _validate_margin_axis(margins.top, margins.bottom, "vertical")
     if config.pages.resolution is not None:
         width, height = config.pages.resolution
+        if height is None:
+            height, _, _ = _auto_axis(config.text.line_height, margins.top, margins.bottom)
         resolved = _resolve_fixed_margins(margins, width, height)
         if resolved.left + resolved.right >= width:
             raise RenderConfigError("horizontal margins leave no drawable page width")
@@ -329,6 +337,57 @@ def _load_font(config: TextConfig) -> ImageFont.FreeTypeFont | ImageFont.ImageFo
     return ImageFont.load_default(size=config.font_size)
 
 
+@lru_cache(maxsize=16)
+def font_codepoints(path: str) -> frozenset[int]:
+    from fontTools.ttLib import TTFont
+
+    with TTFont(path) as font:
+        return frozenset(font.getBestCmap())
+
+
+class FontChain:
+    """Deterministic per-codepoint fallback shared by measurement and drawing."""
+
+    def __init__(self, config: TextConfig):
+        self.fonts = [_load_font(config)] + [
+            ImageFont.truetype(path, config.font_size) for path in config.fallback_fonts
+        ]
+        self.coverage = [
+            font_codepoints(path)
+            for path in (config.font, *config.fallback_fonts)
+            if path is not None
+        ]
+
+    def runs(self, text: str):
+        current, buffer = 0, ""
+        for char in text:
+            index = next((i for i, cmap in enumerate(self.coverage) if ord(char) in cmap), 0)
+            if index != current and buffer:
+                yield self.fonts[current], buffer
+                buffer = ""
+            current, buffer = index, buffer + char
+        if buffer:
+            yield self.fonts[current], buffer
+
+    def getlength(self, text: str) -> float:
+        return sum(font.getlength(run) for font, run in self.runs(text))
+
+    def getbbox(self, text: str) -> tuple[float, float, float, float]:
+        x, left, top, right, bottom = 0.0, 0.0, 0.0, 0.0, 0.0
+        for font, run in self.runs(text):
+            a, b, c, d = font.getbbox(run)
+            left, top = min(left, x + a), min(top, b)
+            right, bottom = max(right, x + c), max(bottom, d)
+            x += font.getlength(run)
+        return left, top, max(x, right), bottom
+
+    def draw(self, draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, fill):
+        x, y = xy
+        for font, run in self.runs(text):
+            draw.text((x, y), run, font=font, fill=fill)
+            x += font.getlength(run)
+
+
 def _visual_lines(source: str, config: TextConfig) -> list[VisualLine]:
     source_lines = source.splitlines()
     if not source_lines:
@@ -345,22 +404,18 @@ def _visual_lines(source: str, config: TextConfig) -> list[VisualLine]:
             for index in range(0, len(line), config.line_width)
         ]
         output.extend(
-            VisualLine(chunk, number, continuation=index > 0)
-            for index, chunk in enumerate(chunks)
+            VisualLine(chunk, number, continuation=index > 0) for index, chunk in enumerate(chunks)
         )
     return output
 
 
-def render_source(
+def render_pages(
     source: str,
     *,
-    stem: str,
-    output_dir: str | Path,
     config: RenderConfig,
-) -> RenderResult:
-    output_path = Path(output_dir).expanduser().resolve()
-    output_path.mkdir(parents=True, exist_ok=True)
-    font = _load_font(config.text)
+) -> tuple[list[Image.Image], int, bool]:
+    """Render in memory; file and training workflows share identical pixels."""
+    font = FontChain(config.text)
     lines = _visual_lines(source, config.text)
 
     pages = config.pages
@@ -378,20 +433,19 @@ def render_source(
 
     if pages.resolution is None:
         content_width = math.ceil(
-            max(
-                max(font.getlength(line), font.getbbox(line)[2])
-                for line in rendered_lines
-            )
+            max(max(font.getlength(line), font.getbbox(line)[2]) for line in rendered_lines)
         )
         content_height = len(lines) * text_config.line_height
-        resolution, margins = _auto_geometry(
-            pages.margins, content_width, content_height
-        )
+        resolution, margins = _auto_geometry(pages.margins, content_width, content_height)
         width, height = resolution
         lines_per_page = len(lines)
     else:
-        resolution = pages.resolution
-        width, height = resolution
+        width, height = pages.resolution
+        if height is None:
+            height, _, _ = _auto_axis(
+                len(lines) * text_config.line_height, pages.margins.top, pages.margins.bottom
+            )
+        resolution = width, height
         margins = _resolve_fixed_margins(pages.margins, width, height)
         usable_height = height - margins.top - margins.bottom
         lines_per_page = usable_height // text_config.line_height
@@ -405,22 +459,20 @@ def render_source(
                 f"{math.ceil(measured_width)}px, but only {usable_width}px are available; "
                 "lower line_width/font_size or margins"
             )
+        for line in rendered_lines:
+            left, top, right, bottom = font.getbbox(line)
+            if right > usable_width or left < -margins.left:
+                raise RenderConfigError("actual glyph extents exceed drawable width")
+            if top < 0 or bottom > text_config.line_height:
+                raise RenderConfigError("actual glyph extents exceed line height")
 
     required_pages = math.ceil(len(lines) / lines_per_page)
     rendered_pages = min(required_pages, pages.max_pages or required_pages)
     truncated = rendered_pages < required_pages
 
-    ext = {"JPEG": "jpg"}.get(config.output.format, config.output.format.lower())
-    page_paths: list[Path] = []
+    images: list[Image.Image] = []
     for page_index in range(rendered_pages):
         page_number = pages.start_number + page_index
-        try:
-            filename = config.output.filename_pattern.format(
-                stem=stem, page=page_number, ext=ext
-            )
-        except (KeyError, ValueError) as exc:
-            raise RenderConfigError(f"invalid output.filename_pattern: {exc}") from exc
-        destination = output_path / filename
         image = Image.new("RGB", resolution, ImageColor.getrgb(pages.background))
         draw = ImageDraw.Draw(image)
         start = page_index * lines_per_page
@@ -429,21 +481,36 @@ def render_source(
                 margins.left,
                 margins.top + row * text_config.line_height,
             )
-            draw.text(position, rendered, fill=ImageColor.getrgb(text_config.color), font=font)
+            font.draw(draw, position, rendered, ImageColor.getrgb(text_config.color))
 
         if pages.draw_page_number:
             label = str(page_number)
-            box = draw.textbbox((0, 0), label, font=font)
+            box = font.getbbox(label)
             label_width = box[2] - box[0]
             draw.text(
                 ((width - label_width) / 2, height - margins.bottom / 2),
                 label,
                 fill=ImageColor.getrgb(text_config.color),
-                font=font,
+                font=font.fonts[0],
                 anchor="mm",
             )
 
-        save_options: dict[str, Any] = {"dpi": pages.dpi}
+        images.append(image)
+    return images, len(lines), truncated
+
+
+def render_source(
+    source: str, *, stem: str, output_dir: str | Path, config: RenderConfig
+) -> RenderResult:
+    output_path = Path(output_dir).expanduser().resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    images, visual_line_count, truncated = render_pages(source, config=config)
+    ext = {"JPEG": "jpg"}.get(config.output.format, config.output.format.lower())
+    page_paths = []
+    for index, image in enumerate(images, start=config.pages.start_number):
+        filename = config.output.filename_pattern.format(stem=stem, page=index, ext=ext)
+        destination = output_path / filename
+        save_options: dict[str, Any] = {"dpi": config.pages.dpi}
         if config.output.format == "PNG":
             save_options["compress_level"] = 6
         image.save(destination, format=config.output.format, **save_options)
@@ -452,7 +519,7 @@ def render_source(
     return RenderResult(
         page_paths=tuple(page_paths),
         source_line_count=len(source.splitlines()),
-        visual_line_count=len(lines),
+        visual_line_count=visual_line_count,
         truncated=truncated,
     )
 

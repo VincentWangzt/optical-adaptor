@@ -10,6 +10,15 @@ dependencies = [
     "pyyaml>=6.0.2,<7",
     "transformers==5.16.1",
     "vllm==0.28.0",
+    "torch==2.13.0",
+    "accelerate>=1.10,<2",
+    "datasets>=4,<5",
+    "polars>=1.30,<2",
+    "safetensors>=0.8,<1",
+    "python-dotenv>=1.2,<2",
+    "wandb>=0.21,<1",
+    "fonttools>=4.60,<5",
+    "pydantic>=2.11,<3",
 ]
 
 [project.scripts]
@@ -17,6 +26,10 @@ render-code = "optical_adaptor.render_code:main"
 ocr-infer = "optical_adaptor.infer_ocr:main"
 ocr-edit-distance = "optical_adaptor.edit_distance:main"
 ocr-evaluate = "optical_adaptor.evaluate_ocr:main"
+prepare-adapter-data = "optical_adaptor.training.data:main"
+extract-deepseek-embeddings = "optical_adaptor.training.cache:extract_main"
+cache-qwen-teacher = "optical_adaptor.training.cache:teacher_main"
+evaluate-adapter = "optical_adaptor.training.evaluate:main"
 
 [build-system]
 requires = ["hatchling"]
