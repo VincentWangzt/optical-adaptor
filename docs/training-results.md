@@ -125,6 +125,11 @@ MLP's sharp reconstruction improvement began around updates 500–700, late in a
 experiment. Transformer did not show that transition. Its larger capacity alone
 did not improve learning under these shared hyperparameters.
 
+The [training-dynamics analysis](training-dynamics.md) examines the delayed MLP
+transition using full training histories and intermediate adapter checkpoints.
+The sustained change occurs around 580–610; no learning-rate or clipping change
+coincides with it. Its proposed explanation remains a hypothesis.
+
 ## Image-dependence diagnostic
 
 After training, each final checkpoint was evaluated with correct, mismatched,
