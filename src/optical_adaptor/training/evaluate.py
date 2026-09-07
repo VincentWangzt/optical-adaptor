@@ -15,6 +15,7 @@ from optical_adaptor.edit_distance import evaluate_edit_distance
 from optical_adaptor.training.cache import TensorCache
 from optical_adaptor.training.config import fingerprint, load_credentials, load_pipeline, write_json
 from optical_adaptor.training.data import load_manifest
+from optical_adaptor.training.generation import generate_tokens
 from optical_adaptor.training.models import FrozenQwen, build_adapter
 from optical_adaptor.training.objectives import mean_metrics, task_loss
 
@@ -241,21 +242,22 @@ def refresh_generation_metrics(pipeline, records, output_dir: Path, step: int, *
 
 
 @torch.no_grad()
-def greedy_adapters(pipeline, qwen, adapter, cache, records) -> list[tuple[str, bool]]:
+def generate_adapters(pipeline, qwen, adapter, cache, records) -> list[tuple[str, bool]]:
     visual = cache.batch(records, "encoder", qwen.device)
     adapted = adapter(visual).to(visual.dtype)
     before = qwen.embed(qwen.reconstruction_before)[None].expand(len(records), -1, -1)
     after = qwen.embed(qwen.reconstruction_after)[None].expand(len(records), -1, -1)
     inputs = torch.cat([before, adapted, after], dim=1)
     qwen.model.eval()
-    outputs = qwen.model.generate(
-        inputs_embeds=inputs,
-        attention_mask=torch.ones(inputs.shape[:2], device=qwen.device, dtype=torch.long),
-        max_new_tokens=pipeline.config.evaluation.max_new_tokens,
-        do_sample=False,
-        use_cache=True,
-        eos_token_id=qwen.assistant_end,
-        pad_token_id=qwen.tokenizer.pad_token_id,
+    outputs = generate_tokens(
+        pipeline,
+        qwen,
+        qwen.model,
+        records,
+        {
+            "inputs_embeds": inputs,
+            "attention_mask": torch.ones(inputs.shape[:2], device=qwen.device, dtype=torch.long),
+        },
     ).tolist()
     results = []
     for output in outputs:
@@ -302,7 +304,7 @@ def generate_reconstructions(
             predictions = (
                 native.generate_batch(batch)
                 if native is not None
-                else greedy_adapters(pipeline, qwen, adapter, cache, batch)
+                else generate_adapters(pipeline, qwen, adapter, cache, batch)
             )
         for record, (prediction, truncated) in zip(batch, predictions, strict=True):
             reference = record["visual"]

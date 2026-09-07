@@ -11,6 +11,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
 from optical_adaptor.renderer import render_pages
 from optical_adaptor.training.config import fingerprint, write_json
+from optical_adaptor.training.generation import generate_tokens
 
 
 class NativeQwen:
@@ -135,14 +136,9 @@ class NativeQwen:
         values, _, _, _ = self.batch_inputs(records, "reconstruction", targets=False)
         prefix_length = values["input_ids"].shape[1]
         self.model.eval()
-        outputs = self.model.generate(
-            **values,
-            do_sample=False,
-            use_cache=True,
-            max_new_tokens=self.pipeline.config.evaluation.max_new_tokens,
-            eos_token_id=self.qwen.assistant_end,
-            pad_token_id=self.qwen.tokenizer.pad_token_id,
-        )[:, prefix_length:].tolist()
+        outputs = generate_tokens(self.pipeline, self.qwen, self.model, records, values)[
+            :, prefix_length:
+        ].tolist()
         results = []
         for output in outputs:
             stopped = self.qwen.assistant_end in output

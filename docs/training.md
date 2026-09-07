@@ -122,13 +122,23 @@ The final checkpoint and latest three periodic checkpoints are retained.
 ## Evaluation
 
 Teacher-forced evaluation runs at initialization, every 100 updates, and completion.
-Greedy reconstruction uses a fixed 50-record subset every 500 updates and all 500
+Sampled reconstruction uses a fixed 50-record subset every 500 updates and all 500
 records at completion, with a 4,096-token generation cap. Teacher-forced evaluation
 batches four records; generation batches 16 records per rank, grouped by target
 length after selecting the fixed evaluation subset. Metrics are token-weighted and stratified
 by language, aspect ratio, logical lines, and display lines. Generation reports
 character/word edit distance, CER/WER, exact match, and truncation rate. Edit distance
 is exact unit-cost Levenshtein, using RapidFuzz through the existing metric helper.
+
+Native Qwen and both adapters share `evaluation.sampling`: sampling is enabled,
+temperature is 1.0, top-p is 1.0, top-k is 0 (disabled), presence penalty is 0.0,
+and repetition penalty is 1.0. No additional presence-penalty processor is used.
+Each generation batch derives its random seed from the pipeline seed and ordered
+record IDs. Evaluation restores the previous CPU and selected-GPU random states,
+so it does not perturb training. Replays require the same batch membership, order,
+and runtime. These settings are included in configuration and reference fingerprints.
+The existing results report describes the earlier greedy protocol; changing the
+configuration does not update those measurements, and stale references are rejected.
 
 ```bash
 CUDA_VISIBLE_DEVICES=8 uv run --locked evaluate-adapter --reference teacher

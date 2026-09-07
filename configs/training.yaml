@@ -57,6 +57,13 @@ evaluation:
   generation_every: 500
   generation_subset: 50
   max_new_tokens: 4096
+  sampling:
+    do_sample: true
+    temperature: 1.0
+    top_p: 1.0
+    top_k: 0
+    presence_penalty: 0.0
+    repetition_penalty: 1.0
   instruction: >-
     Transcribe all visible text in this image exactly. Preserve line breaks, indentation,
     punctuation, and code formatting. Return only the transcription without commentary or

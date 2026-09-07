@@ -78,6 +78,16 @@ class TrainingConfig(StrictConfig):
     keep_periodic: PositiveInt
 
 
+class SamplingConfig(StrictConfig):
+    do_sample: Literal[True]
+    temperature: PositiveFloat
+    top_p: Annotated[float, Field(gt=0, le=1)]
+    top_k: Annotated[int, Field(ge=0)]
+    # Transformers has no presence-penalty option; zero means no custom processor.
+    presence_penalty: Literal[0.0]
+    repetition_penalty: PositiveFloat
+
+
 class EvaluationConfig(StrictConfig):
     batch_size: PositiveInt
     generation_batch_size: PositiveInt
@@ -85,6 +95,7 @@ class EvaluationConfig(StrictConfig):
     generation_every: PositiveInt
     generation_subset: PositiveInt
     max_new_tokens: PositiveInt
+    sampling: SamplingConfig
     instruction: Annotated[str, Field(min_length=1)]
 
 

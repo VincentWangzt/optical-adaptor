@@ -1,5 +1,9 @@
 # v1 training results
 
+These measurements use the original greedy-decoding protocol. The canonical
+configuration now specifies temperature-1 sampling for native Qwen and adapters;
+the results below have not been rerun with those settings.
+
 Both three-epoch experiments completed successfully. MLP learned substantially
 more than Transformer-plus-MLP under the specified budget, but neither final
 checkpoint achieves reliable exact transcription. The shared pure-text and
