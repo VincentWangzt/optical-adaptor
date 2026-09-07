@@ -2,8 +2,9 @@
 
 Both three-epoch experiments completed successfully. MLP learned substantially
 more than Transformer-plus-MLP under the specified budget, but neither final
-checkpoint achieves reliable exact transcription. The native-Qwen reference is
-currently running and will be added to this report.
+checkpoint achieves reliable exact transcription. The shared pure-text and
+native-Qwen references also completed. Native Qwen reconstructs substantially
+better, but its exact-match generation rate is still only 3.2%.
 
 The primary results use the final checkpoints, without best-checkpoint selection.
 Each continuation evaluation set contains 500 records and 64,000 target tokens.
@@ -25,7 +26,8 @@ examples. Each epoch visits all 10,000 training records once under each task:
 With two ranks and microbatch 2 per task per rank, a full update accumulates eight
 microbatches for each task on each rank. Thus 939 is an optimizer-update count,
 not a count of examples or forward passes. Both complete histories and checkpoint
-states were audited; neither run stopped early.
+states were audited; neither run stopped early. The separate 100-update W&B
+runs are overfit checks, not these full training runs.
 
 This verifies the requested schedule, not the adequacy of three epochs. MLP was
 still improving at the end. Transformer reconstruction stayed near a plateau,
@@ -36,14 +38,19 @@ so extra steps alone are not established as the remedy.
 | Model | Evaluation set | KL to text teacher | CE | Perplexity | Teacher top-1 agreement |
 | --- | --- | ---: | ---: | ---: | ---: |
 | Pure-text teacher | Front | 0 | 0.840671 | 2.317922 | 100% |
+| Native Qwen | Front | 0.762343 | 1.571339 | 4.813088 | 80.17% |
 | MLP | Front | 0.571395 | 1.362635 | 3.906475 | 79.90% |
 | Transformer + MLP | Front | 0.783443 | 1.573605 | 4.824009 | 76.74% |
 | Pure-text teacher | Middle | 0 | 0.778418 | 2.178025 | 100% |
+| Native Qwen | Middle | 0.326125 | 1.077539 | 2.937441 | 87.62% |
 | MLP | Middle | 0.414094 | 1.137306 | 3.118355 | 83.81% |
 | Transformer + MLP | Middle | 0.529402 | 1.246065 | 3.476635 | 81.65% |
 
 Middle examples include up to 256 preceding text tokens. Their numbers should
-not be interpreted as a controlled comparison with front examples.
+not be interpreted as a controlled comparison with front examples. Native Qwen
+is strongest among the visual systems on middle continuation. MLP has lower
+front KL and CE than native Qwen, while native has slightly higher front top-1
+agreement; the metrics do not give one uniform ranking.
 
 ## Final reconstruction results
 
@@ -52,6 +59,7 @@ assistant end token. The training objective also supervises that end token.
 
 | Model | Initialization CE | Final CE | Final perplexity | Final token accuracy |
 | --- | ---: | ---: | ---: | ---: |
+| Native Qwen | — | 0.052804 | 1.054223 | 98.47% |
 | MLP | 1.168034 | 0.482754 | 1.620532 | 88.03% |
 | Transformer + MLP | 1.162642 | 1.064037 | 2.898047 | 76.57% |
 
@@ -64,12 +72,23 @@ Greedy generation uses all 500 reconstruction records at completion, with a
 
 | Model | CER | WER | Mean character edit distance | Mean word edit distance | Exact match | Truncated |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native Qwen | 0.535598 | 0.261792 | 922.896 | 45.234 | 3.2% | 5.6% |
 | MLP | 2.078972 | 1.797981 | 3,582.306 | 310.666 | 0% | 26.2% |
 | Transformer + MLP | 7.504275 | 6.276226 | 12,930.722 | 1,084.444 | 0% | 84.4% |
 
 CER and WER divide total edit counts by total reference units. Excess output
 adds insertions, so these ratios can exceed 1. These generation results are a
 substantial failure of exact transcription despite the teacher-forced gains.
+Removing only outer whitespace still yields zero exact matches for both adapters,
+so the failures are not explained solely by leading or trailing whitespace.
+
+Long outputs dominate the edit totals. The 28 native outputs that reached the
+4,096-token limit account for 87.26% of native character edits; the corresponding
+shares are 91.56% for MLP and 97.72% for Transformer. On the 472 native outputs
+that stopped normally, CER is 0.073259 and WER is 0.046668. These are diagnostic
+subsets selected by model behavior, not replacement scores or a matched
+comparison between models. The primary table retains every record. Detailed
+aggregates are saved in `diagnostics/generation-length-check.json` on the server.
 
 The fixed 50-record subset permits comparison at identical record membership:
 
@@ -129,8 +148,22 @@ Detailed aggregates and selection fingerprints are in
 
 Both adapters use 111 visual tokens per image. Mean source-text-to-adapted-token
 ratios are 4.562 for front continuation, 4.956 for middle continuation, and 4.413
-for reconstruction. The pure-text reference ratio is 1. Native visual-token
-counts will be reported from the official processor.
+for reconstruction. Native source-text-to-visual-token ratios are 0.272, 0.296,
+and 0.262 respectively, meaning it uses more visual tokens than the source text
+uses text tokens. The pure-text reference ratio is 1. The official native
+processor produced the following verified counts:
+
+| Evaluation set | Mean native visual tokens | Range | Native / adapter token count |
+| --- | ---: | ---: | ---: |
+| Front continuation | 1,828.56 | 1,440–2,840 | 16.47× |
+| Middle continuation | 1,838.56 | 1,440–2,840 | 16.56× |
+| Reconstruction | 1,836.40 | 1,440–2,840 | 16.54× |
+
+These are counts after native visual merging, excluding vision boundary tokens.
+They are verified against processor grids and record fingerprints for all 1,500
+evaluation images. Native Qwen consequently has a much larger visual token
+budget; its comparison measures the complete systems rather than isolating
+adapter architecture.
 
 Both runs used two A6000 GPUs through Accelerate DDP with BF16 computation,
 FP32 adapter and AdamW states, and microbatch 2 per task per rank.
@@ -164,12 +197,19 @@ Training-record fingerprint:
 
 Runs: [MLP](https://wandb.ai/2162681069-peking-university/optical-adaptor/runs/jl52d63v),
 [Transformer + MLP](https://wandb.ai/2162681069-peking-university/optical-adaptor/runs/u6hvj4kj),
-[pure-text teacher](https://wandb.ai/2162681069-peking-university/optical-adaptor/runs/ds7jol7t).
+[pure-text teacher](https://wandb.ai/2162681069-peking-university/optical-adaptor/runs/ds7jol7t),
+[native Qwen](https://wandb.ai/2162681069-peking-university/optical-adaptor/runs/e6xk3lrp).
 
 Artifacts are under `/workspace/optical-adaptor/outputs/adapter-v1/` on the
 server. Each run's `completion-audit.json` and the shared
 `comparison-input-audit.json` record the checks above. MLP generation strata
 were added from saved predictions without repeating generation.
+
+The native reference ran on two A6000s from 2026-09-07 08:58:49 to 10:03:10 UTC.
+Its completion audit verified the reference identity, 1,500 teacher-forced
+records, 117 aggregate/stratum groups, and 500 unique generation records split
+250 per rank. Reaggregating the saved predictions reproduced every reported
+generation metric. Its processor audit verified all 1,500 image token counts.
 
 ## Interpretation limits
 
@@ -177,6 +217,9 @@ The v1 renderer preserves unmarked wrapping ambiguity in the reconstruction
 target, and DeepSeek's official no-crop preprocessing distorts the image aspect
 ratio. Both are intentional constraints. These runs use one seed and repeatedly
 inspected evaluation sets. They do not establish robustness across seeds or
-an untouched final test result. The native reference is still needed to quantify
-how much of the difficulty comes from the rendering/task versus the learned
-compression and adapters.
+an untouched final test result. Native Qwen's 3.2% exact-match rate shows that
+this rendering/task remains difficult even for the original multimodal model.
+The compressed adapter systems also perform substantially worse on
+reconstruction CE and generation errors. The native comparison
+changes the vision encoder, preprocessing, alignment, and visual token budget
+together, so it cannot attribute that gap specifically to compression.
