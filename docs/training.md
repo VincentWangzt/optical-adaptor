@@ -184,3 +184,39 @@ chunked gradients, target alignment, cache corruption, and checkpoint replay.
 The distributed test compares unequal-length accumulated losses with an unbatched
 reference and checks exact CPU replay. Real GPU probes additionally validate both
 frozen model boundaries, adapter-only gradients, and native/pseudo-image generation.
+
+
+## Extend a completed run
+
+Use an explicit extension to increase the total epoch count while preserving the
+adapter, AdamW moments, original warmup schedule, and per-rank RNG. The source must
+be a completed training checkpoint. The destination must be a new directory; W&B
+creates a new run with the source run, checkpoint identity, and starting step in
+its continuation metadata. Data, training settings, runtime, topology, and
+microbatch must match. A validated checkpoint supplies its original microbatch
+and prior training eligibility, so throughput profiling and the overfit gate are
+not repeated.
+
+For the completed three-epoch MLP, ten total epochs means steps 940–3130:
+2,191 additional updates, or seven more passes over the 10,000 training pairs.
+The original 29-step warmup is retained and the applied LR remains 0.0002.
+
+```bash
+CUDA_VISIBLE_DEVICES=8,9 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=4 \
+TOKENIZERS_PARALLELISM=false uv run --locked accelerate launch \
+  --multi_gpu --num_processes 2 --mixed_precision bf16 \
+  --num_cpu_threads_per_process 4 --main_process_port 29571 \
+  scripts/train_mlp_adapter.py --mode train --epochs 10 \
+  --extend-from outputs/adapter-v1/runs/mlp/final \
+  --run-dir outputs/adapter-v1/runs/mlp-10epochs --allow-sampling-change
+```
+
+The explicit sampling-change flag permits only the generation sampling
+configuration to differ from the source. This is needed for the historical greedy
+checkpoint to use the currently configured temperature-1 sampling. Teacher-forced
+metrics remain comparable; new generation scores use a different decoding protocol.
+
+To resume an interrupted extension, use `--epochs 10 --resume
+outputs/adapter-v1/runs/mlp-10epochs/step-001000` with the same configuration and
+runtime. Omit `--extend-from` and `--allow-sampling-change`: ordinary resume
+requires the complete saved identity to match and continues the same W&B run.

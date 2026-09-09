@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import time
+from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from optical_adaptor.training.cache import TensorCache
 from optical_adaptor.training.config import (
     AdapterKind,
     Pipeline,
+    PipelineConfig,
     fingerprint,
     load_credentials,
     load_pipeline,
@@ -28,6 +30,12 @@ from optical_adaptor.training.config import (
 from optical_adaptor.training.data import load_manifest
 from optical_adaptor.training.models import FrozenQwen, build_adapter
 from optical_adaptor.training.objectives import mean_metrics, task_loss
+from optical_adaptor.training.resume import (
+    checkpoint_warmup,
+    resolve_continuation,
+    validate_checkpoint,
+    validate_restored_state,
+)
 from optical_adaptor.training.sampling import TaskWindow, epoch_windows
 
 
@@ -200,7 +208,12 @@ def train_main(kind: AdapterKind) -> None:
     parser.add_argument("--config", type=Path, default=Path("configs/training.yaml"))
     parser.add_argument("--mode", choices=("profile", "overfit", "train"), default="train")
     parser.add_argument("--microbatch-size", type=int)
-    parser.add_argument("--resume", type=Path)
+    restart = parser.add_mutually_exclusive_group()
+    restart.add_argument("--resume", type=Path)
+    restart.add_argument("--extend-from", type=Path)
+    parser.add_argument("--epochs", type=int, help="total epochs, including completed epochs")
+    parser.add_argument("--run-dir", type=Path, help="separate output directory for an extension")
+    parser.add_argument("--allow-sampling-change", action="store_true")
     parser.add_argument(
         "--max-updates", type=int, default=100, help="number of updates for the overfit gate"
     )
@@ -213,8 +226,24 @@ def train_main(kind: AdapterKind) -> None:
         raise ValueError("update limits must be positive")
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
         raise RuntimeError("select idle GPUs explicitly with CUDA_VISIBLE_DEVICES")
+    if (args.resume or args.extend_from) and args.mode == "profile":
+        raise ValueError("profile mode cannot resume a checkpoint")
+    if args.extend_from and (args.mode != "train" or args.epochs is None or args.run_dir is None):
+        raise ValueError("--extend-from requires --mode train, --epochs, and --run-dir")
+    if args.allow_sampling_change and not args.extend_from:
+        raise ValueError("--allow-sampling-change is only valid with --extend-from")
+    if args.epochs is not None and (args.mode != "train" or args.epochs < 1):
+        raise ValueError("--epochs must be positive and is only valid for training")
     pipeline = load_pipeline(args.config)
+    if args.epochs is not None:
+        resolved_config = pipeline.config.model_dump()
+        resolved_config["training"]["epochs"] = args.epochs
+        pipeline = replace(pipeline, config=PipelineConfig.model_validate(resolved_config))
     config = pipeline.config
+    checkpoint = args.resume or args.extend_from
+    metadata = json.loads((checkpoint / "state.json").read_text()) if checkpoint else None
+    if metadata is not None:
+        validate_checkpoint(metadata)
     configure_training_runtime(pipeline)
     load_credentials(pipeline, wandb=args.mode != "profile")
     accelerator = Accelerator(
@@ -234,6 +263,8 @@ def train_main(kind: AdapterKind) -> None:
     train_records = [row for row in records if row["split"] == "train"]
     identity = runtime_identity(pipeline, kind, accelerator.num_processes)
     microbatch = args.microbatch_size
+    if microbatch is None and metadata is not None:
+        microbatch = metadata["resolved"]["microbatch"]
     if microbatch is None:
         if args.mode == "profile":
             raise ValueError("profile mode requires --microbatch-size")
@@ -325,39 +356,59 @@ def train_main(kind: AdapterKind) -> None:
         train_records = train_records[: args.overfit_records]
         total_updates = args.max_updates
     else:
-        gate_path = pipeline.output / "overfit" / kind / "gate.json"
-        gate = json.loads(gate_path.read_text())
-        if gate["identity"] != fingerprint(identity) or not gate["passed"]:
-            raise ValueError("a passing overfit gate for this configuration is required")
+        if metadata is None:
+            gate_path = pipeline.output / "overfit" / kind / "gate.json"
+            gate = json.loads(gate_path.read_text())
+            if gate["identity"] != fingerprint(identity) or not gate["passed"]:
+                raise ValueError("a passing overfit gate for this configuration is required")
         total_updates = config.total_updates
     updates_per_epoch = math.ceil(len(train_records) / config.training.global_pairs)
     epochs = math.ceil(total_updates / updates_per_epoch)
-    scheduler = get_constant_schedule_with_warmup(
-        optimizer, num_warmup_steps=math.ceil(total_updates * config.training.warmup_ratio)
-    )
-    adapter, optimizer = accelerator.prepare(adapter, optimizer)
-    accelerator.register_for_checkpointing(scheduler)
-    run_dir = pipeline.output / ("runs" if args.mode == "train" else "overfit") / kind
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = (
+        args.run_dir
+        or (args.resume.parent if args.resume else None)
+        or pipeline.output / ("runs" if args.mode == "train" else "overfit") / kind
+    ).resolve()
+    if args.extend_from and run_dir.exists():
+        raise FileExistsError(f"extension requires a new run directory: {run_dir}")
     identity.update(
         mode=args.mode,
         microbatch=microbatch,
         total_updates=total_updates,
         train_records=fingerprint([row["record_hash"] for row in train_records]),
     )
-    identity_hash = fingerprint(identity)
     step, start_epoch, start_update, wandb_id = 0, 0, 0, None
     initial = None
-    if args.resume:
-        metadata = json.loads((args.resume / "state.json").read_text())
-        if metadata["identity"] != identity_hash:
-            raise ValueError("checkpoint data/configuration/runtime/topology mismatch")
+    if metadata is not None:
+        identity = resolve_continuation(
+            identity,
+            metadata,
+            checkpoint,
+            extend=args.extend_from is not None,
+            allow_sampling_change=args.allow_sampling_change,
+        )
         step, start_epoch, start_update = metadata["step"], metadata["epoch"], metadata["update"]
-        wandb_id, initial = metadata["wandb_id"], metadata["initial_metrics"]
+        wandb_id = metadata["wandb_id"] if args.resume else None
+        initial = metadata["initial_metrics"]
+        if step >= total_updates or (args.stop_after is not None and args.stop_after <= step):
+            raise ValueError("resume has no remaining updates before its stopping point")
     elif (run_dir / "run.json").exists():
         raise FileExistsError(f"run exists; use --resume explicitly: {run_dir}")
+    identity_hash = fingerprint(identity)
+    scheduler = get_constant_schedule_with_warmup(
+        optimizer, num_warmup_steps=checkpoint_warmup(identity)
+    )
+    adapter, optimizer = accelerator.prepare(adapter, optimizer)
+    accelerator.register_for_checkpointing(scheduler)
+    run_dir.mkdir(parents=True, exist_ok=True)
     run = (
-        open_wandb(pipeline, kind, args.mode, identity, wandb_id)
+        open_wandb(
+            pipeline,
+            kind,
+            f"train-{config.training.epochs}epochs" if "continuation" in identity else args.mode,
+            identity,
+            wandb_id,
+        )
         if accelerator.is_main_process
         else None
     )
@@ -369,9 +420,22 @@ def train_main(kind: AdapterKind) -> None:
             run_dir / "run.json",
             {"identity": identity_hash, "resolved": identity, "wandb_id": wandb_id},
         )
-    if args.resume:
+    if checkpoint:
         # Restore RNG after tracker setup, which may itself consume random state.
-        accelerator.load_state(str(args.resume))
+        accelerator.load_state(str(checkpoint))
+        validate_restored_state(optimizer, scheduler, step)
+        if accelerator.is_main_process:
+            restored = {
+                "checkpoint": str(checkpoint.resolve()),
+                "step": step,
+                "epoch": start_epoch,
+                "update": start_update,
+                "total_updates": total_updates,
+                "warmup_updates": checkpoint_warmup(identity),
+                "lr": scheduler.get_last_lr(),
+            }
+            write_json(run_dir / f"resume-{step:06d}.json", restored)
+            print(json.dumps({"restored": restored}), flush=True)
     evaluation_records = train_records if args.mode == "overfit" else records
     if initial is None:
         initial = evaluate_teacher_forced(
