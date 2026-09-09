@@ -111,3 +111,22 @@ and [Transformer overfit](https://wandb.ai/2162681069-peking-university/optical-
 The pure-text reference has compression ratio 1. Its aggregate results are cached
 for reuse across both experiments in `references/teacher/complete.json` and in
 [W&B](https://wandb.ai/2162681069-peking-university/optical-adaptor/runs/ds7jol7t).
+
+## Ten-epoch MLP continuation
+
+On 2026-09-09, commit `67efb05` added explicit completed-run extension and strict
+resume of the extended run. Seventeen focused remote tests passed across
+`test_training_resume.py`, `test_training_data.py`, and
+`test_training_generation.py`. These cover original warmup preservation, AdamW
+and scheduler continuation, exact identity checks, cursor consistency, rejection
+of changed training/runtime/data settings, and explicit sampling-change handling.
+Local Ruff formatting and checks passed on all three changed Python files.
+
+A remote CPU preflight loaded the actual MLP step-939 optimizer and scheduler.
+All six AdamW parameter states and the scheduler were at step 939 with LR 0.0002.
+The source checkpoint's configuration, data and record fingerprints, runtime,
+topology, and microbatch matched the proposed extension after allowing only the
+new total epoch count and the previously approved generation sampling change.
+The resolved schedule retains 29 warmup updates and adds 2,191 updates to reach
+step 3,130. The durable two-GPU job was launched on idle GPUs 8 and 9; its final
+training and generation results remain pending.
