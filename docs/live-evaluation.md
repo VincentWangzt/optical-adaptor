@@ -67,7 +67,7 @@ sampled generations logged during training. Reconstruction has a 20,000-token
 output budget, checked against every reference during preparation; QA has 32
 tokens. Generation-limit stops are reported rather than hidden. The 32K filter
 defines the common **text-prompt cohort**; native image inputs can require more
-tokens and have a separate 131,072-token context capacity. Inputs are never
+tokens and have a separate 262,144-token context capacity. Inputs are never
 silently truncated. The native processor uses its original image geometry;
 DeepSeek resizes each image to the training 640-by-640 input. Token usage records
 this unequal visual budget explicitly.

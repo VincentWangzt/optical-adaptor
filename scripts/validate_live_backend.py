@@ -59,6 +59,10 @@ def main():
         "image_tokens": image_tokens,
         "live_cache_max_abs": difference.max().item(),
         "live_cache_mean_abs": difference.mean().item(),
+        "live_cache_relative_l2": (difference.norm() / cached.float().norm()).item(),
+        "live_cache_cosine": torch.nn.functional.cosine_similarity(
+            live.float().flatten(), cached.float().flatten(), dim=0
+        ).item(),
         "vllm": response.to_dict(),
     }
     backend.vision.cpu()
@@ -89,7 +93,7 @@ def main():
     report["expected_prefix"] = record["visual"][:300]
     write_json(directory / "validation" / "live-backend.json", report)
     print(json.dumps(report, indent=2), flush=True)
-    if difference.max().item() > 0.1 or not report["greedy_text_equal"]:
+    if report["live_cache_relative_l2"] > 0.02 or not report["greedy_text_equal"]:
         raise RuntimeError("backend parity check requires investigation; see diagnostic JSON")
 
 

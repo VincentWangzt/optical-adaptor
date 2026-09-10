@@ -9,9 +9,9 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from optical_adaptor.benchmark.config import load_benchmark
+from optical_adaptor.benchmark.config import BenchmarkConfig, load_benchmark
 from optical_adaptor.inference.messages import chat_ids, text_message
-from optical_adaptor.renderer import font_codepoints, render_pages
+from optical_adaptor.renderer import FontChain, font_codepoints, render_pages
 from optical_adaptor.token_utils import load_tokenizer
 from optical_adaptor.training.config import file_sha256, fingerprint, load_credentials, write_json
 from optical_adaptor.training.data import canonicalize, load_manifest
@@ -180,8 +180,15 @@ def lcb_cases(config, pipeline, directory, tokenizer):
                 if row["prompt"].count(row["repo_text"]) != 1:
                     raise ValueError("LCB prompt must contain repo_text exactly once")
                 before, after = row["prompt"].split(row["repo_text"])
+                font = FontChain(pipeline.render.text)
+                escaped = []
+                for char in set(row["repo_text"]):
+                    if ord(char) > 127 and ord(char) in coverage:
+                        _, top, _, bottom = font.getbbox(char)
+                        if top < 0 or bottom > pipeline.render.text.line_height:
+                            escaped.append(ord(char))
                 canonical = canonicalize(
-                    row["repo_text"], coverage, pipeline.render.text.tab_width
+                    row["repo_text"], coverage.difference(escaped), pipeline.render.text.tab_width
                 ).text
                 lines = source_lines(canonical)
                 images = [
@@ -213,6 +220,7 @@ def lcb_cases(config, pipeline, directory, tokenizer):
                         "no_image_prompt": before + after,
                         "text_prompt_tokens": tokens,
                         "canonical_render_changed": canonical != row["repo_text"],
+                        "escaped_vertical_glyph_codepoints": sorted(escaped),
                     }
                 )
             print(f"LCB: {name}; retained={len(cases)} excluded={dict(excluded)}", flush=True)
@@ -232,13 +240,17 @@ def main():
     load_credentials(pipeline, wandb=False)
     directory.mkdir(parents=True, exist_ok=True)
     identity = {
-        "config": config.model_dump(),
+        "config": config.data_settings(),
         "source_manifest": file_sha256(pipeline.manifest),
         "data_fingerprint": pipeline.data_fingerprint,
     }
     state_path = directory / "preparation.json"
-    if state_path.exists() and json.loads(state_path.read_text())["identity"] != identity:
-        raise ValueError("preparation configuration changed; select a new output directory")
+    if state_path.exists():
+        previous = json.loads(state_path.read_text())["identity"]
+        if "backend" in previous["config"]:
+            previous["config"] = BenchmarkConfig.model_validate(previous["config"]).data_settings()
+        if previous != identity:
+            raise ValueError("preparation configuration changed; select a new output directory")
     write_json(state_path, {"identity": identity})
     reconstruction_path = directory / "reconstruction.json"
     if reconstruction_path.exists():

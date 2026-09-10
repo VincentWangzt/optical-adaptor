@@ -182,18 +182,24 @@ class VllmBackend:
 
     def _adapted_prompt(self, ids, images):
         torch = self.torch
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.inference_mode():
             features = []
             for offset in range(0, len(images), self.settings.vision_batch_size):
                 pixels = images[offset : offset + self.settings.vision_batch_size]
-                features.extend(self.adapter(self.vision(pixels)).cpu().unbind())
+                encoded = self.vision(pixels)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    features.extend(self.adapter(encoded).cpu().unbind())
             expanded = expand_image_tokens(ids, self.image_token, [len(f) for f in features])
             embeds = self.embedding_table[expanded].clone()
             positions = [i for i, token in enumerate(expanded) if token == self.image_token]
             if features:
                 embeds[positions] = torch.cat(features)
-        # Supplying explicit IDs also makes token accounting and stop handling unambiguous.
-        return {"prompt_embeds": embeds, "prompt_token_ids": expanded}, len(positions)
+        # IDs without this explicit mask make vLLM ignore supplied prompt embeddings.
+        return {
+            "prompt_embeds": embeds,
+            "prompt_token_ids": expanded,
+            "prompt_is_token_ids": [token != self.image_token for token in expanded],
+        }, len(positions)
 
     def generate(self, requests: list[ChatRequest]) -> list[ChatResponse]:
         from vllm import SamplingParams

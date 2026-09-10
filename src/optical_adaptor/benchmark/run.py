@@ -120,7 +120,7 @@ def main():
     destination = args.output or directory / "results" / args.backend
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    if manifest["identity"]["config"] != config.model_dump():
+    if manifest["identity"]["config"] != config.data_settings():
         raise ValueError("benchmark configuration changed after data preparation")
     cases = manifest["cases"]
     if args.suites:

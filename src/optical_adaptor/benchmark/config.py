@@ -39,6 +39,21 @@ class BenchmarkConfig(StrictConfig):
     backend: BackendConfig
     reconstruction_instruction: str
 
+    def data_settings(self) -> dict:
+        return self.model_dump(
+            include={
+                "training_config",
+                "seed",
+                "multi_image_counts",
+                "long_source_lines",
+                "qa_source_lines_per_image",
+                "lcb_dataset",
+                "lcb_revision",
+                "prompt_token_limit",
+                "reconstruction_instruction",
+            }
+        )
+
 
 def load_benchmark(path: Path):
     path = path.resolve()

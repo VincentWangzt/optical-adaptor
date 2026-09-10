@@ -12,7 +12,7 @@ reconstruction_max_tokens: 20000
 qa_max_tokens: 32
 batch_size: 4
 backend:
-  max_model_len: 131072
+  max_model_len: 262144
   max_num_seqs: 4
   max_num_batched_tokens: 4096
   max_images: 128
