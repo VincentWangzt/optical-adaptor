@@ -153,3 +153,6 @@ Upstream references:
 ## Adapter training
 
 The Accelerate/DDP training pipeline, frozen caches, and evaluation commands are documented in [docs/training.md](docs/training.md). Its canonical configuration is [configs/training.yaml](configs/training.yaml).
+
+Live multi-image reconstruction, 80-source-line reconstruction, LongCodeQA and the
+standalone vLLM chat interface are documented in [docs/live-evaluation.md](docs/live-evaluation.md).

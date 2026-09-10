@@ -32,6 +32,9 @@ prepare-adapter-data = "optical_adaptor.training.data:main"
 extract-deepseek-embeddings = "optical_adaptor.training.cache:extract_main"
 cache-qwen-teacher = "optical_adaptor.training.cache:teacher_main"
 evaluate-adapter = "optical_adaptor.training.evaluate:main"
+prepare-live-benchmark = "optical_adaptor.benchmark.prepare:main"
+evaluate-live-benchmark = "optical_adaptor.benchmark.run:main"
+serve-optical = "optical_adaptor.inference.serve:main"
 
 [build-system]
 requires = ["hatchling"]
