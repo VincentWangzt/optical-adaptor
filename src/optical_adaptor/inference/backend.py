@@ -180,15 +180,27 @@ class VllmBackend:
         with safe_open(path, framework="pt", device="cpu") as source:
             self.embedding_table = source.get_tensor(name).to(torch.bfloat16)
 
+    def encode_images(self, images):
+        """Keep the encoder's microbatch geometry identical to cache extraction.
+
+        BF16 vision kernels are measurably batch-shape dependent. Pad the final
+        microbatch with repeated pixels and discard those duplicate outputs.
+        """
+        if not images:
+            raise ValueError("encode_images requires at least one image")
+        outputs = []
+        for offset in range(0, len(images), self.settings.vision_batch_size):
+            batch = images[offset : offset + self.settings.vision_batch_size]
+            padded = batch + [batch[-1]] * (self.settings.vision_batch_size - len(batch))
+            outputs.append(self.vision(padded)[: len(batch)])
+        return self.torch.cat(outputs)
+
     def _adapted_prompt(self, ids, images):
         torch = self.torch
         with torch.inference_mode():
-            features = []
-            for offset in range(0, len(images), self.settings.vision_batch_size):
-                pixels = images[offset : offset + self.settings.vision_batch_size]
-                encoded = self.vision(pixels)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    features.extend(self.adapter(encoded).cpu().unbind())
+            encoded = self.encode_images(images)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                features = list(self.adapter(encoded).cpu().unbind())
             expanded = expand_image_tokens(ids, self.image_token, [len(f) for f in features])
             embeds = self.embedding_table[expanded].clone()
             positions = [i for i, token in enumerate(expanded) if token == self.image_token]

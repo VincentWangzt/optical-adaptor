@@ -63,7 +63,7 @@ QA control with repository text removed. The latter retains the same question,
 answer choices and instructions, and tests knowledge without supplied code.
 
 All conditions use greedy decoding with thinking disabled. This differs from the
-sampled generations logged during training. Reconstruction has a 20,000-token
+sampled generations logged during training. Reconstruction has a 32,768-token
 output budget, checked against every reference during preparation; QA has 32
 tokens. Generation-limit stops are reported rather than hidden. The 32K filter
 defines the common **text-prompt cohort**; native image inputs can require more
@@ -98,7 +98,10 @@ seed)` and returns text, usage and stop metadata. It has no dependency on benchm
 records, targets or feature caches. `build_backend` selects `vllm-adapter` or
 `vllm-native`; both use the installed vLLM inference engine.
 
-The adapter performs live DeepSeek vision inference, applies the MLP with the
+The adapter performs live DeepSeek vision inference in microbatches of eight,
+matching the original cache extraction batch geometry. It pads the final
+microbatch with duplicate pixels and discards duplicate outputs: this avoids the
+measurable BF16 feature drift seen with singleton batches. It applies the MLP with the
 training FP32-parameter/BF16-autocast convention, and replaces each image
 placeholder with 111 embeddings. Every image retains its own vision-start/end
 tokens. Adjacent image parts in a single message produce adjacent vision blocks,

@@ -53,7 +53,7 @@ def main():
     # Match the training forward convention before testing the language backend.
     cache = TensorCache(pipeline, records)
     cached = cache.batch([record], "encoder", torch.device("cuda:0"))[0]
-    live = backend.vision(images)[0]
+    live = backend.encode_images(images)[0]
     difference = (live.float() - cached.float()).abs()
     report = {
         "image_tokens": image_tokens,

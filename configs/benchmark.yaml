@@ -8,7 +8,7 @@ qa_source_lines_per_image: 80
 lcb_dataset: Steefano/LCB
 lcb_revision: 989d5eff750d65a72c522e47f8f745ef2e22906b
 prompt_token_limit: 32768
-reconstruction_max_tokens: 20000
+reconstruction_max_tokens: 32768
 qa_max_tokens: 32
 batch_size: 4
 backend:
@@ -16,7 +16,7 @@ backend:
   max_num_seqs: 4
   max_num_batched_tokens: 4096
   max_images: 128
-  vision_batch_size: 4
+  vision_batch_size: 8
   gpu_memory_utilization: 0.82
   enforce_eager: true
 reconstruction_instruction: >-
