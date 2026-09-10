@@ -91,6 +91,18 @@ CUDA_VISIBLE_DEVICES=8 uv run evaluate-live-benchmark --backend vllm-adapter \
 Use `--suites` and `--modes` to select conditions. `--report-only` aggregates saved
 results without loading a model.
 
+To compare all QA conditions with both the strict letter score and the
+[upstream LongCodeQA answer parser](https://github.com/Zteefano/long-code-bench/blob/master/src/long_code_bench/inference/codeqa_eval.py), run:
+
+```bash
+uv run python -m optical_adaptor.benchmark.compare
+```
+
+This writes `qa-comparison.json` from the unchanged responses. Upstream accepts a
+`Final Answer:` label or a terminal A-D letter, case-insensitively. Reporting both
+scores distinguishes instruction-format failures from parser differences; outputs
+that transcribe code or never supply an answer remain failures.
+
 ## Standalone inference interface
 
 `optical_adaptor.inference.backend` accepts `ChatRequest(messages, max_tokens,

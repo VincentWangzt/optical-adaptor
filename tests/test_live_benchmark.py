@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from optical_adaptor.benchmark.compare import lcb_answer
 from optical_adaptor.benchmark.prepare import join_lines, source_lines
 from optical_adaptor.benchmark.run import case_messages, score
 from optical_adaptor.inference.backend import expand_image_tokens, normalize_messages
@@ -61,6 +62,13 @@ def test_request_controls_never_include_repository_or_answer(tmp_path):
     assert score(case, "D")["correct"]
     assert not score(case, "A or D")["correct"]
     assert score(case, "Answer unavailable")["invalid_answer"]
+
+
+def test_upstream_lcb_answer_policy_is_reported_separately():
+    assert lcb_answer("Final Answer: c") == "C"
+    assert lcb_answer("The answer is B") == "B"
+    assert lcb_answer("A) an explanation") is None
+    assert lcb_answer("import hashlib") is None
 
 
 def test_qwen_template_matches_adjacent_vision_blocks():
