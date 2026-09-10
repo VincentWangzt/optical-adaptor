@@ -164,10 +164,11 @@ class VllmBackend:
             raise ValueError("checkpoint must be the configured MLP architecture")
         state = json.loads((checkpoint / "state.json").read_text())
         self.identity["checkpoint_state_sha256"] = file_sha256(checkpoint / "state.json")
-        self.identity["checkpoint_state_step"] = state.get("step", state.get("update"))
+        self.identity["checkpoint_state_step"] = state["step"]
         self.adapter = build_adapter("mlp", pipeline.config.adapter)
         self.adapter.load_state_dict(load_file(checkpoint / "adapter.safetensors"), strict=True)
-        self.adapter.to(device="cuda:0", dtype=torch.bfloat16).requires_grad_(False).eval()
+        # Match training/evaluation: FP32 adapter parameters with BF16 autocast.
+        self.adapter.to(device="cuda:0").requires_grad_(False).eval()
         self.vision = DeepSeekVision(pipeline, torch.device("cuda:0"))
         model = pipeline.config.models
         index = hf_hub_download(
@@ -181,7 +182,7 @@ class VllmBackend:
 
     def _adapted_prompt(self, ids, images):
         torch = self.torch
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             features = []
             for offset in range(0, len(images), self.settings.vision_batch_size):
                 pixels = images[offset : offset + self.settings.vision_batch_size]

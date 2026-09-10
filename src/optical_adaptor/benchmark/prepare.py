@@ -249,6 +249,22 @@ def main():
             load_manifest(pipeline), config, pipeline, directory
         )
         write_json(reconstruction_path, {"cases": cases, "audit": reconstruction_audit})
+    # Repository splitting cannot catch copied headers/code in different repositories.
+    records = load_manifest(pipeline)
+    training_hashes = {r["visual_sha256"] for r in records if r["split"] == "train"}
+    overlapping_ids = {
+        r["record_id"]
+        for r in records
+        if r["split"] == "reconstruction" and r["visual_sha256"] in training_hashes
+    }
+    excluded_cases = [
+        r["id"] for r in cases if overlapping_ids.intersection(r["source_record_ids"])
+    ]
+    cases = [r for r in cases if r["id"] not in excluded_cases]
+    reconstruction_audit["training_visual_overlap"] = {
+        "source_record_ids": sorted(overlapping_ids),
+        "excluded_case_ids": excluded_cases,
+    }
     tokenizer = load_tokenizer(
         pipeline.config.models.qwen_id, revision=pipeline.config.models.qwen_revision
     )
