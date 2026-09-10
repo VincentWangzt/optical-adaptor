@@ -10,21 +10,11 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from optical_adaptor.benchmark.config import load_benchmark
+from optical_adaptor.inference.messages import chat_ids, text_message
 from optical_adaptor.renderer import font_codepoints, render_pages
 from optical_adaptor.token_utils import load_tokenizer
 from optical_adaptor.training.config import file_sha256, fingerprint, load_credentials, write_json
 from optical_adaptor.training.data import canonicalize, load_manifest
-
-
-def text_message(text: str) -> list[dict]:
-    return [{"role": "user", "content": [{"type": "text", "text": text}]}]
-
-
-def chat_ids(tokenizer, messages: list[dict]) -> list[int]:
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-    )
-    return tokenizer.encode(prompt, add_special_tokens=False)
 
 
 def source_lines(text: str) -> list[str]:
@@ -219,7 +209,7 @@ def lcb_cases(config, pipeline, directory, tokenizer):
                         "text_prompt": row["prompt"],
                         "before_images": before,
                         "after_images": after,
-                        # Removing only the repository preserves identical question/options/instructions.
+                        # Remove only the repository; keep the question, options and instructions.
                         "no_image_prompt": before + after,
                         "text_prompt_tokens": tokens,
                         "canonical_render_changed": canonical != row["repo_text"],
