@@ -280,7 +280,13 @@ def main():
     tokenizer = load_tokenizer(
         pipeline.config.models.qwen_id, revision=pipeline.config.models.qwen_revision
     )
-    qa, qa_audit = lcb_cases(config, pipeline, directory, tokenizer)
+    qa_path = directory / "longcodeqa.json"
+    if qa_path.exists():
+        saved = json.loads(qa_path.read_text())
+        qa, qa_audit = saved["cases"], saved["audit"]
+    else:
+        qa, qa_audit = lcb_cases(config, pipeline, directory, tokenizer)
+        write_json(qa_path, {"cases": qa, "audit": qa_audit})
     cases.extend(qa)
     for case in cases:
         if case["task"] == "reconstruction":
