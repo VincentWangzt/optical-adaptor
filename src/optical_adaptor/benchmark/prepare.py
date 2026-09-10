@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
+import os
 import zipfile
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -37,7 +41,9 @@ def save_image(text: str, directory: Path, pipeline) -> dict:
     if len(images) != 1 or truncated:
         raise ValueError("benchmark image must contain the entire supplied source span")
     path.parent.mkdir(parents=True, exist_ok=True)
-    images[0].save(path)
+    temporary = path.with_suffix(f".{os.getpid()}.tmp.png")
+    images[0].save(temporary)
+    temporary.replace(path)
     metadata = {
         "path": str(path.relative_to(directory)),
         "sha256": file_sha256(path),
@@ -145,7 +151,7 @@ def reconstruction_sets(records, config, pipeline, directory):
     return cases, audit
 
 
-def lcb_cases(config, pipeline, directory, tokenizer):
+def lcb_cases(config, pipeline, directory, tokenizer, pool):
     archive = Path(
         hf_hub_download(
             config.lcb_dataset,
@@ -191,14 +197,13 @@ def lcb_cases(config, pipeline, directory, tokenizer):
                     row["repo_text"], coverage.difference(escaped), pipeline.render.text.tab_width
                 ).text
                 lines = source_lines(canonical)
-                images = [
-                    save_image(
-                        join_lines(lines[start : start + config.qa_source_lines_per_image]),
-                        directory,
-                        pipeline,
-                    )
+                pages = [
+                    join_lines(lines[start : start + config.qa_source_lines_per_image])
                     for start in range(0, len(lines), config.qa_source_lines_per_image)
                 ]
+                images = list(
+                    pool.map(partial(save_image, directory=directory, pipeline=pipeline), pages)
+                )
                 if len(images) > config.backend.max_images:
                     raise ValueError(
                         f"LCB {name}:{index} needs {len(images)} images; raise max_images"
@@ -223,6 +228,11 @@ def lcb_cases(config, pipeline, directory, tokenizer):
                         "escaped_vertical_glyph_codepoints": sorted(escaped),
                     }
                 )
+                if len(cases) % 10 == 0:
+                    print(
+                        f"LCB rendered {len(cases)} cases; latest repository={row['repo']}",
+                        flush=True,
+                    )
             print(f"LCB: {name}; retained={len(cases)} excluded={dict(excluded)}", flush=True)
     return cases, {
         "cases": len(cases),
@@ -235,7 +245,10 @@ def lcb_cases(config, pipeline, directory, tokenizer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("configs/benchmark.yaml"))
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
+    if args.workers < 1:
+        raise ValueError("workers must be positive")
     config, pipeline, directory = load_benchmark(args.config)
     load_credentials(pipeline, wandb=False)
     directory.mkdir(parents=True, exist_ok=True)
@@ -285,7 +298,10 @@ def main():
         saved = json.loads(qa_path.read_text())
         qa, qa_audit = saved["cases"], saved["audit"]
     else:
-        qa, qa_audit = lcb_cases(config, pipeline, directory, tokenizer)
+        with ProcessPoolExecutor(
+            max_workers=args.workers, mp_context=multiprocessing.get_context("spawn")
+        ) as pool:
+            qa, qa_audit = lcb_cases(config, pipeline, directory, tokenizer, pool)
         write_json(qa_path, {"cases": qa, "audit": qa_audit})
     cases.extend(qa)
     for case in cases:
