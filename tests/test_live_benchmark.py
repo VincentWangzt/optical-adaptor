@@ -7,8 +7,12 @@ from PIL import Image
 
 from optical_adaptor.benchmark.compare import lcb_answer
 from optical_adaptor.benchmark.prepare import join_lines, source_lines
-from optical_adaptor.benchmark.run import case_messages, score
-from optical_adaptor.inference.backend import expand_image_tokens, normalize_messages
+from optical_adaptor.benchmark.run import case_messages, score, task_decoding
+from optical_adaptor.inference.backend import (
+    GREEDY_DECODING,
+    expand_image_tokens,
+    normalize_messages,
+)
 from optical_adaptor.inference.messages import chat_ids
 from optical_adaptor.training.config import file_sha256, load_pipeline
 
@@ -69,6 +73,20 @@ def test_upstream_lcb_answer_policy_is_reported_separately():
     assert lcb_answer("The answer is B") == "B"
     assert lcb_answer("A) an explanation") is None
     assert lcb_answer("import hashlib") is None
+
+
+def test_reconstruction_decoding_matches_training_while_qa_stays_greedy():
+    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "configs/training.yaml")
+    reconstruction = task_decoding("reconstruction", pipeline)
+    assert reconstruction.to_vllm_kwargs() == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    }
+    assert task_decoding("qa", pipeline) == GREEDY_DECODING
 
 
 def test_qwen_template_matches_adjacent_vision_blocks():

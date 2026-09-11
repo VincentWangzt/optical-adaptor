@@ -19,10 +19,34 @@ from optical_adaptor.training.config import file_sha256
 
 
 @dataclass(frozen=True)
+class DecodingConfig:
+    temperature: float
+    top_p: float
+    top_k: int
+    presence_penalty: float
+    frequency_penalty: float
+    repetition_penalty: float
+
+    def to_vllm_kwargs(self) -> dict[str, float | int]:
+        return asdict(self)
+
+
+GREEDY_DECODING = DecodingConfig(
+    temperature=0.0,
+    top_p=1.0,
+    top_k=0,
+    presence_penalty=0.0,
+    frequency_penalty=0.0,
+    repetition_penalty=1.0,
+)
+
+
+@dataclass(frozen=True)
 class ChatRequest:
     messages: list[dict]
     max_tokens: int
     seed: int
+    decoding: DecodingConfig
 
 
 @dataclass(frozen=True)
@@ -145,7 +169,6 @@ class VllmBackend:
             else None,
             "settings": settings.model_dump(),
             "vision_cache": False,
-            "temperature": 0.0,
             "enable_thinking": False,
         }
         if checkpoint:
@@ -238,7 +261,7 @@ class VllmBackend:
             visual_counts.append(visual)
             parameters.append(
                 SamplingParams(
-                    temperature=0.0,
+                    **request.decoding.to_vllm_kwargs(),
                     max_tokens=request.max_tokens,
                     seed=request.seed,
                     stop_token_ids=[self.end_token],

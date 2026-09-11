@@ -12,7 +12,12 @@ import torch
 
 from optical_adaptor.benchmark.config import load_benchmark
 from optical_adaptor.benchmark.prepare import save_image
-from optical_adaptor.inference.backend import ChatRequest, build_backend, normalize_messages
+from optical_adaptor.inference.backend import (
+    GREEDY_DECODING,
+    ChatRequest,
+    build_backend,
+    normalize_messages,
+)
 from optical_adaptor.inference.messages import chat_ids
 from optical_adaptor.training.cache import TensorCache
 from optical_adaptor.training.config import load_credentials, write_json
@@ -49,7 +54,7 @@ def main():
     ids = chat_ids(backend.tokenizer, normalized)
     prompt, image_tokens = backend._adapted_prompt(ids, images)
     embeddings = prompt["prompt_embeds"]
-    response = backend.generate([ChatRequest(messages, 64, config.seed)])[0]
+    response = backend.generate([ChatRequest(messages, 64, config.seed, GREEDY_DECODING)])[0]
     # Match the training forward convention before testing the language backend.
     cache = TensorCache(pipeline, records)
     cached = cache.batch([record], "encoder", torch.device("cuda:0"))[0]

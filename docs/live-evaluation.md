@@ -62,17 +62,20 @@ images for both tasks, plus the official full-text QA prompt and a question-only
 QA control with repository text removed. The latter retains the same question,
 answer choices and instructions, and tests knowledge without supplied code.
 
-All conditions use greedy decoding with thinking disabled. This differs from the
-sampled generations logged during training. Reconstruction has a 32,768-token
-output budget, checked against every reference during preparation; QA has 32
-tokens. Generation-limit stops are reported rather than hidden. The 32K filter
+Thinking is disabled in every condition. QA uses greedy decoding. Reconstruction
+inherits `evaluation.sampling` from `configs/training.yaml`: temperature 1.0,
+top-p 1.0, top-k disabled, and neutral presence and repetition penalties. Its
+32,768-token output budget remains benchmark-specific and is checked against every
+reference during preparation; QA has 32 tokens. Generation-limit stops are
+reported rather than hidden. The 32K filter
 defines the common **text-prompt cohort**; native image inputs can require more
 tokens and have a separate 262,144-token context capacity. Inputs are never
 silently truncated. The native processor uses its original image geometry;
 DeepSeek resizes each image to the training 640-by-640 input. Token usage records
 this unequal visual budget explicitly.
 
-Results are written atomically per example under `results/<backend>/<mode>`.
+Results are written atomically per example under the configured
+`results-training-sampling/<backend>/<mode>` directory.
 Re-running the same command resumes missing examples after checking provenance.
 `summary.json` reports completion counts, exact-match accuracy, corpus character
 and word error rates, QA accuracy, invalid answers, visual token counts and
@@ -106,8 +109,8 @@ that transcribe code or never supply an answer remain failures.
 ## Standalone inference interface
 
 `optical_adaptor.inference.backend` accepts `ChatRequest(messages, max_tokens,
-seed)` and returns text, usage and stop metadata. It has no dependency on benchmark
-records, targets or feature caches. `build_backend` selects `vllm-adapter` or
+seed, decoding)` and returns text, usage and stop metadata. It has no dependency on
+benchmark records, targets or feature caches. `build_backend` selects `vllm-adapter` or
 `vllm-native`; both use the installed vLLM inference engine.
 
 The adapter performs live DeepSeek vision inference in microbatches of eight,

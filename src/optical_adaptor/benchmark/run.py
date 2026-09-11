@@ -9,9 +9,37 @@ from pathlib import Path
 
 from optical_adaptor.benchmark.config import load_benchmark
 from optical_adaptor.edit_distance import evaluate_edit_distance
-from optical_adaptor.inference.backend import BACKENDS, ChatRequest, build_backend
+from optical_adaptor.inference.backend import (
+    BACKENDS,
+    GREEDY_DECODING,
+    ChatRequest,
+    DecodingConfig,
+    build_backend,
+)
 from optical_adaptor.inference.messages import text_message
 from optical_adaptor.training.config import file_sha256, load_credentials, write_json
+
+
+def reconstruction_decoding(pipeline) -> DecodingConfig:
+    sampling = pipeline.config.evaluation.sampling
+    if not sampling.do_sample:
+        raise ValueError("training reconstruction decoding must use sampling")
+    return DecodingConfig(
+        temperature=sampling.temperature,
+        top_p=sampling.top_p,
+        top_k=sampling.top_k,
+        presence_penalty=sampling.presence_penalty,
+        frequency_penalty=0.0,
+        repetition_penalty=sampling.repetition_penalty,
+    )
+
+
+def task_decoding(task: str, pipeline) -> DecodingConfig:
+    if task == "qa":
+        return GREEDY_DECODING
+    if task == "reconstruction":
+        return reconstruction_decoding(pipeline)
+    raise ValueError(f"unknown benchmark task: {task}")
 
 
 def case_messages(case: dict, mode: str, directory: Path) -> list[dict]:
@@ -117,7 +145,7 @@ def main():
     )
     if args.backend == "vllm-adapter" and modes != ["images"]:
         raise ValueError("QA text controls use the unchanged native Qwen language model")
-    destination = args.output or directory / "results" / args.backend
+    destination = args.output or directory / config.results_subdir / args.backend
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     if manifest["identity"]["config"] != config.data_settings():
@@ -141,6 +169,10 @@ def main():
         print(json.dumps(report(cases, modes, destination), indent=2))
         return
     load_credentials(pipeline, wandb=False)
+    decoding = {
+        "qa": GREEDY_DECODING.to_vllm_kwargs(),
+        "reconstruction": reconstruction_decoding(pipeline).to_vllm_kwargs(),
+    }
     identity = {
         "manifest_sha256": file_sha256(manifest_path),
         "backend": args.backend,
@@ -151,6 +183,7 @@ def main():
         "transformers": version("transformers"),
         "torch": version("torch"),
         "config": config.model_dump(),
+        "decoding": decoding,
     }
     identity_path = destination / "identity.json"
     if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
@@ -183,6 +216,7 @@ def main():
                         if r["task"] == "qa"
                         else config.reconstruction_max_tokens,
                         config.seed,
+                        task_decoding(r["task"], pipeline),
                     )
                     for r in batch
                 ]

@@ -25,6 +25,7 @@ class BackendConfig(StrictConfig):
 class BenchmarkConfig(StrictConfig):
     training_config: str
     output_dir: str
+    results_subdir: str
     checkpoint: str
     seed: int
     multi_image_counts: list[PositiveInt]

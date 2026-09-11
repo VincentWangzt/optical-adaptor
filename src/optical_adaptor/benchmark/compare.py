@@ -20,7 +20,7 @@ def lcb_answer(text: str) -> str | None:
     return match[1].upper() if match else None
 
 
-def compare(directory: Path):
+def compare(directory: Path, results_directory: Path):
     cases = [
         r
         for r in json.loads((directory / "manifest.json").read_text())["cases"]
@@ -35,7 +35,7 @@ def compare(directory: Path):
     ]:
         rows = []
         for case in cases:
-            path = directory / "results" / backend / mode / f"{case['id']}.json"
+            path = results_directory / backend / mode / f"{case['id']}.json"
             if path.exists():
                 response = json.loads(path.read_text())["response"]
                 answer = lcb_answer(response["text"])
@@ -70,7 +70,7 @@ def compare(directory: Path):
                 }
             )
         report[f"{backend}/{mode}"] = result
-    write_json(directory / "qa-comparison.json", report)
+    write_json(results_directory / "qa-comparison.json", report)
     return report
 
 
@@ -78,8 +78,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("configs/benchmark.yaml"))
     args = parser.parse_args()
-    _, _, directory = load_benchmark(args.config)
-    print(json.dumps(compare(directory), indent=2))
+    config, _, directory = load_benchmark(args.config)
+    print(json.dumps(compare(directory, directory / config.results_subdir), indent=2))
 
 
 if __name__ == "__main__":
