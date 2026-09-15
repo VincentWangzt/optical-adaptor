@@ -36,10 +36,12 @@ def training_template(template: str) -> str:
     content. Neither behavior is suitable for exact transcription SFT. Fail on an
     unknown template rather than silently discarding masks or reasoning.
     """
+    content_assignment = "{%- set content = render_content(message.content, true) %}"
+    reasoning_assignment = "{%- set reasoning_content = reasoning_content %}"
     replacements = {
         "{%- if loop.index0 > ns.last_query_index %}": "{%- if true %}",
-        "{%- set content = render_content(message.content, true)|trim %}": "{%- set content = render_content(message.content, true) %}",
-        "{%- set reasoning_content = reasoning_content|trim %}": "{%- set reasoning_content = reasoning_content %}",
+        "{%- set content = render_content(message.content, true)|trim %}": content_assignment,
+        "{%- set reasoning_content = reasoning_content|trim %}": reasoning_assignment,
         '{%- elif message.role == "assistant" %}': '{%- elif message.role == "assistant" %}'
         '{{- oa_prefix ~ "as:" ~ loop.index0 ~ ":END" }}',
         '{%- elif message.role == "tool" %}': '{{- oa_prefix ~ "ae:" ~ loop.index0 ~ ":END" }}'
