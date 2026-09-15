@@ -200,10 +200,10 @@ def stack_records(
     seed: int,
     line_width: int,
 ) -> Iterator[dict]:
-    group = row["max_stars_repo_name"]
+    group = row["repository_name"]
     if not group:
         raise ValueError("The Stack record has no repository identity")
-    origin_id = row.get("hexsha") or fingerprint(row["content"])
+    origin_id = fingerprint([group, row["path"], row["content"]])
     pages = visual_spans(text, config.lines_per_image, line_width)
     rng = random.Random(fingerprint([seed, source.name, origin_id]))
     for images in config.stack_image_counts:
