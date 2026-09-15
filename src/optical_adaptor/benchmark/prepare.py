@@ -16,9 +16,10 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from optical_adaptor.benchmark.config import BenchmarkConfig, load_benchmark
 from optical_adaptor.inference.messages import chat_ids, text_message
 from optical_adaptor.renderer import FontChain, font_codepoints, render_pages
+from optical_adaptor.text import canonicalize
 from optical_adaptor.token_utils import load_tokenizer
 from optical_adaptor.training.config import file_sha256, fingerprint, load_credentials, write_json
-from optical_adaptor.training.data import canonicalize, load_manifest
+from optical_adaptor.training.data import load_manifest
 
 
 def source_lines(text: str) -> list[str]:

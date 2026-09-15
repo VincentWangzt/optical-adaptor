@@ -7,10 +7,8 @@ import json
 import multiprocessing
 import os
 import re
-import unicodedata
 from collections import Counter, deque
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +16,7 @@ import polars as pl
 from huggingface_hub import HfApi, hf_hub_download
 
 from optical_adaptor.renderer import RenderConfigError, font_codepoints, render_pages
+from optical_adaptor.text import canonicalize
 from optical_adaptor.token_utils import load_tokenizer
 from optical_adaptor.training.config import (
     SPLITS,
@@ -28,35 +27,6 @@ from optical_adaptor.training.config import (
     load_pipeline,
     write_json,
 )
-
-
-@dataclass(frozen=True)
-class CanonicalText:
-    text: str
-    source_boundaries: tuple[int, ...]
-
-
-def canonicalize(source: str, coverage: frozenset[int], tab_width: int) -> CanonicalText:
-    pieces, boundaries = [], [0]
-    for match in re.finditer(r"([^\r\n]*)(\r\n|\r|\n|$)", source):
-        line, newline = match.groups()
-        if not line and not newline:
-            continue
-        column = 0
-        for offset, char in enumerate(line.rstrip(" \t")):
-            if char == "\t":
-                rendered = " " * (tab_width - column % tab_width)
-            elif ord(char) not in coverage or unicodedata.category(char).startswith("C"):
-                rendered = f"\\u{ord(char):04x}" if ord(char) <= 0xFFFF else f"\\U{ord(char):08x}"
-            else:
-                rendered = char
-            pieces.append(rendered)
-            boundaries.extend([match.start() + offset + 1] * len(rendered))
-            column += len(rendered)
-        if newline:
-            pieces.append("\n")
-            boundaries.append(match.end())
-    return CanonicalText("".join(pieces), tuple(boundaries))
 
 
 def inspection_markup(text: str, start: int, end: int) -> str:

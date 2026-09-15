@@ -4,6 +4,7 @@ set -euo pipefail
 # Edit these variables for an experiment. Run this script on the GPU server.
 GPU_IDS="8,9"
 NUM_GPUS=2
+NCCL_P2P_DISABLE=1                # This server's GPU 8/9 P2P transport hangs.
 CONFIG="configs/automodel.yaml"
 RUN_DIR="outputs/automodel/run-v1"
 DATA_DIR="outputs/automodel/data-v1"
@@ -42,6 +43,7 @@ fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+export NCCL_P2P_DISABLE
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1

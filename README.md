@@ -1,27 +1,41 @@
 # Optical Adaptor
 
-This uv project has four commands:
+Train an optical MLP adapter from DeepSeek-OCR's frozen visual encoder into
+Qwen3.5-4B, using online CE + teacher KL in NeMo AutoModel. The project also provides:
 
 - `render-code` turns a source file into configurable, paginated Pillow images.
 - `ocr-infer` runs a configured Qwen3.5 or DeepSeek OCR model on a document image.
 - `ocr-edit-distance` compares reference and OCR text at character or word level.
 - `ocr-evaluate` selects source text, renders it, runs OCR, and writes token/accuracy metrics.
 
-Qwen3.5, DeepSeek-OCR, and DeepSeek-OCR-2 all use vLLM's native multimodal inference
-implementations. They run locally in BF16 in one shared environment.
+The standalone OCR inference commands use vLLM's native multimodal implementations.
 
 ## Set up
 
-Install the single rendering, testing, and inference environment:
+Install the locked Linux training environment on the GPU server:
 
 ```bash
-uv sync
+uv sync --locked --group dev
 ```
 
-The project pins vLLM 0.28.0 and Transformers 5.16.1. vLLM pins the compatible PyTorch,
-torchvision, CUDA-runtime, and optimized-kernel dependencies. No model-specific extras or legacy
-Transformers environment are required. The CUDA 13 runtime requires a Linux NVIDIA driver version
-580 or newer.
+AutoModel is pinned to a Git commit, with Transformers 5.15.1, PyTorch 2.13/CUDA 13,
+and FLA 0.5.2. For the standalone OCR inference commands, install the optional
+`inference` extra with `uv sync --locked --extra inference` and retain that extra
+when running them (`uv run --extra inference ...`).
+
+## Train the optical adapter
+
+Edit the variables at the top of [scripts/launch_optical_training.sh](scripts/launch_optical_training.sh)
+and the full [configs/automodel.yaml](configs/automodel.yaml), then run on the server:
+
+```bash
+bash scripts/launch_optical_training.sh --smoke  # Three steps on two idle GPUs
+bash scripts/launch_optical_training.sh          # Configured training schedule
+```
+
+The launcher prepares conversation slices, renders/encodes images online, starts
+AutoModel DDP, logs to W&B, evaluates by slice, and writes resumable adapter checkpoints.
+See [docs/training.md](docs/training.md) for data, masks, losses, resume, and limitations.
 
 ## Render code into images
 
@@ -149,10 +163,6 @@ Upstream references:
 - <https://huggingface.co/deepseek-ai/DeepSeek-OCR>
 - <https://huggingface.co/deepseek-ai/DeepSeek-OCR-2>
 - <https://docs.vllm.ai/en/stable/models/supported_models/>
-
-## Adapter training
-
-The Accelerate/DDP training pipeline, frozen caches, and evaluation commands are documented in [docs/training.md](docs/training.md). Its canonical configuration is [configs/training.yaml](configs/training.yaml).
 
 Live multi-image reconstruction, 80-source-line reconstruction, LongCodeQA and the
 standalone vLLM chat interface are documented in [docs/live-evaluation.md](docs/live-evaluation.md).

@@ -4,8 +4,9 @@ import pytest
 from pydantic import ValidationError
 
 from optical_adaptor.renderer import load_render_config, render_pages
+from optical_adaptor.text import canonicalize
 from optical_adaptor.training.config import PipelineConfig, load_pipeline
-from optical_adaptor.training.data import canonicalize, inspection_markup, repository_split
+from optical_adaptor.training.data import inspection_markup, repository_split
 
 ROOT = Path(__file__).resolve().parents[1]
 

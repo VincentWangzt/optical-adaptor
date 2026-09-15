@@ -21,7 +21,7 @@ from optical_adaptor.automodel.conversations import (
     swe_records,
 )
 from optical_adaptor.renderer import font_codepoints, load_render_config
-from optical_adaptor.training.data import canonicalize
+from optical_adaptor.text import canonicalize
 
 
 def source_rows(source):

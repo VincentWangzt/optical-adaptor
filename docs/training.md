@@ -1,222 +1,232 @@
-# Optical adaptor training
+# Online optical-adaptor training
 
-The v1 pipeline freezes DeepSeek-OCR and the post-trained Qwen3.5-4B text model, and
-trains either a token-wise MLP or a two-layer bidirectional Transformer followed by
-the MLP. `configs/training.yaml` is the canonical configuration. Unknown fields,
-incompatible shapes, stale manifests/caches, and mismatched resume configurations
-are errors.
+The default experiment trains a token-wise LayerNorm → Linear → GELU → Linear MLP
+from DeepSeek-OCR's 1280-wide visual features to Qwen3.5-4B's 2560-wide text
+embeddings. DeepSeek and Qwen stay frozen. Only the MLP receives parameter gradients
+and optimizer updates.
 
-## Data and caches
+## Launch
 
-Run Python only on the Linux server with `uv`. Commit and push local changes before
-pulling them on the server. The server's `.env` supplies `HF_TOKEN` and
-`WANDB_API_KEY`; the explicit W&B destination is in the training configuration.
-Real `.env` files, data, caches, predictions, and checkpoints are ignored by Git.
+Run Python and GPU work on the Linux server. Commit local edits, push them to
+GitHub, then pull into `~/optical-adaptor` before executing them.
 
 ```bash
-uv sync --locked
-OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false uv run --locked prepare-adapter-data --workers 8
-nvidia-smi
-# Select currently idle GPUs before executing these examples.
-CUDA_VISIBLE_DEVICES=8 uv run --locked extract-deepseek-embeddings --batch-size 8 --workers 8
-CUDA_VISIBLE_DEVICES=9 uv run --locked cache-qwen-teacher --batch-size 4
+git pull --ff-only
+bash scripts/launch_optical_training.sh --smoke
 ```
 
-Preparation uses the pinned revision of The Stack Smol, preserving all 30 languages.
-Repository-hash assignment makes splits repository-disjoint. Seeded file ordering
-and ordered consumption of CPU-worker results make selection independent of worker
-completion order. Each source file supplies at most one record. Selection resumes
-from partial checkpoints and fails with an eligibility report if exact quotas
-cannot be filled.
+The smoke profile reads 64 original records per source, prepares derived samples,
+and runs three optimizer steps on two GPUs, followed by sliced evaluation and a
+checkpoint. This tests execution, not convergence or downstream task success.
 
-The manifest contains 10,000 training records and three 500-record evaluation sets:
-front continuation, middle continuation, and reconstruction. Each span contains
-40–60 logical lines, no more than 80 display lines or 2,048 Qwen tokens, and exactly
-128 continuation tokens. Middle spans begin halfway through a file's logical lines
-and include up to 256 preceding tokens. An exact-hash overlap audit is written to
-`outputs/adapter-v1/data/eligibility.json`; repository separation alone does not
-eliminate copied files or spans.
-
-Rendering uses 1280px width, automatic height, 20px JetBrains Mono with Liberation
-Serif fallback, 28px line spacing, 100-column wrapping, and 1% margins. Unsupported
-characters and control characters become visible escapes. Newlines, four-column
-tabs, and trailing horizontal whitespace are canonicalized. Reconstruction targets
-retain logical source lines rather than inserted display wraps. An invisible final
-visual newline is excluded, while the following continuation retains its boundary
-newline. Inspection markup is generated from offsets with escaped source content.
-
-DeepSeek uses its official direct square resize to 640px and only its 476 vision
-checkpoint tensors. Encoder shards store `[N,111,1280]` BF16 tensors. Teacher shards
-store `[N,128,2560]` BF16 final normalized hidden states at the positions predicting
-the continuation. Only the 11,000 continuation-capable records require teacher
-states. Both cache types have fingerprints, exact shapes/dtypes, and file checksums;
-only verified completed shards are reused. Image rendering is prefetched by CPU
-workers; full images remain ephemeral apart from configured debug samples.
-
-## Training and profiling
-
-Each rank processes both continuation and reconstruction. Independent task
-permutations cover every training record once per task per epoch. The global batch
-is **32 pairs**, or 64 examples; each rank contributes 16 pairs on two GPUs. The
-final update contains 16 global pairs. There are 313 updates per epoch and 939 over
-three epochs. AdamW warms up for 29 updates and then holds learning rate at `2e-4`.
-Weight decay remains `0.01`.
-
-The objective is half token-mean full-vocabulary teacher-to-student KL and half
-token-mean reconstruction CE. Normalization spans every rank and microbatch in the
-entire update, including its partial final batch. Continuation CE is metric-only.
-Reconstruction optimizes the assistant end token but excludes it from reported text
-CE and token accuracy. Losses use FP32 log probabilities and reductions; the frozen
-model computation uses BF16. Chunked vocabulary projection and non-reentrant
-checkpointing bound memory. Only the adapter is wrapped in DDP and checkpointed as
-a trainable model. One gradient synchronization and optimizer step occur per update.
-The pinned FLA package supplies Qwen's linear-attention kernels; model loading fails
-if Transformers selects its slow PyTorch fallback. Torch, Transformers, and vLLM
-versions remain unchanged. Kernel versions participate in profile and resume identities.
-Deterministic GPU algorithms and the configured cuBLAS workspace make repeated
-backward passes reproducible, including checkpoint replay.
-
-Profile each candidate separately so an out-of-memory failure cannot leave another
-candidate with a damaged CUDA/DDP process. Use the same commands for
-`train_transformer_adapter.py`. Check `nvidia-smi` before each job.
+For training, edit the hardcoded variables at the top of
+[`scripts/launch_optical_training.sh`](../scripts/launch_optical_training.sh), then:
 
 ```bash
-# This server's GPU 8/9 peer-to-peer path hangs during the first NCCL collective.
-# Shared-memory transport works; apply this only to our launch environment.
-export NCCL_P2P_DISABLE=1
-CUDA_VISIBLE_DEVICES=8,9 uv run --locked accelerate launch \
-  --multi_gpu --num_processes 2 --mixed_precision bf16 \
-  --num_cpu_threads_per_process 4 --main_process_port 29571 \
-  scripts/train_mlp_adapter.py --mode profile --microbatch-size 1
-# Repeat with --microbatch-size 2, 4, and 8.
+bash scripts/launch_optical_training.sh
 ```
 
-Profiles sample evenly spaced length quantiles, including the shortest and longest
-training reconstructions, with two warmup updates and three timed updates. Every
-candidate must match the same workload fingerprint. The trainer chooses the lowest measured time among passing profiles
-below 40 GiB peak reserved memory. Results are locked per adapter and configuration.
+The complete canonical configuration is
+[`configs/automodel.yaml`](../configs/automodel.yaml). The launcher saves the fully
+resolved configuration under `RUN_DIR/config.yaml`. Change GPU IDs, output/data
+directories, steps, batch sizes, context limits, image-count filter, assistant loss
+scope, generation limits, and resume path in the script. Change source paths,
+weights, task prompts, bins, model revisions, loss mixture, and rendering in YAML.
+The launcher checks selected GPUs immediately before training and refuses devices
+with more than 1 GiB already occupied.
+The launcher also disables NCCL peer-to-peer transport for this server's known
+GPU 8/9 issue; DDP communicates through the working shared-memory path instead.
 
-```bash
-CUDA_VISIBLE_DEVICES=8,9 uv run --locked accelerate launch \
-  --multi_gpu --num_processes 2 --mixed_precision bf16 \
-  --num_cpu_threads_per_process 4 --main_process_port 29571 \
-  scripts/train_mlp_adapter.py --mode overfit --max-updates 100
+`uv sync --locked --group dev` installs the pinned Linux environment. vLLM is an
+optional `inference` extra; training imports neither vLLM nor DeepSeek's obsolete
+Transformers language decoder. The standalone DeepSeek loader imports only
+`deepencoder.py` from a pinned model commit and checks all 476 checkpoint tensors.
+Its deterministic CLIP position-ID buffer is reconstructed locally, as it is absent
+from the released weights.
 
-CUDA_VISIBLE_DEVICES=8,9 uv run --locked accelerate launch \
-  --multi_gpu --num_processes 2 --mixed_precision bf16 \
-  --num_cpu_threads_per_process 4 --main_process_port 29571 \
-  scripts/train_mlp_adapter.py --mode train
+Store `HF_TOKEN` and `WANDB_API_KEY` in the server's ignored `.env`. Online W&B is
+the default and missing credentials are an error. Explicitly setting
+`WANDB_MODE=offline` in the launcher is available for isolated tests. W&B receives
+configuration and aggregate metrics; source text, images, and generations stay on
+the server.
+
+## Data contract
+
+Three configurable sources are pinned:
+
+| Source | Tasks | Reasoning |
+| --- | --- | --- |
+| `bigcode/the-stack-smol` | Exact reconstruction and continuation, front/middle excerpts | Disabled |
+| `nvidia/Open-SWE-Traces`, `minisweagent/qwen38_27b` | Next action; observation reconstruction/continuation | Retained for next action |
+| `nvidia/Open-SWE-Traces`, `sweagent/qwen35_122b` | Next action; observation reconstruction/continuation | Disabled |
+
+The Stack uses round-robin language-shard reads, so a bounded preparation run
+does not accidentally use only the first language. Model provenance follows the
+dataset's documented source directories; it is not inferred from generated text.
+
+Every derived record stores ordinary SFT `messages` and `tools`. Assistant turns
+contain the real target transcription, continuation, or action. A sidecar
+`visual_areas` list addresses `(message, start, end)` text spans. The source text
+does not contain an executable image markup language; batch processing inserts
+configured boundary markers from these offsets. Tool-call argument JSON strings
+are normalized to objects for the native Qwen tool template.
+
+For naive tasks, seeded variation selects prompt wording, system/user instruction
+placement, and user/tool image placement. Tool placement includes a real preceding
+`read_document` call. That scaffolding call is context only; the final answer is
+the reconstruction/continuation target. No reasoning is requested for naive tasks.
+
+Visual text uses the existing newline, tab, trailing-whitespace, and font-coverage
+canonicalization. Unsupported characters become visible escapes in both the
+teacher's text and the rendered image. Images use the existing 1280px-wide,
+automatic-height rendering defaults, then DeepSeek's direct resize to 640×640.
+Each image contains at most `lines_per_image` display rows. Long observations
+paginate without ellipses. One observation can therefore produce several images.
+
+### Trajectories and slices
+
+Each SWE trajectory produces:
+
+- A `full` record retaining the complete conversation, including reasoning and
+  any trailing observations. Training consumes through the final assistant target.
+- Selected next-action records with configurable 1/2/4/8 observation-turn histories,
+  plus the initial instructions. A window includes the assistant call that caused
+  its first observation; it does not create orphan tool responses.
+- Simple reconstruction/continuation tasks from sufficiently long observations.
+
+`turn_count` counts assistant actions whose observations have visual areas; multiple
+tool responses from one action count once. `image_count` counts actual rendered
+areas. Both have independent, configurable bins. Thus a one-turn example can
+belong to the 3–4-image bin. Filter image count to 1 for strictly single-image data.
+
+Preparation writes:
+
+```text
+DATA_DIR/
+  originals/<source>.jsonl           # Complete source records, including long trajectories
+  slices/<source>/<task>/<view>/images-<bin>/turns-<bin>/<train|eval>.jsonl
+  manifest.parquet                  # Polars index, offsets, hashes, split and slice metadata
+  summary.json                     # Source counts and dataset fingerprint
 ```
 
-Full training requires a passing overfit gate for both losses. Run the two adapter
-experiments separately and sequentially. Use the remote MCP's durable job tools for
-long runs and inspect their exit codes and logs.
+Repository-hash assignment is shared across sources and derived tasks. Variants
+from a repository cannot cross train/eval. This is repository separation, not a
+claim that copied code in unrelated repositories has been eliminated. The eval
+sets are used throughout training and should not be described as a held-out test.
 
-Checkpoints include adapter safetensors/configuration, optimizer, scheduler,
-per-rank RNG, next epoch/update, dataset/configuration fingerprints, runtime versions,
-and W&B ID. Frozen model weights are excluded. To continue a saved run, append
-`--resume outputs/adapter-v1/runs/mlp/step-000250`. Existing runs require explicit
-resume. `--stop-after N` saves a checkpoint for controlled interruption tests.
-The final checkpoint and latest three periodic checkpoints are retained.
+Preflight checks token lengths and produces `checkpoints/data-report.json` with
+per-slice eligibility, rejection reasons, and teacher/student/target lengths.
+`overlength: drop` rejects a whole example; `error` stops instead. Nothing is
+token-truncated. All full records remain in the prepared dataset. To train on long
+full trajectories, select `views: [full]` and raise both context limits to fit the
+intended examples and available memory. A context limit is not a guarantee that
+the corresponding batch fits two A6000s.
+
+Training draws from a configurable source/task mixture. `balance_slices: true`
+also balances the available bins within each source/task, using replacement.
+`samples_per_epoch` controls the number of draws; an epoch is not necessarily a
+single visit to every row. A global seeded draw list is split across DP ranks.
+
+## Paired inputs and losses
+
+1. Read one conversation and its visual offsets.
+2. Serialize the native Qwen tool/chat format, preserving exact content whitespace
+   and all historical reasoning. The inference template's trimming and thought
+   removal are explicitly disabled for SFT.
+3. The teacher sees text inside the configured visual boundary markers. The
+   student replaces that text with 111 adapted feature vectors per image.
+4. Construct two prediction-position lists. For each supervised token at `p`,
+   the corresponding prediction comes from `p - 1` in that branch's own sequence.
+   The target token IDs must match exactly across both branches.
+5. Gather only these hidden states, project them into vocabulary logits in small
+   chunks, and compute ground-truth CE and AutoModel's full-vocabulary forward KL.
+
+The objective is:
+
+```text
+loss = (1 - kd_ratio) * CE + kd_ratio * T² KL(teacher_T || student_T)
+```
+
+Image slots, padding, user/system/tool messages, and injected assistant prefixes
+never contribute target labels. With `assistant_loss: all`, all genuine SWE
+assistant targets contribute, including reasoning and tool calls. With `last`, only
+the last action contributes; earlier assistant turns remain conditioning context.
+The empty no-thinking prefix is supplied as context, not learned as transcription.
+The first assistant action may precede all images: its KL is then zero in exact
+arithmetic and its CE cannot improve the adapter. Select `last` when this dilution
+is undesirable for a next-action experiment.
+
+Both branches use the **original frozen Qwen3.5-4B** as the online teacher/backbone.
+The 27B/122B trajectories supply SFT labels; those large generators are not loaded
+as distillation teachers. One Qwen instance per rank runs the teacher pass under
+`no_grad`, then the student pass with activation checkpointing. Hidden states and
+image features live only for the current batch. There are no embedding or teacher
+state caches.
+
+Loss normalization uses the number of supervised tokens across all ranks and
+accumulation microbatches, with the matching DDP reduction factor. This avoids
+giving short and long microbatches equal weight accidentally. The AutoModel VLM
+KD subclass inherits the optimizer-step loop, scheduling, gradient synchronization,
+clipping, checkpoint engine, and main training loop. Its forward hook handles the
+different sequence positions and its evaluation hook handles slice aggregation.
+The current strategy is shared-setup DDP; TP/CP/PP and separate teacher meshes are
+rejected explicitly.
 
 ## Evaluation
 
-Teacher-forced evaluation runs at initialization, every 100 updates, and completion.
-Sampled reconstruction uses a fixed 50-record subset every 500 updates and all 500
-records at completion, with a 4,096-token generation cap. Teacher-forced evaluation
-batches four records; generation batches 16 records per rank, grouped by target
-length after selecting the fixed evaluation subset. Metrics are token-weighted and stratified
-by language, aspect ratio, logical lines, and display lines. Generation reports
-character/word edit distance, CER/WER, exact match, and truncation rate. Edit distance
-is exact unit-cost Levenshtein, using RapidFuzz through the existing metric helper.
+Teacher-forced evaluation visits a deterministic per-slice subset without padding
+or repeating examples across ranks:
 
-Native Qwen and both adapters share `evaluation.sampling`: sampling is enabled,
-temperature is 1.0, top-p is 1.0, top-k is 0 (disabled), presence penalty is 0.0,
-and repetition penalty is 1.0. No additional presence-penalty processor is used.
-Each generation batch derives its random seed from the pipeline seed and ordered
-record IDs. Evaluation restores the previous CPU and selected-GPU random states,
-so it does not perturb training. Replays require the same batch membership, order,
-and runtime. These settings are included in configuration and reference fingerprints.
-The existing results report describes the earlier greedy protocol; changing the
-configuration does not update those measurements, and stale references are rejected.
+- `eval-core/{loss,ce,kl,teacher_ce,agreement,token_accuracy,tokens}`: token-weighted
+  totals over the selected evaluation mixture.
+- `eval-aux/<source>/<task>/<view>/images-<bin>/turns-<bin>/...`: the same metrics
+  for every populated slice.
+- `cer`, `ler`, and `generated_samples`: greedy, no-thinking reconstruction
+  generation, with character/line Levenshtein distances divided by reference size.
 
-```bash
-CUDA_VISIBLE_DEVICES=8 uv run --locked evaluate-adapter --reference teacher
-CUDA_VISIBLE_DEVICES=8 uv run --locked evaluate-adapter --reference native --generate
-CUDA_VISIBLE_DEVICES=8 uv run --locked evaluate-adapter \
-  --checkpoint outputs/adapter-v1/runs/mlp/final --generate
-```
+Core metrics depend on the selected mixture and token lengths; compare runs with
+the same data fingerprint and evaluation selection. Separate slice metrics are
+needed to see whether progress comes only from easy OCR examples.
 
-References are fingerprinted, evaluated once, and reused across experiments. Native
-Qwen uses its official image processor and spatial positions on the same rendered
-images; its actual grid and visual-token count are recorded under
-`references/native/inputs/` and used for compression metrics. Adapter
-embeddings use sequential pseudo-language positions instead of a native spatial grid.
-The final checkpoint is the primary result; evaluation metrics do not select a best
-checkpoint. These repeatedly inspected sets are evaluation sets, not held-out tests.
+Generations are stored in per-rank JSONL files, never sent to W&B. The smoke profile
+has a deliberately small 64-token generation limit, so its edit distances are an
+execution check, not a meaningful reconstruction-quality measurement.
 
-W&B receives aggregate metrics, hashes, configuration, throughput, and system
-statistics. Source, images, targets, predictions, manifests, and tensors stay on the
-server. Authentication errors never silently switch to offline logging.
+## Checkpoints and resume
 
-## Validation
+AutoModel checkpoints contain the MLP, optimizer, scheduler, RNG, data-loader
+position, effective configuration, W&B run ID, and a strict run-contract fingerprint.
+Frozen model weights are reloaded from the pinned upstream models. Checkpoints
+from the old cached training pipeline are not resume-compatible.
 
-Measured checks, profile results, and overfit gates are recorded in
-[training-validation.md](training-validation.md).
-Experiment measurements and completion audits are recorded in
-[training-results.md](training-results.md).
+To resume, set `RESUME_FROM` in the launcher to `LATEST` or a concrete checkpoint
+directory and keep `RUN_DIR` and `DATA_DIR` unchanged. Incompatible model, loss,
+data, or distributed contracts fail before resuming. Reusing an occupied checkpoint
+directory without an explicit resume setting is an error. A longer maximum-step
+budget can be used for a continuation; preserve the intended LR schedule.
+
+## Verification and extension points
 
 ```bash
-uv run --locked pytest
-OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 uv run --locked python -m torch.distributed.run \
-  --standalone --nproc_per_node=2 tests/test_training_distributed.py \
-  --output outputs/validation/ddp
-
-CUDA_VISIBLE_DEVICES=8,9 uv run --locked accelerate launch \
-  --multi_gpu --num_processes 2 --mixed_precision bf16 \
-  --num_cpu_threads_per_process 4 --main_process_port 29571 \
-  tests/test_training_gpu_resume.py --output outputs/validation/gpu-resume
+uv run --no-sync pytest tests/test_automodel_processing.py
 ```
 
-Focused tests cover canonicalization, render geometry, configuration, repository
-assignment, task coverage, final partial batches, exact KL and metric detachment,
-chunked gradients, target alignment, cache corruption, and checkpoint replay.
-The distributed test compares unequal-length accumulated losses with an unbatched
-reference and checks exact CPU replay. Real GPU probes additionally validate both
-frozen model boundaries, adapter-only gradients, and native/pseudo-image generation.
+The focused checks cover exact whitespace/Unicode targets, varying image lengths,
+causal prediction positions, multi-turn all/last masking, historical reasoning,
+full-trajectory preservation, and whole-example length rejection. Run the launcher
+for model loading, frozen-gradient, distributed update, evaluation, and checkpoint
+validation.
 
+`optical.llm` configures the model ID, revision, text-subconfiguration key, attention
+backend, and gradient checkpointing. `optical.vision._target_` selects an importable
+encoder factory with `pixels()` and `forward()` methods; feature dimensions and
+tokens per image are explicit. `model`/`optical.adapter` share one YAML anchor.
+The default compiler validates the Qwen3.5 template rather than assuming every
+model uses the same chat syntax. Supporting a different template requires adapting
+that compiler and checking its masks, in addition to changing the model ID.
 
-## Extend a completed run
+Upstream contracts:
 
-Use an explicit extension to increase the total epoch count while preserving the
-adapter, AdamW moments, original warmup schedule, and per-rank RNG. The source must
-be a completed training checkpoint. The destination must be a new directory; W&B
-creates a new run with the source run, checkpoint identity, and starting step in
-its continuation metadata. Data, training settings, runtime, topology, and
-microbatch must match. A validated checkpoint supplies its original microbatch
-and prior training eligibility, so throughput profiling and the overfit gate are
-not repeated.
-
-For the completed three-epoch MLP, ten total epochs means steps 940–3130:
-2,191 additional updates, or seven more passes over the 10,000 training pairs.
-The original 29-step warmup is retained and the applied LR remains 0.0002.
-
-```bash
-CUDA_VISIBLE_DEVICES=8,9 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=4 \
-TOKENIZERS_PARALLELISM=false uv run --locked accelerate launch \
-  --multi_gpu --num_processes 2 --mixed_precision bf16 \
-  --num_cpu_threads_per_process 4 --main_process_port 29571 \
-  scripts/train_mlp_adapter.py --mode train --epochs 10 \
-  --extend-from outputs/adapter-v1/runs/mlp/final \
-  --run-dir outputs/adapter-v1/runs/mlp-10epochs --allow-sampling-change
-```
-
-The explicit sampling-change flag permits only the generation sampling
-configuration to differ from the source. This is needed for the historical greedy
-checkpoint to use the currently configured temperature-1 sampling. Teacher-forced
-metrics remain comparable; new generation scores use a different decoding protocol.
-
-To resume an interrupted extension, use `--epochs 10 --resume
-outputs/adapter-v1/runs/mlp-10epochs/step-001000` with the same configuration and
-runtime. Omit `--extend-from` and `--allow-sampling-change`: ordinary resume
-requires the complete saved identity to match and continues the same W&B run.
+- [AutoModel VLM KD recipe, pinned commit](https://github.com/NVIDIA-NeMo/Automodel/blob/2c0df17efff1fc9d5128a9df1a2ed716d0f2c54a/nemo_automodel/recipes/vlm/kd.py)
+- [Open-SWE-Traces, pinned revision](https://huggingface.co/datasets/nvidia/Open-SWE-Traces/tree/f967cba3312573981a47fd7a7b80029b53909b5f)
+- [DeepSeek-OCR vision code](https://huggingface.co/deepseek-ai/DeepSeek-OCR/blob/9f30c71f441d010e5429c532364a86705536c53a/deepencoder.py)
