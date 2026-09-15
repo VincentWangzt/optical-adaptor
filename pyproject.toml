@@ -8,8 +8,8 @@ dependencies = [
     "numpy>=2.0,<3",
     "pillow>=11.1,<12",
     "pyyaml>=6.0.2,<7",
-    "transformers==5.16.1",
-    "vllm==0.28.0",
+    "transformers==5.15.1",
+    "nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git@2c0df17efff1fc9d5128a9df1a2ed716d0f2c54a",
     "torch==2.13.0",
     "accelerate>=1.10,<2",
     "datasets>=4,<5",
@@ -21,17 +21,22 @@ dependencies = [
     "pydantic>=2.11,<3",
     "rapidfuzz>=3.14,<4",
     "flash-linear-attention==0.5.2",
+    "einops>=0.8,<1",
+    "easydict>=1.13,<2",
+    "torchdata>=0.11,<1",
+    "torchao>=0.15,<1",
 ]
+
+[project.optional-dependencies]
+inference = ["vllm==0.28.0"]
 
 [project.scripts]
 render-code = "optical_adaptor.render_code:main"
 ocr-infer = "optical_adaptor.infer_ocr:main"
 ocr-edit-distance = "optical_adaptor.edit_distance:main"
 ocr-evaluate = "optical_adaptor.evaluate_ocr:main"
-prepare-adapter-data = "optical_adaptor.training.data:main"
-extract-deepseek-embeddings = "optical_adaptor.training.cache:extract_main"
-cache-qwen-teacher = "optical_adaptor.training.cache:teacher_main"
-evaluate-adapter = "optical_adaptor.training.evaluate:main"
+prepare-adapter-data = "optical_adaptor.automodel.prepare:main"
+train-optical-adapter = "optical_adaptor.automodel.recipe:main"
 prepare-live-benchmark = "optical_adaptor.benchmark.prepare:main"
 evaluate-live-benchmark = "optical_adaptor.benchmark.run:main"
 serve-optical = "optical_adaptor.inference.serve:main"
