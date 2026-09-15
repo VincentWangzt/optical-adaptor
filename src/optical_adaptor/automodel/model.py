@@ -89,7 +89,9 @@ class FrozenBackbone:
         return self.hidden(inputs, [pair.student_positions for pair in pairs])
 
     @torch.no_grad()
-    def generate(self, pair: PairedTokens, adapted: torch.Tensor, max_new_tokens: int) -> str:
+    def generate(
+        self, pair: PairedTokens, adapted: torch.Tensor, max_new_tokens: int
+    ) -> tuple[str, bool]:
         self.mode(False)
         inputs = self.inputs(pair, adapted)[: pair.generation_prefix_length].unsqueeze(0)
         ids = self.model.generate(
@@ -101,7 +103,8 @@ class FrozenBackbone:
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
         )
-        return self.tokenizer.decode(ids[0], skip_special_tokens=True)
+        ended = ids[0, -1].item() == self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        return self.tokenizer.decode(ids[0], skip_special_tokens=True), not ended
 
 
 def aligned_losses(

@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 from collections import Counter
 from contextlib import nullcontext
 from functools import partial
@@ -256,7 +257,11 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         self, idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True
     ):
         model = self.model_parts[0]
-        sync = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+        sync = (
+            get_sync_ctx(model, idx == num_batches - 1, defer_fsdp_grad_sync=False)
+            if is_train
+            else nullcontext()
+        )
         with sync:
             pairs = batch["compiled"]
             teacher = self.backbone.teacher_hidden(pairs)
@@ -293,7 +298,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         keys = sorted({row["slice"] for row in self.eval_data.rows})
         offsets = {key: i for i, key in enumerate(keys)}
         totals = torch.zeros((len(keys), 6), dtype=torch.float64, device=self.dist_env.device)
-        generation = torch.zeros((len(keys), 5), dtype=torch.float64, device=self.dist_env.device)
+        generation = torch.zeros((len(keys), 6), dtype=torch.float64, device=self.dist_env.device)
         gen_counts = Counter()
         generation_ids = set()
         for row in self.eval_data.rows:
@@ -325,7 +330,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                     )
                 pair = batch["compiled"][0]
                 adapted = self._adapt([pair], False)
-                prediction = self.backbone.generate(
+                prediction, reached_limit = self.backbone.generate(
                     pair, adapted, self.optical.evaluation.max_new_tokens
                 )
                 reference = next(
@@ -340,6 +345,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                         line_edits,
                         len(reference.splitlines()),
                         1,
+                        int(reached_limit),
                     ],
                     device=self.dist_env.device,
                 )
@@ -349,6 +355,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                         "slice": slice_key(record),
                         "reference": reference,
                         "prediction": prediction,
+                        "reached_generation_limit": reached_limit,
                     }
                 )
         self._ce_loss_buffer.clear()
@@ -385,6 +392,9 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                         f"{key}/cer": (sums[0] / sums[1].clamp_min(1)).item(),
                         f"{key}/ler": (sums[2] / sums[3].clamp_min(1)).item(),
                         f"{key}/generated_samples": sums[4].item(),
+                        f"{key}/character_edits": sums[0].item(),
+                        f"{key}/line_edits": sums[2].item(),
+                        f"{key}/generation_limit_fraction": (sums[5] / sums[4]).item(),
                     }
                 )
         if generation_rows:
@@ -425,7 +435,7 @@ def main():
         recipe.run_train_validation_loop()
     finally:
         if wandb.run is not None:
-            wandb.finish()
+            wandb.finish(exit_code=int(sys.exc_info()[0] is not None))
         if dist.is_initialized():
             dist.destroy_process_group()
 
