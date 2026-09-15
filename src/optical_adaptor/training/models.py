@@ -11,6 +11,7 @@ from safetensors import safe_open
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
 
+from optical_adaptor.adapters import MLPAdapter
 from optical_adaptor.training.config import AdapterConfig, AdapterKind, Pipeline
 
 
@@ -25,26 +26,6 @@ def qwen_kernel_identity() -> dict[str, str]:
             raise RuntimeError(f"Qwen requires the locked FLA kernel for {name}")
         kernels[name] = implementation
     return kernels
-
-
-class MLPAdapter(nn.Module):
-    def __init__(self, config: AdapterConfig):
-        super().__init__()
-        self.config = config
-        self.projection = nn.Sequential(
-            nn.LayerNorm(config.input_dim),
-            nn.Linear(config.input_dim, config.output_dim),
-            nn.GELU(),
-            nn.Linear(config.output_dim, config.output_dim),
-        )
-
-    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
-        if embeddings.ndim != 3 or embeddings.shape[1:] != (
-            self.config.sequence_length,
-            self.config.input_dim,
-        ):
-            raise ValueError("adapter input shape must be [batch,111,1280]")
-        return self.projection(embeddings)
 
 
 class TransformerAdapter(nn.Module):
@@ -70,7 +51,7 @@ class TransformerAdapter(nn.Module):
             for module in layer.modules():
                 if isinstance(module, nn.Linear):
                     module.reset_parameters()
-        self.mlp = MLPAdapter(config)
+        self.mlp = MLPAdapter(config.input_dim, config.output_dim, config.output_dim)
 
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.encoder(embeddings + self.positions))
@@ -78,7 +59,7 @@ class TransformerAdapter(nn.Module):
 
 def build_adapter(kind: AdapterKind, config: AdapterConfig) -> nn.Module:
     if kind == "mlp":
-        return MLPAdapter(config)
+        return MLPAdapter(config.input_dim, config.output_dim, config.output_dim)
     if kind == "transformer":
         return TransformerAdapter(config)
     raise ValueError(f"unknown adapter kind: {kind}")
