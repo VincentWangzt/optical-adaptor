@@ -1,0 +1,180 @@
+# Canonical online training configuration. Launch from the repository root.
+seed: 42
+model: &adapter
+  _target_: optical_adaptor.adapters.MLPAdapter
+  input_dim: 1280
+  hidden_dim: 2560
+  output_dim: 2560
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+distributed:
+  _target_: nemo_automodel.components.distributed.ddp.DDPManager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  activation_checkpointing: false
+  broadcast_buffers: false
+  find_unused_parameters: false
+  static_graph: false
+separate_meshes: false
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 1
+  num_epochs: 3
+  max_steps: null
+  ckpt_every_steps: 250
+  val_every_steps: 100
+  save_checkpoint_every_epoch: true
+  validate_on_checkpoint: true
+  log_remote_every_steps: 1
+  gc_every_steps: 100
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0002
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  eps: 1.0e-8
+lr_scheduler:
+  lr_warmup_steps: 100
+  lr_decay_style: cosine
+clip_grad_norm:
+  max_norm: 1.0
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+kd_ratio: 0.5
+kd_loss_fn:
+  _target_: nemo_automodel.components.loss.kd_loss.KDLoss
+  ignore_index: -100
+  temperature: 1.0
+  fp32_upcast: true
+  chunk_size: 64
+checkpoint:
+  enabled: true
+  checkpoint_dir: outputs/automodel/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+  is_async: false
+  restore_from: null
+wandb:
+  project: optical-adaptor
+  entity: 2162681069-peking-university
+  name: deepseek-ocr-qwen35-4b-online-kd
+  mode: online
+optical:
+  render_config: configs/render.training.yaml
+  llm:
+    model_id: Qwen/Qwen3.5-4B
+    revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+    text_config_key: text_config
+    attn_implementation: sdpa
+    gradient_checkpointing: true
+  vision:
+    _target_: optical_adaptor.automodel.vision.DeepSeekOCRVision
+    model_id: deepseek-ai/DeepSeek-OCR
+    revision: 9f30c71f441d010e5429c532364a86705536c53a
+    image_size: 640
+    output_dim: 1280
+    tokens_per_image: 111
+    expected_tensors: 476
+  adapter: *adapter
+  prepare:
+    output_dir: outputs/automodel/data
+    sources:
+      - name: stack
+        kind: stack
+        dataset_id: bigcode/the-stack-smol
+        revision: 4a6938ce94446f324c6629e7de00ac591710044b
+        data_files: data/*/data.json
+        split: train
+        thinking: false
+        max_records: 10000
+        weight: 1.0
+      - name: swe_qwen38_27b
+        kind: swe
+        dataset_id: nvidia/Open-SWE-Traces
+        revision: f967cba3312573981a47fd7a7b80029b53909b5f
+        data_files: data/minisweagent/qwen38_27b/*/*.parquet
+        split: train
+        thinking: true
+        max_records: 2000
+        weight: 1.0
+      - name: swe_qwen35_122b
+        kind: swe
+        dataset_id: nvidia/Open-SWE-Traces
+        revision: f967cba3312573981a47fd7a7b80029b53909b5f
+        data_files: data/sweagent/qwen35_122b/*/*.parquet
+        split: train
+        thinking: false
+        max_records: 2000
+        weight: 1.0
+    eval_fraction: 0.1
+    min_observation_chars: 256
+    lines_per_image: 50
+    stack_image_counts: [1, 2, 4, 8]
+    continuation_lines: 8
+    window_turns: [1, 2, 4, 8]
+    max_actions_per_trajectory: 8
+    reconstruction_observations_per_trajectory: 2
+    image_bins:
+      - {name: '1', minimum: 1, maximum: 1}
+      - {name: '2', minimum: 2, maximum: 2}
+      - {name: '3-4', minimum: 3, maximum: 4}
+      - {name: '5-8', minimum: 5, maximum: 8}
+      - {name: '9-16', minimum: 9, maximum: 16}
+      - {name: '17+', minimum: 17, maximum: null}
+    turn_bins:
+      - {name: '1', minimum: 1, maximum: 1}
+      - {name: '2', minimum: 2, maximum: 2}
+      - {name: '3-4', minimum: 3, maximum: 4}
+      - {name: '5-8', minimum: 5, maximum: 8}
+      - {name: '9-16', minimum: 9, maximum: 16}
+      - {name: '17+', minimum: 17, maximum: null}
+    instruction_roles: [system, user]
+    image_roles: [user, tool]
+    reconstruction_prompts:
+      - Transcribe the text in the images in order. Preserve whitespace and line breaks. Return only the text.
+      - Read all pages and reproduce their contents exactly, without explanation or Markdown fences.
+      - Copy the visible text faithfully, including indentation and punctuation. Output the transcription only.
+    continuation_prompts:
+      - Continue the text shown in the images. Return only the next {lines} lines.
+      - Read these pages in order and predict the following {lines} lines. Output only the continuation.
+      - Complete this excerpt with its next {lines} lines, preserving the formatting.
+  processing:
+    assistant_loss: all
+    max_teacher_tokens: 32768
+    max_student_tokens: 32768
+    overlength: drop
+    vision_start: '<|vision_start|>'
+    vision_end: '<|vision_end|>'
+    preserve_all_reasoning: true
+    loss_chunk_tokens: 64
+    image_microbatch_size: 4
+  data:
+    train_filter:
+      sources: null
+      tasks: null
+      views: null
+      image_bins: null
+      turn_bins: null
+      min_images: 1
+      max_images: null
+    eval_filter:
+      sources: null
+      tasks: null
+      views: null
+      image_bins: null
+      turn_bins: null
+      min_images: 1
+      max_images: null
+    balance_slices: true
+    task_weights: {reconstruction: 1.0, continuation: 1.0, next_action: 1.0}
+    samples_per_epoch: null
+    eval_samples_per_slice: 16
+    num_workers: 0
+  evaluation:
+    generation_every: 500
+    generation_samples_per_slice: 2
+    max_new_tokens: 4096
+    tasks: [reconstruction]

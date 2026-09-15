@@ -54,6 +54,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/optical_adaptor"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
 
