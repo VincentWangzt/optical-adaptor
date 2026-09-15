@@ -204,31 +204,28 @@ def stack_records(
     if not group:
         raise ValueError("The Stack record has no repository identity")
     origin_id = row.get("hexsha") or fingerprint(row["content"])
-    lines = text.splitlines()
+    pages = visual_spans(text, config.lines_per_image, line_width)
     rng = random.Random(fingerprint([seed, source.name, origin_id]))
     for images in config.stack_image_counts:
-        count = images * config.lines_per_image
-        if len(lines) < count + config.continuation_lines:
+        if len(pages) < images:
             continue
         # Front and middle variants have the same supervised SFT structure.
         for position in ("front", "middle"):
-            start = (
-                0
-                if position == "front"
-                else rng.randrange(1, len(lines) - count - config.continuation_lines + 1)
-                if len(lines) > count + config.continuation_lines
-                else 0
-            )
-            visual = "\n".join(lines[start : start + count])
+            if position == "middle" and len(pages) == images:
+                continue
+            page_start = 0 if position == "front" else rng.randrange(1, len(pages) - images + 1)
+            start, end = pages[page_start][0], pages[page_start + images - 1][1]
+            visual = text[start:end]
+            following = text[end:].removeprefix("\n").splitlines()[: config.continuation_lines]
+            if len(following) < config.continuation_lines:
+                continue
             for task in ("reconstruction", "continuation"):
-                target = (
-                    visual
-                    if task == "reconstruction"
-                    else "\n".join(lines[start + count : start + count + config.continuation_lines])
-                )
+                target = visual if task == "reconstruction" else "\n".join(following)
                 messages, tools, areas = naive_messages(
                     visual, target, task, config, rng, line_width
                 )
+                if len(areas) != images:
+                    raise AssertionError("Stack page selection changed the requested image count")
                 yield make_record(
                     messages=messages,
                     tools=tools,

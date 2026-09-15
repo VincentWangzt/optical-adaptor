@@ -40,6 +40,9 @@ class DeepSeekOCRVision(nn.Module):
         spec.loader.exec_module(module)
         self.sam_model = module.build_sam_vit_b()
         self.vision_model = module.build_clip_l()
+        # The native module persists this deterministic arange buffer, but the
+        # released checkpoint (and vLLM port) intentionally omit it.
+        self.vision_model.embeddings._non_persistent_buffers_set.add("position_ids")
         self.projector = module.MlpProjector(
             EasyDict(projector_type="linear", input_dim=2048, n_embed=output_dim)
         )

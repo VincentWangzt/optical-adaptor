@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 import polars as pl
 from datasets import load_dataset
 from dotenv import load_dotenv
+from huggingface_hub import HfApi
 
 from optical_adaptor.automodel.config import fingerprint, read_config
 from optical_adaptor.automodel.conversations import (
@@ -20,6 +22,44 @@ from optical_adaptor.automodel.conversations import (
 )
 from optical_adaptor.renderer import font_codepoints, load_render_config
 from optical_adaptor.training.data import canonicalize
+
+
+def source_rows(source):
+    if source.kind != "stack":
+        yield from load_dataset(
+            source.dataset_id,
+            data_files=source.data_files,
+            revision=source.revision,
+            split=source.split,
+            streaming=True,
+        )
+        return
+    # Stack shards are language-grouped. Concatenating then taking the first N
+    # would silently turn a multilingual experiment into one-language training.
+    files = HfApi().list_repo_files(
+        source.dataset_id, repo_type="dataset", revision=source.revision
+    )
+    files = sorted(name for name in files if fnmatch.fnmatchcase(name, source.data_files))
+    if not files:
+        raise ValueError(f"No source files match {source.data_files}")
+    streams = deque(
+        iter(
+            load_dataset(
+                source.dataset_id,
+                data_files=name,
+                revision=source.revision,
+                split=source.split,
+                streaming=True,
+            )
+        )
+        for name in files
+    )
+    while streams:
+        stream = streams.popleft()
+        row = next(stream, None)
+        if row is not None:
+            yield row
+            streams.append(stream)
 
 
 def prepare(config_path: str, source_limit: int | None = None) -> dict:
@@ -37,13 +77,7 @@ def prepare(config_path: str, source_limit: int | None = None) -> dict:
     )
     rows, counts, originals, seen = [], Counter(), Counter(), set()
     for source in config.sources:
-        dataset = load_dataset(
-            source.dataset_id,
-            data_files=source.data_files,
-            revision=source.revision,
-            split=source.split,
-            streaming=True,
-        )
+        dataset = source_rows(source)
         raw_path = root / "originals" / f"{source.name}.jsonl"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         limit = source_limit if source_limit is not None else source.max_records
