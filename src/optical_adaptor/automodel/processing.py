@@ -158,6 +158,8 @@ class ConversationCompiler:
                 text[low:high], add_special_tokens=False, return_offsets_mapping=True
             )
             ids.extend(encoded["input_ids"])
+            if len(ids) > self.config.max_teacher_tokens:
+                raise RejectedSample("teacher_length")
             offsets.extend((start + low, end + low) for start, end in encoded["offset_mapping"])
         target_indices = [
             i
@@ -193,8 +195,6 @@ class ConversationCompiler:
         for old in range(cursor, len(ids)):
             old_to_new[old] = len(student_ids)
             student_ids.append(ids[old])
-        if len(ids) > self.config.max_teacher_tokens:
-            raise RejectedSample("teacher_length")
         if len(student_ids) > self.config.max_student_tokens:
             raise RejectedSample("student_length")
         # A prediction at p-1 supervises the token at p, independently in each

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections import Counter
 from pathlib import Path
@@ -74,9 +75,12 @@ class ConversationDataset(Dataset):
             raise ValueError(f"Data integrity failure for {row['sample_id']}")
         return record
 
-    def preflight(self, compiler: ConversationCompiler) -> tuple[list[int], dict]:
+    def preflight(self, compiler: ConversationCompiler, indices: range) -> tuple[list[int], dict]:
         kept, dropped, lengths = [], Counter(), {}
-        for index, row in enumerate(self.rows):
+        for processed, index in enumerate(indices, start=1):
+            row = self.rows[index]
+            if processed % 1000 == 0:
+                logging.info("Preflight: %d/%d assigned records", processed, len(indices))
             try:
                 paired = compiler.compile(self[index])
             except RejectedSample as error:
@@ -90,8 +94,6 @@ class ConversationDataset(Dataset):
                 "student": len(paired.student_ids),
                 "targets": len(paired.targets),
             }
-        if not kept:
-            raise ValueError(f"No examples survive preflight: {dict(dropped)}")
         return kept, {"kept": len(kept), "dropped": dict(dropped), "lengths": lengths}
 
     def select(self, indices: list[int]):

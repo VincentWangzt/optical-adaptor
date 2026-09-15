@@ -233,9 +233,21 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             self.optical.data.train_filter if split == "train" else self.optical.data.eval_filter
         )
         dataset = ConversationDataset(self.optical.prepare.output_dir, split, filters, None)
-        payload = [dataset.preflight(self.compiler) if self.dist_env.is_main else None]
-        dist.broadcast_object_list(payload, src=0)
-        indices, report = payload[0]
+        # Every rank does CPU preflight work. Keeping other ranks blocked in an
+        # NCCL broadcast throughout a large rank-zero scan can hit its timeout.
+        assigned = range(self._get_dp_rank(), len(dataset), self._get_dp_group_size())
+        local = dataset.preflight(self.compiler, assigned)
+        shards = [None] * self._get_dp_group_size()
+        dist.all_gather_object(shards, local)
+        indices, dropped, lengths = [], Counter(), {}
+        for selected, shard_report in shards:
+            indices.extend(selected)
+            dropped.update(shard_report["dropped"])
+            lengths.update(shard_report["lengths"])
+        indices.sort()
+        if not indices:
+            raise ValueError(f"No {split} examples survive preflight: {dict(dropped)}")
+        report = {"kept": len(indices), "dropped": dict(dropped), "lengths": lengths}
         dataset.select(indices)
         if split == "eval" and self.optical.data.eval_samples_per_slice is not None:
             counts, chosen = Counter(), []

@@ -122,6 +122,7 @@ sets are used throughout training and should not be described as a held-out test
 
 Preflight checks token lengths and produces `checkpoints/data-report.json` with
 per-slice eligibility, rejection reasons, and teacher/student/target lengths.
+Ranks share the CPU preflight scan and merge their results in sample order.
 `overlength: drop` rejects a whole example; `error` stops instead. Nothing is
 token-truncated. All full records remain in the prepared dataset. To train on long
 full trajectories, select `views: [full]` and raise both context limits to fit the
