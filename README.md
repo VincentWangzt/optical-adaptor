@@ -36,6 +36,8 @@ bash scripts/launch_optical_training.sh          # Configured training schedule
 The launcher prepares conversation slices, renders/encodes images online, starts
 AutoModel DDP, logs to W&B, evaluates by slice, and writes resumable adapter checkpoints.
 See [docs/training.md](docs/training.md) for data, masks, losses, resume, and limitations.
+Measured results and validation scope are in
+[docs/automodel-validation.md](docs/automodel-validation.md).
 
 ## Render code into images
 
@@ -65,7 +67,7 @@ you need to customize this file later. Bundled font provenance and licenses are 
 ## Run OCR
 
 ```bash
-uv run ocr-infer \
+uv run --extra inference ocr-infer \
   outputs/rendered/sample-page-001.png \
   --config configs/inference.qwen3.5-4b.yaml \
   --gpu 0 \
@@ -75,15 +77,15 @@ uv run ocr-infer \
 There is also one convenience script per model. Each supplies its model-specific configuration:
 
 ```bash
-uv run python scripts/infer_qwen3_5.py outputs/rendered/sample-page-001.png
-uv run python scripts/infer_deepseek_ocr.py outputs/rendered/sample-page-001.png
-uv run python scripts/infer_deepseek_ocr_2.py outputs/rendered/sample-page-001.png
+uv run --extra inference python scripts/infer_qwen3_5.py outputs/rendered/sample-page-001.png
+uv run --extra inference python scripts/infer_deepseek_ocr.py outputs/rendered/sample-page-001.png
+uv run --extra inference python scripts/infer_deepseek_ocr_2.py outputs/rendered/sample-page-001.png
 ```
 
 Override the prompt, output budget, or vLLM execution mode:
 
 ```bash
-uv run ocr-infer image.png \
+uv run --extra inference ocr-infer image.png \
   --config configs/inference.qwen3.5-4b.yaml \
   --max-new-tokens 4096 \
   --enforce-eager \
@@ -113,7 +115,7 @@ Available model-specific configs are:
 Evaluate a whole file with Qwen:
 
 ```bash
-uv run ocr-evaluate examples/sample.py \
+uv run --extra inference ocr-evaluate examples/sample.py \
   --inference-config configs/inference.qwen3.5-4b.yaml \
   --output-dir outputs/evaluation-qwen
 ```
@@ -121,7 +123,7 @@ uv run ocr-evaluate examples/sample.py \
 Or select inclusive line numbers and cap the rendered source at a tokenizer-exact budget:
 
 ```bash
-uv run ocr-evaluate examples/sample.py \
+uv run --extra inference ocr-evaluate examples/sample.py \
   --inference-config configs/inference.deepseek-ocr-2.yaml \
   --start-line 10 --end-line 80 \
   --max-source-tokens 512 \
@@ -153,8 +155,8 @@ comes from vLLM's pinned PyTorch wheel and is independent of the system `nvcc`.
 ## Verify
 
 ```bash
-uv run pytest
-uv run ruff check .
+uv run --no-sync pytest tests/test_automodel_processing.py tests/test_automodel_losses.py tests/test_automodel_data.py tests/test_training_data.py
+uvx ruff check src/optical_adaptor/automodel tests/test_automodel_*.py
 ```
 
 Upstream references:

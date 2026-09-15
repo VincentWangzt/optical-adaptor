@@ -19,6 +19,10 @@ The smoke profile reads 64 original records per source, prepares derived samples
 and runs three optimizer steps on two GPUs, followed by sliced evaluation and a
 checkpoint. This tests execution, not convergence or downstream task success.
 
+Smoke output directories are fixed in the script's `--smoke` block. For another
+fresh smoke run, change those directories in that block; to continue an existing
+run, explicitly set its resume path and a larger step budget.
+
 For training, edit the hardcoded variables at the top of
 [`scripts/launch_optical_training.sh`](../scripts/launch_optical_training.sh), then:
 
