@@ -9,7 +9,7 @@ dist_env:
   backend: nccl
   timeout_minutes: 20
 distributed:
-  _target_: nemo_automodel.components.distributed.ddp.DDPManager
+  strategy: ddp
   tp_size: 1
   cp_size: 1
   pp_size: 1

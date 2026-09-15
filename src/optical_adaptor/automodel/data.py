@@ -91,16 +91,20 @@ class MixtureSampler(Sampler[int]):
         counts = Counter(row["slice"] for row in dataset.rows)
         source_tasks = Counter((row["source"], row["task"]) for row in dataset.rows)
         slices_per_task = Counter((key.split("/")[0], key.split("/")[1]) for key in counts)
-        tasks_per_source = Counter(source for source, task in source_tasks)
+        task_mass = Counter()
+        for source, task in source_tasks:
+            task_mass[source] += config.task_weights[task]
         weights = []
         for row in dataset.rows:
-            weight = source_weights[row["source"]] * config.task_weights[row["task"]]
+            weight = (
+                source_weights[row["source"]]
+                * config.task_weights[row["task"]]
+                / task_mass[row["source"]]
+            )
             if config.balance_slices:
-                weight /= (
-                    counts[row["slice"]]
-                    * slices_per_task[row["source"], row["task"]]
-                    * tasks_per_source[row["source"]]
-                )
+                weight /= counts[row["slice"]] * slices_per_task[row["source"], row["task"]]
+            else:
+                weight /= source_tasks[row["source"], row["task"]]
             weights.append(weight)
         self.weights = torch.tensor(weights, dtype=torch.double)
         if not torch.isfinite(self.weights).all() or (self.weights <= 0).any():
