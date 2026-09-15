@@ -109,6 +109,12 @@ DATA_DIR/
   summary.json                     # Source counts and dataset fingerprint
 ```
 
+Training verifies the preparation fingerprint before reusing a data directory.
+Source limits, revisions, prompts, pagination, seed, and rendering must match the
+effective configuration. Changing only sampling weights does not require new data.
+Use `views: [full]`, `[window]`, `[front]`, `[middle]`, or `[observation]` to filter
+view families; image and turn bins provide the separate size filters.
+
 Repository-hash assignment is shared across sources and derived tasks. Variants
 from a repository cannot cross train/eval. This is repository separation, not a
 claim that copied code in unrelated repositories has been eliminated. The eval
@@ -183,6 +189,8 @@ or repeating examples across ranks:
   for every populated slice.
 - `cer`, `ler`, and `generated_samples`: greedy, no-thinking reconstruction
   generation, with character/line Levenshtein distances divided by reference size.
+- `character_edits`, `line_edits`, and `generation_limit_fraction`: raw edit totals
+  and the fraction of generations that reached the token cap before EOS.
 
 Core metrics depend on the selected mixture and token lengths; compare runs with
 the same data fingerprint and evaluation selection. Separate slice metrics are
@@ -203,17 +211,22 @@ To resume, set `RESUME_FROM` in the launcher to `LATEST` or a concrete checkpoin
 directory and keep `RUN_DIR` and `DATA_DIR` unchanged. Incompatible model, loss,
 data, or distributed contracts fail before resuming. Reusing an occupied checkpoint
 directory without an explicit resume setting is an error. A longer maximum-step
-budget can be used for a continuation; preserve the intended LR schedule.
+budget can be used for a continuation. AutoModel restores the checkpoint's LR
+schedule, including its original decay horizon; extending the step budget does
+not restart the learning-rate curve. Changing the configured LR policy, batch
+sizes, or gradient clipping is rejected by the run contract.
 
 ## Verification and extension points
 
 ```bash
-uv run --no-sync pytest tests/test_automodel_processing.py
+uv run --no-sync pytest tests/test_automodel_processing.py tests/test_automodel_losses.py tests/test_automodel_data.py tests/test_training_data.py
 ```
 
 The focused checks cover exact whitespace/Unicode targets, varying image lengths,
 causal prediction positions, multi-turn all/last masking, historical reasoning,
-full-trajectory preservation, and whole-example length rejection. Run the launcher
+full-trajectory preservation, whole-example length rejection, exact chunked KD
+values/gradients, global-token normalization, data identity, and loader recovery
+with both zero and two data workers. Run the launcher
 for model loading, frozen-gradient, distributed update, evaluation, and checkpoint
 validation.
 

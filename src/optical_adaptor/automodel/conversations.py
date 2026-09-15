@@ -217,9 +217,9 @@ def stack_records(
             start, end = pages[page_start][0], pages[page_start + images - 1][1]
             visual = text[start:end]
             following = text[end:].removeprefix("\n").splitlines()[: config.continuation_lines]
-            if len(following) < config.continuation_lines:
-                continue
             for task in ("reconstruction", "continuation"):
+                if task == "continuation" and len(following) < config.continuation_lines:
+                    continue
                 target = visual if task == "reconstruction" else "\n".join(following)
                 messages, tools, areas = naive_messages(
                     visual, target, task, config, rng, line_width

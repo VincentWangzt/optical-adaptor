@@ -13,7 +13,7 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
-from optical_adaptor.automodel.config import fingerprint, read_config
+from optical_adaptor.automodel.config import fingerprint, preparation_fingerprint, read_config
 from optical_adaptor.automodel.conversations import (
     normalize_messages,
     slice_key,
@@ -62,7 +62,7 @@ def source_rows(source):
             streams.append(stream)
 
 
-def prepare(config_path: str, source_limit: int | None = None) -> dict:
+def prepare(config_path: str) -> dict:
     raw, optical = read_config(config_path)
     config, seed = optical.prepare, raw["seed"]
     root = Path(config.output_dir)
@@ -80,7 +80,7 @@ def prepare(config_path: str, source_limit: int | None = None) -> dict:
         dataset = source_rows(source)
         raw_path = root / "originals" / f"{source.name}.jsonl"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
-        limit = source_limit if source_limit is not None else source.max_records
+        limit = source.max_records
         with raw_path.open("w", encoding="utf-8", newline="\n") as raw_output:
             for row in dataset:
                 if limit is not None and originals[source.name] >= limit:
@@ -154,13 +154,7 @@ def prepare(config_path: str, source_limit: int | None = None) -> dict:
         raise AssertionError("Repository leakage between train and eval")
     frame.write_parquet(manifest)
     summary = {
-        "preparation_fingerprint": fingerprint(
-            {
-                "seed": seed,
-                "prepare": config.model_dump(),
-                "render": Path(optical.render_config).read_text(),
-            }
-        ),
+        "preparation_fingerprint": preparation_fingerprint(optical, seed),
         "original_records": dict(originals),
         "counts": dict(sorted(counts.items())),
         "samples": len(rows),
@@ -175,10 +169,9 @@ def prepare(config_path: str, source_limit: int | None = None) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/automodel.yaml")
-    parser.add_argument("--source-limit", type=int)
     args = parser.parse_args()
     load_dotenv()
-    prepare(args.config, args.source_limit)
+    prepare(args.config)
 
 
 if __name__ == "__main__":

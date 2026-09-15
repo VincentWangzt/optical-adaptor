@@ -131,3 +131,17 @@ def fingerprint(value) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def preparation_fingerprint(optical: OpticalConfig, seed: int) -> str:
+    prepare = optical.prepare.model_dump(exclude={"output_dir"})
+    for source in prepare["sources"]:
+        del source["weight"]  # Sampling weights do not change the stored examples.
+    return fingerprint(
+        {
+            "preparation_version": 2,
+            "seed": seed,
+            "prepare": prepare,
+            "render": Path(optical.render_config).read_text(encoding="utf-8"),
+        }
+    )

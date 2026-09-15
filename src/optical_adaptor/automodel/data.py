@@ -9,8 +9,27 @@ import polars as pl
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from optical_adaptor.automodel.config import DataConfig, FilterConfig, Source, fingerprint
+from optical_adaptor.automodel.config import (
+    DataConfig,
+    FilterConfig,
+    OpticalConfig,
+    Source,
+    fingerprint,
+    preparation_fingerprint,
+)
 from optical_adaptor.automodel.processing import ConversationCompiler, RejectedSample
+
+
+def validate_preparation(optical: OpticalConfig, seed: int) -> None:
+    root = Path(optical.prepare.output_dir)
+    if (root / "preparation.incomplete").exists():
+        raise ValueError("Data preparation is incomplete")
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    if summary["preparation_fingerprint"] != preparation_fingerprint(optical, seed):
+        raise ValueError(
+            "Prepared data does not match the requested source limits, revisions, prompts, "
+            "pagination, seed, or renderer. Prepare a fresh DATA_DIR."
+        )
 
 
 class ConversationDataset(Dataset):
@@ -22,12 +41,16 @@ class ConversationDataset(Dataset):
         for key, column in (
             ("sources", "source"),
             ("tasks", "task"),
-            ("views", "view"),
+            ("views", "view_family"),
             ("image_bins", "image_bin"),
             ("turn_bins", "turn_bin"),
         ):
             values = getattr(filters, key)
             if values is not None:
+                if column == "view_family":
+                    frame = frame.with_columns(
+                        pl.col("slice").str.split("/").list.get(2).alias(column)
+                    )
                 frame = frame.filter(pl.col(column).is_in(values))
         frame = frame.filter(pl.col("image_count") >= filters.min_images)
         if filters.max_images is not None:

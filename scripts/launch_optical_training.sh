@@ -56,7 +56,7 @@ EFFECTIVE_CONFIG="$RUN_DIR/config.yaml"
 uv run --no-sync python - "$CONFIG" "$EFFECTIVE_CONFIG" "$RUN_DIR" "$DATA_DIR" \
     "$MAX_STEPS" "$GLOBAL_BATCH_SIZE" "$LOCAL_BATCH_SIZE" "$MAX_TEACHER_TOKENS" \
     "$MAX_STUDENT_TOKENS" "$MAX_IMAGES" "$ASSISTANT_LOSS" "$WANDB_MODE" "$RESUME_FROM" \
-    "$EVAL_SAMPLES_PER_SLICE" "$GENERATION_SAMPLES_PER_SLICE" "$MAX_NEW_TOKENS" <<'PY'
+    "$EVAL_SAMPLES_PER_SLICE" "$GENERATION_SAMPLES_PER_SLICE" "$MAX_NEW_TOKENS" "$SOURCE_LIMIT" <<'PY'
 import sys
 from pathlib import Path
 import yaml
@@ -64,7 +64,7 @@ from optical_adaptor.automodel.config import OpticalConfig
 
 (source, output, run, data, steps, global_batch, local_batch, teacher_tokens,
  student_tokens, max_images, assistant_loss, mode, resume, eval_per_slice,
- generation_per_slice, max_new_tokens) = sys.argv[1:]
+ generation_per_slice, max_new_tokens, source_limit) = sys.argv[1:]
 config = yaml.safe_load(Path(source).read_text())
 config['checkpoint']['checkpoint_dir'] = str(Path(run) / 'checkpoints')
 config['checkpoint']['restore_from'] = resume or None
@@ -79,6 +79,9 @@ config['wandb']['mode'] = mode
 config['wandb']['name'] = Path(run).name
 optical = config['optical']
 optical['prepare']['output_dir'] = data
+if source_limit:
+    for source in optical['prepare']['sources']:
+        source['max_records'] = int(source_limit)
 optical['processing'].update(assistant_loss=assistant_loss,
     max_teacher_tokens=int(teacher_tokens), max_student_tokens=int(student_tokens))
 for split in ('train_filter', 'eval_filter'):
@@ -91,11 +94,7 @@ Path(output).write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8
 PY
 
 if [[ "$PREPARE_DATA" == 1 && ! -f "$DATA_DIR/manifest.parquet" ]]; then
-    PREPARE_ARGS=(--config "$EFFECTIVE_CONFIG")
-    if [[ -n "$SOURCE_LIMIT" ]]; then
-        PREPARE_ARGS+=(--source-limit "$SOURCE_LIMIT")
-    fi
-    uv run --no-sync python -m optical_adaptor.automodel.prepare "${PREPARE_ARGS[@]}" \
+    uv run --no-sync python -m optical_adaptor.automodel.prepare --config "$EFFECTIVE_CONFIG" \
         2>&1 | tee "$RUN_DIR/prepare.log"
 fi
 

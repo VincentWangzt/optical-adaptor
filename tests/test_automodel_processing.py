@@ -11,6 +11,7 @@ from optical_adaptor.automodel.conversations import (
     make_record,
     naive_messages,
     normalize_messages,
+    stack_records,
     swe_records,
     visual_spans,
 )
@@ -150,3 +151,12 @@ def test_normalize_tool_arguments():
     normalized = normalize_messages(original)
     assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"command": "ls"}
     assert original[0]["tool_calls"][0]["function"]["arguments"] == '{"command":"ls"}'
+
+
+def test_short_stack_documents_still_produce_reconstruction(settings):
+    text = "def short_file():\n    return 42"
+    row = {"repository_name": "example/repository", "path": "short.py", "content": text}
+    records = list(stack_records(row, text, settings.prepare.sources[0], settings.prepare, 42, 100))
+    assert len(records) == 1
+    assert records[0]["task"] == "reconstruction"
+    assert records[0]["messages"][-1]["content"] == text

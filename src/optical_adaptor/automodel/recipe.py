@@ -23,7 +23,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.recipes.vlm.kd import KnowledgeDistillationRecipeForVLM
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -31,7 +31,7 @@ from transformers import AutoTokenizer
 
 from optical_adaptor.automodel.config import OpticalConfig, fingerprint, read_config
 from optical_adaptor.automodel.conversations import slice_key
-from optical_adaptor.automodel.data import ConversationDataset, MixtureSampler
+from optical_adaptor.automodel.data import ConversationDataset, MixtureSampler, validate_preparation
 from optical_adaptor.automodel.model import FrozenBackbone, aligned_losses
 from optical_adaptor.automodel.processing import (
     ConversationCompiler,
@@ -106,6 +106,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         )
         output = Path(self.cfg.checkpoint.checkpoint_dir)
         output.mkdir(parents=True, exist_ok=True)
+        validate_preparation(self.optical, self.cfg.seed)
         self.train_data, train_report = self._data("train")
         self.eval_data, eval_report = self._data("eval")
         self.contract = RunContract(
@@ -121,7 +122,10 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                     "kd_ratio": self.cfg.kd_ratio,
                     "kd_loss": self.raw["kd_loss_fn"],
                     "optimizer": self.raw["optimizer"],
+                    "lr_scheduler": self.raw["lr_scheduler"],
+                    "clip_grad_norm": self.raw["clip_grad_norm"],
                     "global_batch_size": self.raw["step_scheduler"]["global_batch_size"],
+                    "local_batch_size": self.raw["step_scheduler"]["local_batch_size"],
                 }
             )
         )
@@ -200,6 +204,10 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         self.metric_logger_valid = build_metric_logger(output / "validation.jsonl")
         restore = self.raw["checkpoint"]["restore_from"]
         if restore is not None:
+            if not self.cfg.checkpoint.enabled:
+                raise ValueError("Restoring a run requires checkpoint.enabled=true")
+            if restore == "LATEST" and not any(output.glob("epoch_*_step_*")):
+                raise FileNotFoundError(f"No checkpoint to restore in {output}")
             self.load_checkpoint(restore)
         elif any(output.glob("epoch_*_step_*")):
             raise FileExistsError("Checkpoint directory is occupied; set restore_from explicitly")
@@ -209,7 +217,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 raise ValueError("Online W&B logging requires WANDB_API_KEY (load it from .env)")
             if self.contract.wandb_id:
                 self.cfg.wandb.extra.update(id=self.contract.wandb_id, resume="must")
-            run = self.cfg.wandb.build(run_config=self.raw, model_name="optical-adaptor")
+            with ScopedRNG(seed=self.cfg.seed, ranked=True):
+                run = self.cfg.wandb.build(run_config=self.raw, model_name="optical-adaptor")
             self.contract.wandb_id = run.id
             logging.info("W&B: %s", run.url)
         trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
