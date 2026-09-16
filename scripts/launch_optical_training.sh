@@ -113,5 +113,5 @@ for GPU in "${DEVICES[@]}"; do
     fi
 done
 git rev-parse HEAD > "$RUN_DIR/git-commit.txt"
-uv run --no-sync automodel --nproc-per-node "$NUM_GPUS" --config "$EFFECTIVE_CONFIG" \
+uv run --no-sync automodel "$EFFECTIVE_CONFIG" --nproc-per-node "$NUM_GPUS" \
     2>&1 | tee -a "$RUN_DIR/train.log"

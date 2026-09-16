@@ -333,6 +333,7 @@ class BaseRecipe:
                     description=f"write {key} state to {path}",
                 )
 
+        model = self._checkpoint_model(model)
         # For multi-stage PP models, use checkpointer directly to handle all parts
         # For single models, use save_pretrained for HF-compatible API
         if isinstance(model, list) and len(model) > 1:
@@ -461,7 +462,16 @@ class BaseRecipe:
                     )
                 )
 
-        return model, optimizer, scheduler
+        return self._checkpoint_model(model), optimizer, scheduler
+
+    def _checkpoint_model(self, model: nn.Module | list[nn.Module]) -> nn.Module | list[nn.Module]:
+        """Select registered modules whose parameters the run must persist.
+
+        Subclasses may select trainable submodules when other modules are
+        reconstructed from pinned checkpoints. Parameter objects must be shared
+        with the original model and its optimizer; never copy the modules.
+        """
+        return model
 
     def load_checkpoint(self, restore_from: str | None = None):
         """

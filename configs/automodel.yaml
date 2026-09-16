@@ -67,7 +67,6 @@ optical:
     attn_implementation: sdpa
     gradient_checkpointing: true
   vision: &vision
-    _target_: optical_adaptor.automodel.vision.DeepSeekOCRVision
     model_id: deepseek-ai/DeepSeek-OCR
     revision: 9f30c71f441d010e5429c532364a86705536c53a
     image_size: 640

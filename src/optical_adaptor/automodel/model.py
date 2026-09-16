@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
@@ -18,16 +17,13 @@ from optical_adaptor.adapters import MLPAdapter
 from optical_adaptor.automodel.vision import DeepSeekOCRVision
 
 
-@dataclass
-class FrozenResources:
-    """Pinned, reconstructible resources excluded from adapter checkpoint state.
+class FrozenResources(nn.Module):
+    """Registered frozen modules; the recipe checkpoints only the adapter view."""
 
-    These modules are explicitly placed on this rank's device at construction.
-    They remain frozen but the student backbone permits input gradients.
-    """
-
-    language: nn.Module
-    vision: nn.Module | None
+    def __init__(self, language: nn.Module, vision: nn.Module | None):
+        super().__init__()
+        self.language = language
+        self.vision = vision
 
 
 class OpticalModel(nn.Module):

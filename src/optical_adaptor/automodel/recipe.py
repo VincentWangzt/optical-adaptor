@@ -83,6 +83,9 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         )
 
+    def _checkpoint_model(self, model):
+        return [self.student_model().adapter]
+
     def _build_dataloaders(self):
         tokenizer = AutoTokenizer.from_pretrained(
             self.optical.llm["model_id"], revision=self.optical.llm["revision"]
