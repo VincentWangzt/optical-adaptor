@@ -26,8 +26,8 @@ than claiming untested sharding support. The original upstream mesh-backed route
 remain available for other supported models. Packing and adaptive grouping are
 explicitly deferred.
 
-`tests/test_automodel_mesh.py` in the parent repository validates the official
+`tests/test_automodel_mesh.py` in the parent repository is intended to validate the official
 bridge with both 2-student/1-teacher and 1-student/2-teacher CPU process layouts,
 unequal target counts, and two accumulation microbatches against a serial gradient
-reference. GPU optimization and resume evidence belongs in the parent validation
+reference. It has not yet run for this migration. GPU optimization and resume evidence belongs in the parent validation
 report; upstream's unrelated test suites are not a migration requirement.
