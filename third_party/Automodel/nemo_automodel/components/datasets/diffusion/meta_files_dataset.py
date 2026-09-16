@@ -1,0 +1,304 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Tuple
+
+import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
+
+from .text_to_video_dataset import collate_optional_video_fields, load_optional_video_fields
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MetaFilesDatasetConfig:
+    """Construction-time configuration for :class:`MetaFilesDataset`."""
+
+    meta_folder: str
+    """Path to the folder containing `.meta` files."""
+    device: str = "cpu"
+    """Device to load tensors to."""
+    max_files: int | None = None
+    """Maximum number of `.meta` files to use (None means no limit)."""
+
+    def build(
+        self,
+        *,
+        transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        filter_fn: Callable[[dict[str, object]], bool] | None = None,
+    ) -> "MetaFilesDataset":
+        """Build a :class:`MetaFilesDataset` from this :class:`MetaFilesDatasetConfig`.
+
+        Args:
+            transform_text: Optional transform of text embeddings shaped ``[1, S, E]``, where ``S`` is text
+                sequence length and ``E`` is embedding width. It must return the same semantic axis order.
+            transform_video: Optional transform of video latents shaped ``[1, C, T, Y, X]``, where ``C`` is
+                latent channels, ``T`` is latent frames, and ``Y``/``X`` are spatial height/width. It must
+                return the same semantic axis order.
+            filter_fn: Optional callable that filters samples by their metadata dict.
+
+        Returns:
+            Dataset loading tensors on the configured device.
+        """
+        return MetaFilesDataset(
+            meta_folder=self.meta_folder,
+            transform_text=transform_text,
+            transform_video=transform_video,
+            filter_fn=filter_fn,
+            device=self.device,
+            max_files=self.max_files,
+        )
+
+
+class MetaFilesDataset(Dataset):
+    """PyTorch dataset for WAN2.1 `.meta` files."""
+
+    def __init__(
+        self,
+        meta_folder: str,
+        transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        filter_fn: Callable[[Dict], bool] | None = None,
+        device: str = "cpu",
+        max_files: int | None = None,
+    ) -> None:
+        self.meta_folder = Path(meta_folder)
+        self.transform_text = transform_text
+        self.transform_video = transform_video
+        self.filter_fn = filter_fn
+        self.device = device
+
+        self.meta_files = sorted(self.meta_folder.glob("*.meta"))
+        if max_files is None:
+            max_files_env = os.environ.get("MAX_META_FILES")
+            if max_files_env is not None:
+                try:
+                    max_files = int(max_files_env)
+                except ValueError:
+                    logger.warning("Invalid MAX_META_FILES=%s", max_files_env)
+
+        if max_files is not None and max_files > 0:
+            self.meta_files = self.meta_files[:max_files]
+            logger.info("Limited to first %d meta files", len(self.meta_files))
+
+        if not self.meta_files:
+            raise ValueError(f"No .meta files found in {meta_folder}")
+
+        if self.filter_fn:
+            filtered = []
+            for path in self.meta_files:
+                try:
+                    data = torch.load(path, weights_only=True)
+                except Exception as exc:  # pragma: no cover - best effort logging
+                    logger.warning("Failed to load %s during filtering: %s", path, exc)
+                    continue
+                if self.filter_fn(data.get("metadata", {})):
+                    filtered.append(path)
+            self.meta_files = filtered
+            logger.info("Filtered meta files count: %d", len(self.meta_files))
+
+        self._log_dataset_stats()
+
+    def _log_dataset_stats(self) -> None:
+        sample_paths = self.meta_files[: min(5, len(self.meta_files))]
+        stats: List[Tuple[torch.Size, torch.Size, str]] = []
+        for path in sample_paths:
+            try:
+                data = torch.load(path, weights_only=True)
+                stats.append(
+                    (
+                        data["text_embeddings"].shape,
+                        data["video_latents"].shape,
+                        str(data.get("deterministic_latents", "unknown")),
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - stats only
+                logger.debug("Failed to sample %s: %s", path, exc)
+
+        if stats:
+            text_shapes, video_shapes, modes = zip(*stats, strict=False)
+            logger.info("Sample text embeddings: %s", text_shapes)
+            logger.info("Sample video latents: %s", video_shapes)
+            logger.info("Sample encoding modes: %s", set(modes))
+
+    def __len__(self) -> int:
+        return len(self.meta_files)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:  # type: ignore[override]
+        path = self.meta_files[index]
+        data = torch.load(path, weights_only=True)
+
+        text_embeddings: torch.Tensor = data["text_embeddings"].to(self.device)
+        video_latents: torch.Tensor = data["video_latents"].to(self.device)
+
+        if self.transform_text is not None:
+            text_embeddings = self.transform_text(text_embeddings)
+        if self.transform_video is not None:
+            video_latents = self.transform_video(video_latents)
+
+        file_info = {
+            "meta_filename": Path(path).name,
+            "original_filename": data.get("original_filename", "unknown"),
+            "original_video_path": data.get("original_video_path", "unknown"),
+            "deterministic_latents": data.get("deterministic_latents", "unknown"),
+            "memory_optimization": data.get("memory_optimization", "unknown"),
+            "num_frames": data.get("num_frames", "unknown"),
+        }
+
+        result = {
+            "text_embeddings": text_embeddings,
+            "video_latents": video_latents,
+            "metadata": data.get("metadata", {}),
+            "file_info": file_info,
+        }
+
+        # Optional model-specific fields (backwards compatible)
+        result.update(load_optional_video_fields(data, self.device))
+
+        return result
+
+
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Collate encoded video metadata samples into a training batch."""
+    if len(batch) > 0:
+        assert batch[0]["text_embeddings"].ndim == 3, "Expected text_embeddings.ndim to be 3"
+        assert batch[0]["video_latents"].ndim == 5, "Expected video_latents.ndim to be 5"
+    # use cat to stack the tensors in the batch
+    text_embeddings = torch.cat([item["text_embeddings"] for item in batch], dim=0)
+    video_latents = torch.cat([item["video_latents"] for item in batch], dim=0)
+
+    result = {
+        "text_embeddings": text_embeddings,
+        "video_latents": video_latents,
+        "metadata": [item["metadata"] for item in batch],
+        "file_info": [item["file_info"] for item in batch],
+    }
+
+    # Optional model-specific fields (backwards compatible)
+    collate_optional_video_fields(batch, result)
+
+    return result
+
+
+def build_node_parallel_sampler(
+    dataset: "Dataset",
+    dp_rank: int,
+    dp_world_size: int,
+    shuffle: bool = True,
+) -> "DistributedSampler" | None:
+    """Build a distributed sampler when torch.distributed is initialized."""
+    if not dist.is_initialized():
+        return None
+
+    return DistributedSampler(
+        dataset,
+        num_replicas=dp_world_size,
+        rank=dp_rank,
+        shuffle=shuffle,
+        drop_last=False,
+    )
+
+
+@dataclass
+class MetaFilesDataloaderConfig:
+    """Construction-time configuration for a pre-encoded diffusion dataloader."""
+
+    meta_folder: str
+    shuffle: bool = True
+    num_workers: int = 2
+    device: str = "cpu"
+    transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None
+    transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None
+    filter_fn: Callable[[dict[str, object]], bool] | None = None
+    max_files: int | None = None
+
+    def build(self, *, dp_rank: int, dp_world_size: int, batch_size: int) -> DiffusionDataloaderBuild:
+        """Build the configured metadata dataset, sampler, and dataloader."""
+        dataset = MetaFilesDatasetConfig(
+            meta_folder=self.meta_folder,
+            device=self.device,
+            max_files=self.max_files,
+        ).build(
+            transform_text=self.transform_text,
+            transform_video=self.transform_video,
+            filter_fn=self.filter_fn,
+        )
+        sampler = build_node_parallel_sampler(dataset, dp_rank, dp_world_size, shuffle=self.shuffle)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=sampler is None and self.shuffle,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=self.device == "cpu",
+        )
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+
+
+def build_dataloader(
+    *,
+    meta_folder: str,
+    batch_size: int,
+    dp_rank: int,
+    dp_world_size: int,
+    shuffle: bool = True,
+    num_workers: int = 2,
+    device: str = "cpu",
+    transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    filter_fn: Callable[[Dict], bool] | None = None,
+    max_files: int | None = None,
+) -> Tuple[DataLoader, DistributedSampler | None]:
+    """Build a dataloader for pre-encoded diffusion metadata files."""
+    result = MetaFilesDataloaderConfig(
+        meta_folder=meta_folder,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        device=device,
+        transform_text=transform_text,
+        transform_video=transform_video,
+        filter_fn=filter_fn,
+        max_files=max_files,
+    ).build(
+        batch_size=batch_size,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+    )
+    return result.dataloader, result.sampler
+
+
+def create_dataloader(
+    meta_folder: str,
+    batch_size: int,
+    num_nodes: int,
+) -> Tuple[DataLoader, DistributedSampler | None]:
+    """Create a default metadata dataloader for node-parallel loading."""
+    return build_dataloader(
+        meta_folder=meta_folder,
+        batch_size=batch_size,
+        dp_rank=0,
+        dp_world_size=num_nodes,
+    )

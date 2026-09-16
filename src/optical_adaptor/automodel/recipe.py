@@ -1,56 +1,52 @@
-"""AutoModel VLM KD recipe with paired text/optical inputs and adapter-only updates."""
+"""Optical data, evaluation and accounting hooks for the editable AutoModel KD recipe."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
-import os
-import sys
+import time
 from collections import Counter
-from contextlib import nullcontext
-from functools import partial
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import wandb
 from dotenv import load_dotenv
-from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed.config import DDPConfig
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.kd import KnowledgeDistillationRecipeForVLM
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
-from optical_adaptor.automodel.config import OpticalConfig, fingerprint, read_config
+from optical_adaptor.automodel.config import OpticalConfig, fingerprint
 from optical_adaptor.automodel.conversations import slice_key
-from optical_adaptor.automodel.data import ConversationDataset, MixtureSampler, validate_preparation
-from optical_adaptor.automodel.model import FrozenBackbone, aligned_losses
-from optical_adaptor.automodel.processing import (
-    ConversationCompiler,
-    collate_records,
-    render_batch,
+from optical_adaptor.automodel.data import (
+    ConversationDataset,
+    MixtureSampler,
+    inherited_values,
+    removal_report,
+    select_evaluation,
+    validate_preparation,
 )
+from optical_adaptor.automodel.processing import OpticalProcessor
 from optical_adaptor.edit_distance import levenshtein_distance
 from optical_adaptor.renderer import load_render_config
 
 
 class RunContract:
-    """Checkpointed identity; incompatible model/data/loss resumes fail explicitly."""
-
-    def __init__(self, identity: str):
+    def __init__(self, identity):
         self.identity = identity
         self.wandb_id = None
+        self.consumed = Counter()
 
     def state_dict(self):
-        return {"identity": self.identity, "wandb_id": self.wandb_id}
+        return {
+            "identity": self.identity,
+            "wandb_id": self.wandb_id,
+            "consumed": dict(self.consumed),
+        }
 
     def load_state_dict(self, state):
         if state["identity"] != self.identity:
@@ -58,259 +54,307 @@ class RunContract:
                 "Checkpoint model/data/loss/distributed contract does not match this run"
             )
         self.wandb_id = state["wandb_id"]
+        self.consumed = Counter(state["consumed"])
 
 
 class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
-    """Inherit AutoModel's accumulation, optimizer, scheduler, loop and checkpoint engine.
+    """Reuse framework setup, model builders, bridge, optimizer loop and checkpointing."""
 
-    Setup is specialized because the trainable model is an MLP, while the frozen
-    original language model is shared by teacher and student on every DP rank.
-    The forward step uses independent context positions and identical target IDs.
-    """
-
-    def __init__(self, raw: dict):
-        super().__init__(ConfigNode(raw))
-        self.optical = OpticalConfig.model_validate(raw["optical"])
-        self.raw = raw
+    def __init__(self, cfg):
+        load_dotenv()
+        super().__init__(cfg)
+        self.raw = cfg.to_yaml_dict()
+        self.optical = OpticalConfig.model_validate(self.raw["optical"])
+        if not 0 <= self.raw["kd_ratio"] <= 1 or self.raw["kd_loss_fn"]["chunk_size"] != 0:
+            raise ValueError("KD ratio must be in [0,1] and position chunking must be disabled")
+        self.events = {}
 
     def setup(self):
-        if self.cfg.get("separate_meshes", False):
-            raise ValueError("Optical KD currently requires a shared teacher/student setup")
-        if not 0 <= self.cfg.kd_ratio <= 1:
-            raise ValueError("kd_ratio must lie in [0, 1]")
-        self.dist_env = initialize_distributed(**self.raw["dist_env"])
-        setup_logging()
-        self.rng = StatefulRNG(seed=self.cfg.seed, ranked=True)
-        (
-            self.distributed_setup,
-            self.mesh_context,
-            self.distributed_config,
-            self.device_mesh,
-            self.moe_mesh,
-            self.pp_enabled,
-            self.pipeline_config,
-            self.moe_parallel_config,
-            self.activation_checkpointing,
-        ) = self._distributed_setup_attributes(self._create_distributed_setup())
-        if not isinstance(self.distributed_config, DDPConfig):
-            raise ValueError("This adapter-only recipe currently supports AutoModel DDP")
-        if self.activation_checkpointing:
-            raise ValueError("Configure checkpointing under optical.llm, not the small adapter")
-        self.peft_config, self.pp = None, None
-        self.render_config = load_render_config(self.optical.render_config)
-        self.processor = AutoTokenizer.from_pretrained(
+        super().setup()
+        if self._should_setup_training_components():
+            model = self.student_model()
+            model.stage_timer = self._stage_timer
+            if any(p.requires_grad for p in model.resources.language.parameters()):
+                raise AssertionError("Backbone must be frozen")
+
+    def student_model(self):
+        model = self.model_parts[0]
+        return (
+            model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        )
+
+    def _build_dataloaders(self):
+        tokenizer = AutoTokenizer.from_pretrained(
             self.optical.llm["model_id"], revision=self.optical.llm["revision"]
         )
-        self.compiler = ConversationCompiler(
-            self.processor, self.optical.processing, self.optical.vision["tokens_per_image"]
+        self.processor = OpticalProcessor(
+            tokenizer,
+            self.optical.processing,
+            load_render_config(self.optical.render_config),
+            self.optical.vision,
         )
-        output = Path(self.cfg.checkpoint.checkpoint_dir)
-        output.mkdir(parents=True, exist_ok=True)
+        self.compiler = self.processor.compiler
         validate_preparation(self.optical, self.cfg.seed)
         self.train_data, train_report = self._data("train")
         self.eval_data, eval_report = self._data("eval")
-        self.contract = RunContract(
-            fingerprint(
-                {
-                    "optical": self.optical.model_dump(exclude={"evaluation"}),
-                    "training_rows": self.train_data.rows,
-                    "eval_rows": self.eval_data.rows,
-                    "render": Path(self.optical.render_config).read_text(),
-                    "template": self.compiler.template,
-                    "world_size": self.dist_env.world_size,
-                    "seed": self.cfg.seed,
-                    "kd_ratio": self.cfg.kd_ratio,
-                    "kd_loss": self.raw["kd_loss_fn"],
-                    "optimizer": self.raw["optimizer"],
-                    "lr_scheduler": self.raw["lr_scheduler"],
-                    "clip_grad_norm": self.raw["clip_grad_norm"],
-                    "global_batch_size": self.raw["step_scheduler"]["global_batch_size"],
-                    "local_batch_size": self.raw["step_scheduler"]["local_batch_size"],
-                }
-            )
+        self.sampler = MixtureSampler(
+            self.train_data,
+            self.optical.data,
+            self.cfg.seed,
+            self._get_dp_rank(),
+            self._get_dp_group_size(),
+            self.raw["step_scheduler"]["global_batch_size"],
         )
+        self.untrack_state(
+            "sampler"
+        )  # StatefulDataLoader owns its cursor, including worker prefetch.
+        self.dataloader = StatefulDataLoader(
+            self.train_data,
+            batch_size=self.raw["step_scheduler"]["local_batch_size"],
+            sampler=self.sampler,
+            collate_fn=self.processor,
+            num_workers=self.optical.data.num_workers,
+        )
+        self.val_dataloader = None
+        if len(self.eval_data):
+            dp, rank = self._get_dp_group_size(), self._get_dp_rank()
+            # All student replicas issue the same number of bridge requests. Padded
+            # requests are discarded by evaluation, never counted as held-out samples.
+            indices = [
+                min(i + rank, len(self.eval_data) - 1) for i in range(0, len(self.eval_data), dp)
+            ]
+            self.val_dataloader = DataLoader(
+                self.eval_data,
+                batch_size=1,
+                sampler=indices,
+                collate_fn=self.processor,
+                num_workers=self.optical.data.num_workers,
+            )
+        leaves = self.eval_data.all_leaves
+        self.generation_counts = inherited_values(
+            self.optical.evaluation.generation_samples, leaves, integer=True
+        )
+        self.generation_limits = inherited_values(
+            self.optical.evaluation.max_new_tokens, leaves, integer=True
+        )
+        if any(value < 1 for value in self.generation_limits.values()):
+            raise ValueError("Generation output caps must be positive")
+        generation_rows = [
+            row for row in self.eval_data.rows if row["task"] in self.optical.evaluation.tasks
+        ]
+        requested = {
+            key: self.generation_counts[key]
+            for key in self.eval_data.selected_leaves
+            if key.split("/")[1] in self.optical.evaluation.tasks
+        }
+        indices, generation_report = select_evaluation(generation_rows, requested, self.cfg.seed)
+        self.generation_ids = {generation_rows[i]["sample_id"] for i in indices}
         if self.dist_env.is_main:
+            output = Path(self.cfg.checkpoint.checkpoint_dir)
+            output.mkdir(parents=True, exist_ok=True)
             (output / "data-report.json").write_text(
                 json.dumps(
                     {
                         "train": train_report,
                         "eval": eval_report,
-                        "contract": self.contract.identity,
+                        "generation": generation_report,
+                        "mixture": {
+                            key: {"ratio": ratio, "eligible_rows": self.sampler.counts[key]}
+                            for key, ratio in self.sampler.ratios.items()
+                        },
+                        "eval_ids": [row["sample_id"] for row in self.eval_data.rows],
+                        "generation_ids": sorted(self.generation_ids),
+                        "validation_scope": "sample-level",
                     },
                     indent=2,
                 )
-                + "\n",
-                encoding="utf-8",
+                + "\n"
             )
-        sampler = MixtureSampler(
-            self.train_data,
-            self.optical.prepare.sources,
-            self.optical.data,
-            self.cfg.seed,
-            self._get_dp_rank(),
-            self._get_dp_group_size(),
-        )
-        collate = partial(collate_records, compiler=self.compiler)
-        self.dataloader = StatefulDataLoader(
-            self.train_data,
-            batch_size=self.raw["step_scheduler"]["local_batch_size"],
-            sampler=sampler,
-            collate_fn=collate,
-            num_workers=self.optical.data.num_workers,
-        )
-        # Disjoint evaluation without DistributedSampler padding/repeated examples.
-        self.val_dataloader = DataLoader(
-            self.eval_data,
-            batch_size=1,
-            sampler=list(
-                range(self._get_dp_rank(), len(self.eval_data), self._get_dp_group_size())
-            ),
-            collate_fn=collate,
-            num_workers=self.optical.data.num_workers,
-        )
-        self.backbone = FrozenBackbone(
-            self.optical.llm, self.dist_env.device, self.optical.adapter["output_dim"]
-        )
-        self.teacher_model = self.backbone.model
-        self.vision = (
-            ConfigNode(self.optical.vision)
-            .instantiate()
-            .to(device=self.dist_env.device, dtype=torch.bfloat16)
-        )
-        self.untrack_state("vision")
-        adapter = self.cfg.model.instantiate().to(self.dist_env.device, dtype=torch.float32)
-        adapter = DDPManager(self.distributed_config).parallelize(adapter)
-        if self.dist_env.world_size == 1:
-            adapter.float()  # DDPManager's single-device branch casts weights to BF16.
-        self.model_parts = [adapter]
-        self.optimizer = self.cfg.optimizer.build(adapter, device_mesh=self.device_mesh)
-        self.checkpointer = self.cfg.checkpoint.build(
-            dp_rank=self._get_dp_rank(),
-            tp_rank=0,
-            pp_rank=0,
-        )
-        self.step_scheduler = self.cfg.step_scheduler.build(
-            self.dataloader,
-            self._get_dp_group_size(),
-            self.raw["step_scheduler"]["local_batch_size"],
-        )
-        self._setup_garbage_collection(self.step_scheduler)
-        self.lr_scheduler = self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
-        self.max_grad_norm = self.cfg.clip_grad_norm.max_norm
-        self.best_metric_key = "default"
-        self.loss_fn = self.cfg.loss_fn.build()
-        self._setup_kd_state()
-        self.metric_logger_train = build_metric_logger(output / "training.jsonl")
-        self.metric_logger_valid = build_metric_logger(output / "validation.jsonl")
-        restore = self.raw["checkpoint"]["restore_from"]
-        if restore is not None:
-            if not self.cfg.checkpoint.enabled:
-                raise ValueError("Restoring a run requires checkpoint.enabled=true")
-            if restore == "LATEST" and not any(output.glob("epoch_*_step_*")):
-                raise FileNotFoundError(f"No checkpoint to restore in {output}")
-            self.load_checkpoint(restore)
-        elif any(output.glob("epoch_*_step_*")):
-            raise FileExistsError("Checkpoint directory is occupied; set restore_from explicitly")
-        if self.dist_env.is_main and self.cfg.wandb is not None:
-            mode = self.cfg.wandb.extra.get("mode", "online")
-            if mode == "online" and not os.environ.get("WANDB_API_KEY"):
-                raise ValueError("Online W&B logging requires WANDB_API_KEY (load it from .env)")
-            if self.contract.wandb_id:
-                self.cfg.wandb.extra.update(id=self.contract.wandb_id, resume="must")
-            with ScopedRNG(seed=self.cfg.seed, ranked=True):
-                run = self.cfg.wandb.build(run_config=self.raw, model_name="optical-adaptor")
-            self.contract.wandb_id = run.id
-            logging.info("W&B: %s", run.url)
-        trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
-        if any(p.requires_grad for p in self.teacher_model.parameters()):
-            raise AssertionError("Language model must be entirely frozen")
-        if any(p.requires_grad for p in self.vision.parameters()):
-            raise AssertionError("Vision encoder must be entirely frozen")
-        logging.info("Trainable adapter parameters: %d; frozen encoder and backbone", trainable)
 
     def _data(self, split):
         filters = (
             self.optical.data.train_filter if split == "train" else self.optical.data.eval_filter
         )
-        dataset = ConversationDataset(self.optical.prepare.output_dir, split, filters, None)
-        # Every rank does CPU preflight work. Keeping other ranks blocked in an
-        # NCCL broadcast throughout a large rank-zero scan can hit its timeout.
+        dataset = ConversationDataset(self.optical.prepare.output_dir, split, filters)
+        before = list(dataset.rows)
         assigned = range(self._get_dp_rank(), len(dataset), self._get_dp_group_size())
         local = dataset.preflight(self.compiler, assigned)
         shards = [None] * self._get_dp_group_size()
-        dist.all_gather_object(shards, local)
+        dist.all_gather_object(shards, local, group=self._get_dp_group())
         indices, dropped, lengths = [], Counter(), {}
-        for selected, shard_report in shards:
+        for selected, report in shards:
             indices.extend(selected)
-            dropped.update(shard_report["dropped"])
-            lengths.update(shard_report["lengths"])
-        indices.sort()
-        if not indices:
-            raise ValueError(f"No {split} examples survive preflight: {dict(dropped)}")
-        report = {"kept": len(indices), "dropped": dict(dropped), "lengths": lengths}
-        dataset.select(indices)
-        if split == "eval" and self.optical.data.eval_samples_per_slice is not None:
-            counts, chosen = Counter(), []
-            for index, row in enumerate(dataset.rows):
-                if counts[row["slice"]] < self.optical.data.eval_samples_per_slice:
-                    chosen.append(index)
-                    counts[row["slice"]] += 1
-            dataset.select(chosen)
+            dropped.update(report["dropped"])
+            lengths.update(report["lengths"])
+        dataset.select(sorted(indices))
+        report = {
+            "filters": dataset.filter_report,
+            "preflight": removal_report(before, dataset.rows, split + " preflight"),
+            "dropped_reasons": dict(dropped),
+            "lengths": lengths,
+        }
+        if not len(dataset) and split == "train":
+            raise ValueError("No eligible training data")
+        if split == "eval":
+            all_requested = inherited_values(
+                self.optical.data.eval_samples, dataset.all_leaves, integer=True
+            )
+            requested = {key: all_requested[key] for key in dataset.selected_leaves}
+            indices, report["quotas"] = select_evaluation(dataset.rows, requested, self.cfg.seed)
+            dataset.select(indices)
         report["selected_slices"] = dict(Counter(row["slice"] for row in dataset.rows))
-        logging.info("%s: %d selected examples; %s dropped", split, len(dataset), report["dropped"])
         return dataset, report
 
-    def _adapt(self, pairs, is_train):
-        images = render_batch(pairs, self.render_config)
-        features = []
-        size = self.optical.processing.image_microbatch_size
-        for start in range(0, len(images), size):
-            pixels = self.vision.pixels(images[start : start + size])
-            features.append(self.vision(pixels))
-        features = torch.cat(features)
-        model = self.model_parts[0]
-        if not is_train and isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            model = model.module  # Uneven eval shards must not issue DDP collectives.
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            return model(features)
-
-    def _forward_backward_step(
-        self, idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True
-    ):
-        model = self.model_parts[0]
-        sync = (
-            get_sync_ctx(model, idx == num_batches - 1, defer_fsdp_grad_sync=False)
-            if is_train
-            else nullcontext()
+    def _setup_run_state(self):
+        identity = {
+            key: self.raw[key]
+            for key in (
+                "model",
+                "teacher_model",
+                "distributed",
+                "separate_meshes",
+                "kd_ratio",
+                "kd_loss_fn",
+                "optimizer",
+                "lr_scheduler",
+                "clip_grad_norm",
+                "optical",
+            )
+        }
+        identity.update(
+            teacher_distributed=self.raw.get("teacher_distributed"),
+            train_ids=self.train_data.rows,
+            eval_ids=self.eval_data.rows,
+            world_size=self.dist_env.world_size,
+            seed=self.cfg.seed,
+            local_batch=self.raw["step_scheduler"]["local_batch_size"],
+            global_batch=self.raw["step_scheduler"]["global_batch_size"],
+            template=self.compiler.template,
         )
-        with sync:
-            pairs = batch["compiled"]
-            teacher = self.backbone.teacher_hidden(pairs)
-            adapted = self._adapt(pairs, is_train)
-            student = self.backbone.student_hidden(pairs, adapted)
-            targets = torch.tensor(
-                [token for pair in pairs for token in pair.targets], device=self.dist_env.device
+        self.contract = RunContract(fingerprint(identity))
+        output = Path(self.cfg.checkpoint.checkpoint_dir)
+        restore = self.cfg.get("checkpoint.restore_from", None)
+        occupied = any(output.glob("epoch_*_step_*"))
+        if restore == "LATEST" and not occupied:
+            raise FileNotFoundError(f"No checkpoint in {output}")
+        if restore is None and occupied:
+            raise FileExistsError("Checkpoint directory is occupied; configure restore_from")
+
+    def _setup_wandb(self):
+        if self.cfg.wandb is not None and self.contract.wandb_id:
+            self.cfg.wandb.extra.update(id=self.contract.wandb_id, resume="must")
+        super()._setup_wandb()
+        if wandb.run is not None:
+            self.contract.wandb_id = wandb.run.id
+
+    def save_checkpoint(self, epoch, step, *args, **kwargs):
+        super().save_checkpoint(epoch, step, *args, **kwargs)
+        if self.dist_env.is_main and self.cfg.checkpoint.enabled:
+            from safetensors.torch import save_file
+
+            path = Path(self.cfg.checkpoint.checkpoint_dir) / "exports" / f"step-{step + 1:06d}"
+            path.mkdir(parents=True, exist_ok=True)
+            state = {
+                key: value.detach().cpu().contiguous()
+                for key, value in self.student_model().adapter.state_dict().items()
+            }
+            save_file(state, path / "adapter.safetensors")
+            (path / "optical-model.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "step": step + 1,
+                        "model": {
+                            "llm": self.optical.llm,
+                            "vision": self.optical.vision,
+                            "adapter": self.optical.adapter,
+                        },
+                        "run_contract": self.contract.identity,
+                    },
+                    indent=2,
+                )
+                + "\n"
             )
-            stats = aligned_losses(
-                student,
-                teacher,
-                targets,
-                self.teacher_model.get_output_embeddings(),
-                self.kd_loss_fn,
-                self.optical.processing.loss_chunk_tokens,
+
+    @contextmanager
+    def _stage_timer(self, name):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+            self.events.setdefault(name, []).append((start, end))
+
+    @torch.no_grad()
+    def _record_kd_metrics(self, student, teacher, labels, ce_loss, kd_loss, denominator):
+        valid = labels != -100
+        count = valid.sum()
+        teacher_ce = F.cross_entropy(
+            teacher.flatten(0, 1).float(), labels.flatten(), reduction="sum"
+        )
+        student_ce = ce_loss.detach() * denominator
+        if self.kd_ratio == 1:
+            student_ce = F.cross_entropy(
+                student.flatten(0, 1).float(), labels.flatten(), reduction="sum"
             )
-            ce, kl = stats[:2] / num_label_tokens
-            loss = (1 - self.kd_ratio) * ce + self.kd_ratio * kl
-            loss_buffer.append(loss.detach())
-            self._ce_loss_buffer.append(ce.detach())
-            self._kd_loss_buffer.append(kl.detach())
-            self.last_stats = stats.detach()
-            if is_train:
-                (loss * self._get_dp_group_size()).backward()
-                if any(p.grad is not None for p in self.teacher_model.parameters()):
-                    raise AssertionError("Frozen backbone received parameter gradients")
-                if any(p.grad is not None for p in self.vision.parameters()):
-                    raise AssertionError("Frozen encoder received parameter gradients")
+        self.last_stats = torch.stack(
+            (
+                student_ce,
+                kd_loss.detach() * denominator,
+                teacher_ce,
+                ((student.argmax(-1) == teacher.argmax(-1)) & valid).sum(),
+                ((student.argmax(-1) == labels) & valid).sum(),
+                count,
+            )
+        )
+
+    def _run_train_optim_step(self, batches, max_grad_norm=None):
+        self.events.clear()
+        started = time.perf_counter()
+        self.timestamp = started
+        result = super()._run_train_optim_step(batches, max_grad_norm)
+        torch.cuda.synchronize()  # One collection boundary, never synchronize each substep.
+        elapsed = self._dp_allreduce(
+            torch.tensor(time.perf_counter() - started), op=dist.ReduceOp.MAX
+        ).item()
+        local_counts = Counter(
+            slice_key(record) for batch in batches for record in batch["records"]
+        )
+        counts = self._dp_allreduce(
+            torch.tensor([local_counts[key] for key in self.sampler.ratios])
+        ).tolist()
+        metrics = {"timing/step": elapsed}
+        for key, count in zip(self.sampler.ratios, counts, strict=True):
+            self.contract.consumed[key] += count
+            metrics.update(
+                {
+                    f"data/ratio/{key}": self.sampler.ratios[key],
+                    f"data/observed_ratio/{key}": count / sum(counts),
+                    f"data/training_samples/{key}": self.contract.consumed[key],
+                    f"data/training_epochs/{key}": self.contract.consumed[key]
+                    / self.sampler.counts[key],
+                }
+            )
+        totals = [sum(len(batch["records"]) for batch in batches)]
+        pairs = [pair for batch in batches for pair in batch["compiled"]]
+        totals += [
+            sum(len(getattr(pair, field)) for pair in pairs)
+            for field in ("teacher_ids", "student_ids", "targets", "image_positions")
+        ]
+        totals = self._dp_allreduce(torch.tensor(totals)).tolist()
+        names = ("size", "teacher_input_tokens", "student_input_tokens", "loss_tokens", "images")
+        metrics.update({f"batch/{name}": value for name, value in zip(names, totals, strict=True)})
+        for name, value in zip(names[1:4], totals[1:4], strict=True):
+            metrics[f"throughput/{name}_per_second"] = value / elapsed
+        for name, events in self.events.items():
+            seconds = sum(start.elapsed_time(end) for start, end in events) / 1000
+            metrics[f"timing/{name}"] = self._dp_allreduce(
+                torch.tensor(seconds), op=dist.ReduceOp.MAX
+            ).item()
+        metrics["tps"] = totals[3] / elapsed
+        result.metrics.update(metrics)
+        return result
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
@@ -320,19 +364,12 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         offsets = {key: i for i, key in enumerate(keys)}
         totals = torch.zeros((len(keys), 6), dtype=torch.float64, device=self.dist_env.device)
         generation = torch.zeros((len(keys), 6), dtype=torch.float64, device=self.dist_env.device)
-        gen_counts = Counter()
-        generation_ids = set()
-        for row in self.eval_data.rows:
-            if row["task"] in self.optical.evaluation.tasks and (
-                gen_counts[row["slice"]] < self.optical.evaluation.generation_samples_per_slice
-            ):
-                gen_counts[row["slice"]] += 1
-                generation_ids.add(row["sample_id"])
+        generation_ids = self.generation_ids
         generate = self.step_scheduler.is_last_step or (
             (self.step_scheduler.step + 1) % self.optical.evaluation.generation_every == 0
         )
         generation_rows = []
-        for batch in val_dataloader:
+        for batch_index, batch in enumerate(val_dataloader):
             record = batch["records"][0]
             index = offsets[slice_key(record)]
             self._forward_backward_step(
@@ -343,6 +380,11 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 num_batches=1,
                 is_train=False,
             )
+            valid = batch_index * self._get_dp_group_size() + self._get_dp_rank() < len(
+                self.eval_data
+            )
+            if not valid:
+                continue
             totals[index] += self.last_stats.double()
             if generate and record["sample_id"] in generation_ids:
                 if record["thinking"]:
@@ -350,10 +392,21 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                         "Generative edit-distance evaluation requires a no-thinking task"
                     )
                 pair = batch["compiled"][0]
-                adapted = self._adapt([pair], False)
-                prediction, reached_limit = self.backbone.generate(
-                    pair, adapted, self.optical.evaluation.max_new_tokens
+                model = self.student_model()
+                inputs = {
+                    key: value.to(self.dist_env.device)
+                    for key, value in batch["student"].items()
+                    if key in {"input_ids", "attention_mask", "pixel_values", "image_positions"}
+                }
+                for key in ("input_ids", "attention_mask"):
+                    inputs[key] = inputs[key][:, : pair.generation_prefix_length]
+                ids = model.generate(
+                    **inputs, max_new_tokens=self.generation_limits[slice_key(record)]
                 )
+                reached_limit = ids[0, -1].item() != model.tokenizer.convert_tokens_to_ids(
+                    "<|im_end|>"
+                )
+                prediction = model.tokenizer.decode(ids[0], skip_special_tokens=True)
                 reference = next(
                     m["content"] for m in reversed(record["messages"]) if m["role"] == "assistant"
                 )
@@ -381,11 +434,11 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 )
         self._ce_loss_buffer.clear()
         self._kd_loss_buffer.clear()
-        dist.all_reduce(totals)
-        dist.all_reduce(generation)
+        totals = self._dp_allreduce(totals)
+        generation = self._dp_allreduce(generation)
         metrics = {}
         for key, sums in [
-            ("eval-core", totals.sum(0)),
+            *aggregate_metrics(keys, totals),
             *[("eval-aux/" + name, totals[i]) for i, name in enumerate(keys)],
         ]:
             count = sums[5].item()
@@ -404,7 +457,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 }
             )
         for key, sums in [
-            ("eval-core", generation.sum(0)),
+            *aggregate_metrics(keys, generation),
             *[("eval-aux/" + name, generation[i]) for i, name in enumerate(keys)],
         ]:
             if sums[4] > 0:
@@ -444,22 +497,10 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             )
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/automodel.yaml")
-    args = parser.parse_args()
-    load_dotenv()
-    raw, _ = read_config(args.config)
-    recipe = OpticalKDRecipe(raw)
-    try:
-        recipe.setup()
-        recipe.run_train_validation_loop()
-    finally:
-        if wandb.run is not None:
-            wandb.finish(exit_code=int(sys.exc_info()[0] is not None))
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()
+def aggregate_metrics(keys, totals):
+    result = [("eval-core", totals.sum(0))]
+    for axis, level in (("source", 0), ("task", 1)):
+        for name in sorted({key.split("/")[level] for key in keys}):
+            indices = [i for i, key in enumerate(keys) if key.split("/")[level] == name]
+            result.append((f"eval-core/{axis}/{name}", totals[indices].sum(0)))
+    return result

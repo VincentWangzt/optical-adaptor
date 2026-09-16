@@ -1,7 +1,7 @@
-training_config: configs/training.yaml
-output_dir: outputs/benchmarks/live-2500
-results_subdir: results-training-sampling
-checkpoint: outputs/adapter-v1/runs/mlp-10epochs/step-002500
+training_config: configs/automodel.yaml
+output_dir: outputs/benchmarks/automodel
+results_subdir: results-greedy
+checkpoint: outputs/automodel/checkpoints/exports/step-000003
 seed: 42
 multi_image_counts: [2, 4, 8]
 long_source_lines: 80

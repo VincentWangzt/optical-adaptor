@@ -6,8 +6,8 @@ GPU_IDS="8,9"
 NUM_GPUS=2
 NCCL_P2P_DISABLE=1                # This server's GPU 8/9 P2P transport hangs.
 CONFIG="configs/automodel.yaml"
-RUN_DIR="outputs/automodel/run-v1"
-DATA_DIR="outputs/automodel/data-v1"
+RUN_DIR="outputs/automodel/run-v2"
+DATA_DIR="outputs/automodel/data-v2"
 PREPARE_DATA=1
 INSTALL_ENVIRONMENT=1
 SOURCE_LIMIT=""                  # Empty: use each source's limit in the YAML.
@@ -25,8 +25,8 @@ WANDB_MODE="online"
 RESUME_FROM=""                   # Explicit checkpoint directory or LATEST.
 
 if [[ "${1:-}" == "--smoke" ]]; then
-    RUN_DIR="outputs/automodel/smoke"
-    DATA_DIR="outputs/automodel/smoke-data"
+    RUN_DIR="outputs/automodel/migration-smoke"
+    DATA_DIR="outputs/automodel/migration-smoke-data"
     SOURCE_LIMIT=64
     MAX_STEPS=3
     GLOBAL_BATCH_SIZE=2
@@ -86,9 +86,9 @@ optical['processing'].update(assistant_loss=assistant_loss,
     max_teacher_tokens=int(teacher_tokens), max_student_tokens=int(student_tokens))
 for split in ('train_filter', 'eval_filter'):
     optical['data'][split]['max_images'] = int(max_images) if max_images else None
-optical['data']['eval_samples_per_slice'] = int(eval_per_slice)
-optical['evaluation']['generation_samples_per_slice'] = int(generation_per_slice)
-optical['evaluation']['max_new_tokens'] = int(max_new_tokens)
+optical['data']['eval_samples'] = {'': int(eval_per_slice)}
+optical['evaluation']['generation_samples'] = {'': int(generation_per_slice)}
+optical['evaluation']['max_new_tokens'] = {'': int(max_new_tokens)}
 OpticalConfig.model_validate(optical)
 Path(output).write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
 PY
@@ -113,6 +113,5 @@ for GPU in "${DEVICES[@]}"; do
     fi
 done
 git rev-parse HEAD > "$RUN_DIR/git-commit.txt"
-uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node="$NUM_GPUS" \
-    --module optical_adaptor.automodel.recipe --config "$EFFECTIVE_CONFIG" \
+uv run --no-sync automodel --nproc-per-node "$NUM_GPUS" --config "$EFFECTIVE_CONFIG" \
     2>&1 | tee -a "$RUN_DIR/train.log"

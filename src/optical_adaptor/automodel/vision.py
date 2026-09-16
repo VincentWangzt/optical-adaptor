@@ -16,6 +16,14 @@ from safetensors import safe_open
 from torch import nn
 
 
+def image_pixels(images: list[Image.Image], image_size: int) -> torch.Tensor:
+    """CPU preprocessing shared by the training processor and live inference."""
+    arrays = [
+        np.asarray(image.convert("RGB").resize((image_size, image_size))).copy() for image in images
+    ]
+    return torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).float().div_(127.5).sub_(1)
+
+
 class DeepSeekOCRVision(nn.Module):
     def __init__(
         self,
@@ -66,14 +74,6 @@ class DeepSeekOCRVision(nn.Module):
                         state[key.removeprefix("model.")] = checkpoint.get_tensor(key)
         self.load_state_dict(state, strict=True, assign=True)
         self.requires_grad_(False).eval()
-
-    def pixels(self, images: list[Image.Image]) -> torch.Tensor:
-        # Match the previous renderer -> PIL direct resize -> mean/std=.5 path.
-        arrays = [
-            np.asarray(image.convert("RGB").resize((self.image_size, self.image_size))).copy()
-            for image in images
-        ]
-        return torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).float().div_(127.5).sub_(1)
 
     @torch.no_grad()
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:

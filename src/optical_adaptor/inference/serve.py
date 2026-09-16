@@ -9,6 +9,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from optical_adaptor.artifacts import load_credentials
 from optical_adaptor.benchmark.config import load_benchmark
 from optical_adaptor.inference.backend import (
     BACKENDS,
@@ -16,7 +17,6 @@ from optical_adaptor.inference.backend import (
     ChatRequest,
     build_backend,
 )
-from optical_adaptor.training.config import load_credentials
 
 
 def completion(backend, payload, default_seed):

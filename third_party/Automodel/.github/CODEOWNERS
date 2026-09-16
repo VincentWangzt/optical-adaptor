@@ -1,0 +1,16 @@
+.github/ @nvidia-nemo/automation
+codecov.yml @nvidia-nemo/automation
+docker/ @nvidia-nemo/automation
+pyproject.toml @nvidia-nemo/automation
+uv.lock @nvidia-nemo/automation
+tests/ci_tests @nvidia-nemo/automation
+
+docs @jgerh @NVIDIA-NeMo/core-am
+nemo_automodel @NVIDIA-NeMo/core-am
+examples @NVIDIA-NeMo/core-am
+README.md @akoumpa @HuiyingLi @athitten @snowmanwwg
+
+nemo_automodel/components/datasets/llm/retrieval_*.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+nemo_automodel/_transformers/retrieval.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+nemo_automodel/recipes/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+examples/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers

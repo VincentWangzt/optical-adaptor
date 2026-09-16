@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import copy
 import re
 from dataclasses import dataclass
 
 import torch
 
 from optical_adaptor.automodel.config import ProcessingConfig
-from optical_adaptor.automodel.conversations import validate_record
+from optical_adaptor.automodel.conversations import parse_visual_areas, validate_record
 from optical_adaptor.renderer import RenderConfig, render_pages
 
 
@@ -66,7 +65,7 @@ class ConversationCompiler:
 
     def compile(self, record: dict) -> PairedTokens:
         validate_record(record)
-        messages = copy.deepcopy(record["messages"])
+        messages, areas = parse_visual_areas(record["messages"])
         last_assistant = max(i for i, m in enumerate(messages) if m["role"] == "assistant")
         messages = messages[: last_assistant + 1]
         prefix = "OPTICAL_INTERNAL_" + record["sample_id"] + ":"
@@ -75,11 +74,10 @@ class ConversationCompiler:
                 if prefix in value or any(s in value for s in self.tokenizer.all_special_tokens):
                     raise RejectedSample("reserved_token_collision")
         visual_texts = [
-            record["messages"][area["message"]]["content"][area["start"] : area["end"]]
-            for area in record["visual_areas"]
+            messages[area["message"]]["content"][area["start"] : area["end"]] for area in areas
         ]
-        for index in reversed(range(len(record["visual_areas"]))):
-            area = record["visual_areas"][index]
+        for index in reversed(range(len(areas))):
+            area = areas[index]
             if area["message"] >= len(messages):
                 raise ValueError("Visual areas must precede the last assistant target")
             content = messages[area["message"]]["content"]
@@ -218,14 +216,58 @@ class ConversationCompiler:
         )
 
 
-def collate_records(records: list[dict], compiler: ConversationCompiler) -> dict:
-    compiled = [compiler.compile(record) for record in records]
-    labels = torch.nn.utils.rnn.pad_sequence(
-        [torch.tensor(pair.targets, dtype=torch.long) for pair in compiled],
+def pad_tokens(sequences, value):
+    return torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(sequence, dtype=torch.long) for sequence in sequences],
         batch_first=True,
-        padding_value=-100,
+        padding_value=value,
     )
-    return {"records": records, "compiled": compiled, "labels": labels}
+
+
+class OpticalProcessor:
+    """CPU-only rendering, pixels, tokenization and paired padded batch construction."""
+
+    def __init__(self, tokenizer, processing, render_config, vision):
+        self.tokenizer = tokenizer
+        self.compiler = ConversationCompiler(tokenizer, processing, vision["tokens_per_image"])
+        self.render_config = render_config
+        self.image_size = vision["image_size"]
+
+    def __call__(self, records):
+        from optical_adaptor.automodel.vision import image_pixels
+
+        pairs = [self.compiler.compile(record) for record in records]
+        batch = {
+            "records": records,
+            "compiled": pairs,
+            "labels": pad_tokens([p.targets for p in pairs], -100),
+        }
+        for branch in ("teacher", "student"):
+            ids = [getattr(pair, branch + "_ids") for pair in pairs]
+            input_ids = pad_tokens(ids, self.tokenizer.pad_token_id)
+            attention = (
+                torch.arange(input_ids.shape[1])[None]
+                < torch.tensor([len(x) for x in ids])[:, None]
+            )
+            batch[branch] = {
+                "input_ids": input_ids,
+                "attention_mask": attention,
+                "position_ids": (attention.long().cumsum(-1) - 1).clamp_min(0),
+                "loss_positions": pad_tokens(
+                    [getattr(p, branch + "_positions") for p in pairs], -1
+                ),
+            }
+        batch["student"]["pixel_values"] = image_pixels(
+            render_batch(pairs, self.render_config), self.image_size
+        )
+        batch["student"]["image_positions"] = torch.tensor(
+            [
+                [[index, position] for position in positions]
+                for index, pair in enumerate(pairs)
+                for positions in pair.image_positions
+            ]
+        )
+        return batch
 
 
 def render_batch(compiled: list[PairedTokens], render_config: RenderConfig):

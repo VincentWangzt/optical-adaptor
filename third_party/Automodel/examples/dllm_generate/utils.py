@@ -1,0 +1,380 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Utilities for dLLM generation.
+
+Contains:
+- Sampling utilities (Gumbel noise, transfer schedule, transfer index)
+- Model loading helpers (checkpoint resolution, tokenizer setup, compat patches)
+- Response trimming
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# Automodel utilities — use the installed/editable nemo_automodel package.
+# If running from a standalone checkout, set AUTOMODEL_ROOT to the Automodel repo root.
+_automodel_root = os.environ.get("AUTOMODEL_ROOT", "/opt/Automodel")
+if _automodel_root not in sys.path:
+    sys.path.insert(0, _automodel_root)
+from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
+
+# ---------------------------------------------------------------------------
+# Sampling utilities
+# ---------------------------------------------------------------------------
+
+
+def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Gumbel-max sampling noise in float64 for numerical stability."""
+    if temperature == 0:
+        return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    gumbel_noise = (-torch.log(noise)) ** temperature
+    return logits.exp() / gumbel_noise
+
+
+def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
+    """Linear transfer schedule: spread unmasking evenly across steps."""
+    mask_num = mask_index.sum(dim=1, keepdim=True)
+    base = mask_num // steps
+    remainder = mask_num % steps
+    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
+    for i in range(mask_num.size(0)):
+        num_transfer_tokens[i, : int(remainder[i])] += 1
+    return num_transfer_tokens
+
+
+def get_transfer_index(
+    logits: torch.Tensor,
+    temperature: float,
+    remasking: str,
+    mask_index: torch.Tensor,
+    x: torch.Tensor,
+    num_transfer_tokens: torch.Tensor | None,
+    threshold: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select which masked positions to unmask based on confidence.
+
+    When ``threshold`` is set, ``num_transfer_tokens`` is overridden to all
+    masked positions. Top-1 is always unmasked; positions 2+ only if confidence
+    exceeds the threshold.
+    """
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)
+
+    if remasking == "low_confidence":
+        p = F.softmax(logits, dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+    elif remasking == "random":
+        x0_p = torch.rand(x0.shape, device=x0.device)
+    else:
+        raise NotImplementedError(f"Unknown remasking strategy: {remasking}")
+
+    x0 = torch.where(mask_index, x0, x)
+    confidence = torch.where(mask_index, x0_p, -np.inf)
+
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    if threshold is not None:
+        num_transfer_tokens = mask_index.sum(dim=1, keepdim=True)
+    for j in range(confidence.shape[0]):
+        _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j])
+        transfer_index[j, select_index] = True
+        if threshold is not None:
+            for k in range(1, num_transfer_tokens[j]):
+                if confidence[j, select_index[k]] < threshold:
+                    transfer_index[j, select_index[k]] = False
+    return x0, transfer_index
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+
+def resolve_checkpoint(path: str) -> str:
+    """Resolve a checkpoint path, checking for a ``consolidated/`` subdirectory.
+
+    Accepts any of:
+      - ``.../consolidated`` (direct HF-format dir)
+      - ``.../model`` (finds ``consolidated/`` inside)
+      - ``.../LATEST`` (finds ``model/consolidated/`` inside)
+      - ``.../epoch_0_step_312/model/consolidated`` (intermediate steps)
+    """
+    if os.path.isdir(os.path.join(path, "consolidated")):
+        return os.path.join(path, "consolidated")
+    if os.path.isfile(os.path.join(path, "config.json")):
+        return path
+    for sub in [
+        "LATEST/model/consolidated",
+        "LATEST/model",
+        "model/consolidated",
+        "model",
+    ]:
+        candidate = os.path.join(path, sub)
+        if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "config.json")):
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find a valid HF checkpoint at {path}. Expected a directory with config.json and model safetensors."
+    )
+
+
+def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada", mask_id_override: int | None = None):
+    """Load model and tokenizer from an Automodel checkpoint.
+
+    Args:
+        checkpoint_path: Path to the HF-format checkpoint directory.
+        sampler_name: ``"llada"``, ``"scdd"``, ``"llada2"``, ``"nemotron"``,
+            ``"idlm"``, or ``"gemma"``. Adjusts tokenizer setup and model
+            construction kwargs for the chosen family.
+        mask_id_override: Explicit mask token id. Takes precedence over the
+            tokenizer/config lookup. Required for I-DLM, whose base Qwen3
+            tokenizer has no mask token (training reuses a reserved id).
+
+    Returns:
+        ``(model, tokenizer, mask_id, eos_id)``.
+    """
+    from nemo_automodel._transformers.auto_model import _patch_remote_code_compat
+
+    _patch_remote_code_compat()
+
+    tokenizer = NeMoAutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+
+    if sampler_name == "gemma":
+        # DiffusionGemma generation runs through the diffusion sampler that
+        # ships with ``transformers`` (>= 5.11). Load the stock HF class
+        # directly: the NeMoAuto wrapper resolves this architecture to the
+        # Automodel *training* implementation, which has no ``generate``.
+        from transformers import DiffusionGemmaForBlockDiffusion
+
+        # DiffusionGemma SFT saves ONLY the trained decoder (state_dict_adapter:
+        # "frozen base ... is loaded separately"); the frozen encoder that reads
+        # the prompt is not exported. So load the FULL base model recorded in the
+        # checkpoint's config (``_name_or_path``) for a complete encoder, then
+        # overlay the fine-tuned decoder weights on top. bfloat16 explicitly:
+        # SFT consolidates fp32 master weights (104 GB for 26B) which cannot fit
+        # one GPU; "auto" would honor that dtype and offload to meta.
+        cfg_path = os.path.join(checkpoint_path, "config.json")
+        is_local_ckpt = os.path.isfile(cfg_path)
+        base_id = checkpoint_path
+        if is_local_ckpt:
+            import json
+
+            with open(cfg_path) as f:
+                base_id = json.load(f).get("_name_or_path", checkpoint_path)
+
+        model = DiffusionGemmaForBlockDiffusion.from_pretrained(base_id, dtype="bfloat16", device_map="cuda")
+
+        if is_local_ckpt and os.path.realpath(str(base_id)) != os.path.realpath(checkpoint_path):
+            import glob
+
+            from safetensors.torch import load_file
+
+            overlay = {}
+            for shard in sorted(glob.glob(os.path.join(checkpoint_path, "*.safetensors"))):
+                overlay.update(load_file(shard))
+            missing, unexpected = model.load_state_dict(overlay, strict=False)
+            # every fine-tuned tensor must land somewhere; encoder keys are absent
+            # from the overlay and correctly kept from the base.
+            if unexpected:
+                raise RuntimeError(f"fine-tuned decoder keys not found in base model: {unexpected[:5]}")
+            print(f"[gemma] overlaid {len(overlay)} fine-tuned decoder tensors onto base {base_id}")
+
+        return model.eval(), tokenizer, None, tokenizer.eos_token_id
+
+    if sampler_name in ("llada", "scdd"):
+        # SCDD fine-tunes LLaDA-family checkpoints, whose tokenizer ships the
+        # mask token only in the model config.
+        if tokenizer.mask_token is None:
+            tokenizer.add_special_tokens({"mask_token": "<|mdm_mask|>"})
+
+    model_kwargs = dict(
+        torch_dtype="bfloat16",
+        trust_remote_code=True,
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+        attn_implementation="eager",
+    )
+    if sampler_name == "nemotron":
+        # Inference mode for Nemotron-Labs-Diffusion is "bidirectional" (simulates
+        # block-wise attention).  SFT may have saved the checkpoint with
+        # dlm_paradigm=block_diff baked into config.json; force back to
+        # bidirectional for generation.
+        model_kwargs["dlm_paradigm"] = "bidirectional"
+        model_kwargs["block_size"] = 32
+
+    model = NeMoAutoModelForCausalLM.from_pretrained(checkpoint_path, **model_kwargs).eval()
+
+    if not hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
+    if mask_id_override is not None:
+        mask_id = mask_id_override
+    else:
+        mask_id = tokenizer.mask_token_id
+        if mask_id is None:
+            mask_id = getattr(model.config, "mask_token_id", None)
+
+    eos_id = tokenizer.eos_token_id
+    return model, tokenizer, mask_id, eos_id
+
+
+# Native Automodel DiffusionGemma module paths -> HF DiffusionGemmaForBlockDiffusion
+# paths. The two implementations share the same leaf modules (split q/k/v/o and
+# gate/up/down projections) but nest the layer stack differently, so LoRA
+# adapters trained on the native class need this re-parenting before the HF
+# class (the only one that ships ``generate()``) can inject them.
+GEMMA_ADAPTER_KEY_MAP = {"model.layers.": "model.decoder.layers."}
+
+
+def translate_adapter(adapter_path: str, key_map: dict[str, str]) -> str:
+    """Write a module-path-translated copy of a PEFT adapter checkpoint.
+
+    Only the key *addresses* change (tensor values are untouched); returns the
+    directory holding the translated copy.
+    """
+    import json
+    import tempfile
+
+    from safetensors.torch import load_file, save_file
+
+    def tr(key: str) -> str:
+        for old, new in key_map.items():
+            key = key.replace(old, new)
+        return key
+
+    out_dir = tempfile.mkdtemp(prefix="adapter_translated_")
+    tensors = load_file(os.path.join(adapter_path, "adapter_model.safetensors"))
+    save_file({tr(k): v for k, v in tensors.items()}, os.path.join(out_dir, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        cfg = json.load(f)
+    if isinstance(cfg.get("target_modules"), list):
+        cfg["target_modules"] = [tr(t) for t in cfg["target_modules"]]
+    with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    return out_dir
+
+
+def _manual_merge_lora(model, adapter_path: str) -> None:
+    """Merge a LoRA adapter into ``model``'s weights in place, without ``PeftModel``.
+
+    ``peft``'s ``PeftModel`` wrapper assumes a standard autoregressive
+    generation interface (``prepare_inputs_for_generation``) that the
+    DiffusionGemma class does not implement. Since merging is just
+    ``W += (alpha / r) * B @ A`` per adapted linear, do it directly against the
+    base ``state_dict`` so any model — diffusion or AR — can be adapted.
+    """
+    import json
+
+    from safetensors.torch import load_file
+
+    tensors = load_file(os.path.join(adapter_path, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        cfg = json.load(f)
+    r = int(cfg["r"])
+    scale = float(cfg.get("lora_alpha", r)) / r
+
+    sd = model.state_dict()
+    bases = {k[: -len(".lora_A.weight")] for k in tensors if k.endswith(".lora_A.weight")}
+    merged = 0
+    for base in bases:
+        a = tensors[base + ".lora_A.weight"]
+        b = tensors[base + ".lora_B.weight"]
+        weight_key = base.replace("base_model.model.", "", 1) + ".weight"
+        if weight_key not in sd:
+            raise KeyError(f"adapter targets {weight_key!r} which is absent from the base model")
+        w = sd[weight_key]
+        delta = (b.to(torch.float32) @ a.to(torch.float32)) * scale
+        w.add_(delta.to(w.dtype).to(w.device))
+        merged += 1
+    if merged == 0:
+        raise ValueError("no LoRA modules found in adapter checkpoint")
+
+
+def merge_adapter(model, adapter_path: str, key_map: dict[str, str] | None = None):
+    """Merge a PEFT adapter checkpoint into the loaded base model for inference.
+
+    Automodel PEFT training writes ``adapter_model.safetensors`` plus an
+    HF-format ``adapter_config.json``. Adapters are merged into the base
+    weights and the PEFT wrapper is dropped, keeping the generation code path
+    identical to full-SFT checkpoints.
+
+    Args:
+        model: The loaded base model to merge into.
+        adapter_path: Directory with the adapter checkpoint.
+        key_map: Optional module-path translation applied first, for families
+            whose training implementation names modules differently from the
+            inference class (see ``GEMMA_ADAPTER_KEY_MAP``).
+    """
+    if key_map:
+        adapter_path = translate_adapter(adapter_path, key_map)
+
+    # DiffusionGemma (and other non-AR diffusion models) don't implement the
+    # standard generation interface (``prepare_inputs_for_generation``) that
+    # ``PeftModel`` assumes, so wrapping them fails. Detect that up front and
+    # merge the LoRA weights directly instead — checked BEFORE any peft
+    # wrapping so a partial injection can't corrupt the base state_dict.
+    try:
+        from peft import PeftModel
+    except ImportError:
+        _manual_merge_lora(model, adapter_path)
+        return model.eval()
+
+    if not hasattr(model, "prepare_inputs_for_generation"):
+        _manual_merge_lora(model, adapter_path)
+        return model.eval()
+
+    merged = PeftModel.from_pretrained(model, adapter_path).merge_and_unload()
+    return merged.eval()
+
+
+# ---------------------------------------------------------------------------
+# Response trimming
+# ---------------------------------------------------------------------------
+
+
+def trim_response(tokenizer, seq_ids_list, input_ids_list):
+    """Extract generated text after the prompt, truncated at first EOS / EOT."""
+    results = []
+    stop_ids = set()
+    if tokenizer.eos_token_id is not None:
+        stop_ids.add(tokenizer.eos_token_id)
+    eot_id = getattr(tokenizer, "eot_token_id", None)
+    if eot_id is not None:
+        stop_ids.add(eot_id)
+    for token_str in ["<|eot_id|>", "<|end_of_text|>"]:
+        tid = tokenizer.convert_tokens_to_ids(token_str)
+        if tid is not None and tid != tokenizer.unk_token_id:
+            stop_ids.add(tid)
+
+    for seq_ids, input_ids in zip(seq_ids_list, input_ids_list):
+        full = list(seq_ids)
+        start = len(list(input_ids))
+        end = len(full)
+        for i in range(start, len(full)):
+            if full[i] in stop_ids:
+                end = i
+                break
+        text = tokenizer.decode(full[start:end], skip_special_tokens=True)
+        for stop_str in ["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"]:
+            if stop_str in text:
+                text = text.split(stop_str)[0]
+        results.append(text)
+    return results

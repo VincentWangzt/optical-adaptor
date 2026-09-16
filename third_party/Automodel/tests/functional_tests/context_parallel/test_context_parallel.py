@@ -1,0 +1,80 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Functional tests for context parallelism on attention layers.
+
+These tests validate that attention layers produce identical forward outputs
+and gradients when using different context parallel sizes with packed sequences.
+"""
+
+import pytest
+import torch
+
+from tests.utils.test_utils import run_test_script
+
+TEST_FOLDER = "context_parallel"
+CP_QWEN3_MOE_ATTENTION_TEST_FILENAME = "L2_CP_Qwen3MoE_Attention_Test.sh"
+CP_DEEPSEEK_V3_MLA_TEST_FILENAME = "L2_CP_DeepSeekV3_MLA_Test.sh"
+CP_NEMOTRON_V3_MAMBA_TEST_FILENAME = "L2_CP_NemotronV3_Mamba_Test.sh"
+CP_NEMOTRON_V3_ATTENTION_TEST_FILENAME = "L2_CP_NemotronV3_Attention_Test.sh"
+CP_NEMOTRON_V3_HYBRID_TEST_FILENAME = "L2_CP_NemotronV3_Hybrid_Test.sh"
+CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME = "L2_CP_Qwen3_5MoE_LinearAttn_Test.sh"
+CP_DENSE_PACKED_TEST_FILENAME = "L2_CP_Dense_Packed_Test.sh"
+TP_DENSE_PACKED_TEST_FILENAME = "L2_TP_Dense_Packed_Test.sh"
+TP_CP_DENSE_PACKED_TEST_FILENAME = "L2_TP_CP_Dense_Packed_Test.sh"
+TP_CP_DENSE_PACKED_REQUIRED_GPUS = 4
+
+
+class TestContextParallelAttention:
+    """Test suite for context parallel attention layers."""
+
+    def test_cp_qwen3_moe_attention(self):
+        """Test Qwen3MoeAttention layer with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_QWEN3_MOE_ATTENTION_TEST_FILENAME)
+
+    def test_cp_deepseek_v3_mla(self):
+        """Test DeepSeek V3 MLA layer with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_DEEPSEEK_V3_MLA_TEST_FILENAME)
+
+    def test_cp_nemotron_v3_mamba(self):
+        """Test NemotronV3Mamba2Mixer layer with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_NEMOTRON_V3_MAMBA_TEST_FILENAME)
+
+    def test_cp_nemotron_v3_attention(self):
+        """Test NemotronV3Attention layer with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_NEMOTRON_V3_ATTENTION_TEST_FILENAME)
+
+    def test_cp_nemotron_v3_hybrid(self):
+        """Test hybrid NemotronV3 model (interleaved attention + mamba) with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_NEMOTRON_V3_HYBRID_TEST_FILENAME)
+
+    def test_cp_qwen3_5_moe_linear_attn(self):
+        """Test Qwen3.5 MoE linear attention (GatedDeltaNet) with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME)
+
+    def test_cp_dense_packed(self):
+        """Test two-layer packed THD forward and gradient parity for dense Llama, Qwen2, and Qwen3."""
+        run_test_script(TEST_FOLDER, CP_DENSE_PACKED_TEST_FILENAME)
+
+    def test_tp_dense_packed(self):
+        """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=1."""
+        run_test_script(TEST_FOLDER, TP_DENSE_PACKED_TEST_FILENAME)
+
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < TP_CP_DENSE_PACKED_REQUIRED_GPUS,
+        reason="requires 4 GPUs for TP=2 x CP=2; remove once context_parallel CI runs on a 4-GPU runner",
+    )
+    def test_tp_cp_dense_packed(self):
+        """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=2."""
+        run_test_script(TEST_FOLDER, TP_CP_DENSE_PACKED_TEST_FILENAME)

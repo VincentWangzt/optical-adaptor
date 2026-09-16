@@ -7,9 +7,9 @@ import json
 import re
 from pathlib import Path
 
+from optical_adaptor.artifacts import write_json
 from optical_adaptor.benchmark.config import load_benchmark
 from optical_adaptor.benchmark.run import score
-from optical_adaptor.training.config import write_json
 
 
 def lcb_answer(text: str) -> str | None:

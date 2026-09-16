@@ -14,11 +14,85 @@ from optical_adaptor.automodel.config import (
     DataConfig,
     FilterConfig,
     OpticalConfig,
-    Source,
     fingerprint,
     preparation_fingerprint,
 )
 from optical_adaptor.automodel.processing import ConversationCompiler, RejectedSample
+
+
+def inherited_values(values: dict, leaves: list[str], *, integer: bool = False) -> dict:
+    """Nearest ancestor replaces the default; ancestors do not partition mass."""
+    valid = {""}
+    for leaf in leaves:
+        parts = leaf.split("/")
+        valid.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    if "" not in values:
+        raise ValueError("Hierarchy must configure the root default under the empty key")
+    unknown = values.keys() - valid
+    if unknown:
+        raise ValueError(f"Unknown hierarchy paths: {sorted(unknown)}")
+    for key, value in values.items():
+        if not math.isfinite(value) or value < 0 or (integer and type(value) is not int):
+            raise ValueError(f"Invalid {'count' if integer else 'weight'} at {key!r}: {value}")
+    resolved = {}
+    for leaf in leaves:
+        parts = leaf.split("/")
+        ancestors = ["/".join(parts[:i]) for i in range(len(parts), -1, -1)]
+        resolved[leaf] = next(values[path] for path in ancestors if path in values)
+    return resolved
+
+
+def removal_report(before: list[dict], after: list[dict], stage: str) -> dict:
+    original, retained = Counter(r["slice"] for r in before), Counter(r["slice"] for r in after)
+    report = {}
+    for key, count in sorted(original.items()):
+        removed = count - retained[key]
+        report[key] = {
+            "before": count,
+            "retained": retained[key],
+            "removed": removed,
+            "removed_percent": 100 * removed / count,
+        }
+        if removed:
+            logging.warning(
+                "%s %s: %d before, %d retained, %d removed (%.2f%% of stage input)",
+                stage,
+                key,
+                count,
+                retained[key],
+                removed,
+                100 * removed / count,
+            )
+    return report
+
+
+def select_evaluation(
+    rows: list[dict], requested: dict[str, int], seed: int
+) -> tuple[list[int], dict]:
+    counts, chosen, report = Counter(), [], {}
+    for index in sorted(range(len(rows)), key=lambda i: fingerprint([seed, rows[i]["sample_id"]])):
+        key = rows[index]["slice"]
+        if counts[key] < requested[key]:
+            chosen.append(index)
+            counts[key] += 1
+    for key, wanted in requested.items():
+        shortfall = wanted - counts[key]
+        report[key] = {
+            "requested": wanted,
+            "selected": counts[key],
+            "shortfall": shortfall,
+            "shortfall_percent": 100 * shortfall / wanted if wanted else 0,
+        }
+        if shortfall:
+            logging.warning(
+                "Evaluation %s: %d requested, %d available, shortfall %d (%.2f%%)",
+                key,
+                wanted,
+                counts[key],
+                shortfall,
+                100 * shortfall / wanted,
+            )
+    return sorted(chosen), report
 
 
 def validate_preparation(optical: OpticalConfig, seed: int) -> None:
@@ -34,33 +108,49 @@ def validate_preparation(optical: OpticalConfig, seed: int) -> None:
 
 
 class ConversationDataset(Dataset):
-    def __init__(self, root: str, split: str, filters: FilterConfig, per_slice: int | None):
+    def __init__(self, root: str, split: str, filters: FilterConfig):
         self.root = Path(root)
         if (self.root / "preparation.incomplete").exists():
             raise ValueError("Data preparation is incomplete")
-        frame = pl.read_parquet(self.root / "manifest.parquet").filter(pl.col("split") == split)
+        manifest = pl.read_parquet(self.root / "manifest.parquet")
+        self.all_leaves = sorted(manifest["slice"].unique().to_list())
+        frame = manifest.filter(pl.col("split") == split)
+        before = frame.to_dicts()
         for key, column in (
             ("sources", "source"),
             ("tasks", "task"),
-            ("views", "view_family"),
             ("image_bins", "image_bin"),
             ("turn_bins", "turn_bin"),
         ):
             values = getattr(filters, key)
             if values is not None:
-                if column == "view_family":
-                    frame = frame.with_columns(
-                        pl.col("slice").str.split("/").list.get(2).alias(column)
-                    )
+                unknown = set(values) - set(manifest[column].unique().to_list())
+                if unknown:
+                    raise ValueError(f"Unknown {key}: {sorted(unknown)}")
                 frame = frame.filter(pl.col(column).is_in(values))
+        self.selected_leaves = sorted(
+            key
+            for key in self.all_leaves
+            if (filters.sources is None or key.split("/")[0] in filters.sources)
+            and (filters.tasks is None or key.split("/")[1] in filters.tasks)
+            and (
+                filters.image_bins is None
+                or not key.split("/")[2].startswith("images-")
+                or key.split("/")[2].removeprefix("images-") in filters.image_bins
+            )
+            and (
+                filters.turn_bins is None
+                or not key.split("/")[2].startswith("turns-")
+                or key.split("/")[2].removeprefix("turns-") in filters.turn_bins
+            )
+        )
         frame = frame.filter(pl.col("image_count") >= filters.min_images)
         if filters.max_images is not None:
             frame = frame.filter(pl.col("image_count") <= filters.max_images)
         frame = frame.sort("sample_id")
-        if per_slice is not None:
-            frame = frame.group_by("slice", maintain_order=True).head(per_slice)
         self.rows = frame.to_dicts()
-        if not self.rows:
+        self.filter_report = removal_report(before, self.rows, f"{split} filters")
+        if not self.rows and split == "train":
             raise ValueError(f"No {split} examples match the requested data filters")
 
     def __len__(self):
@@ -106,36 +196,30 @@ class MixtureSampler(Sampler[int]):
     def __init__(
         self,
         dataset: ConversationDataset,
-        sources: list[Source],
         config: DataConfig,
         seed: int,
         rank: int,
         world_size: int,
+        global_batch_size: int,
     ):
-        source_weights = {source.name: source.weight for source in sources}
         counts = Counter(row["slice"] for row in dataset.rows)
-        source_tasks = Counter((row["source"], row["task"]) for row in dataset.rows)
-        slices_per_task = Counter((key.split("/")[0], key.split("/")[1]) for key in counts)
-        task_mass = Counter()
-        for source, task in source_tasks:
-            task_mass[source] += config.task_weights[task]
-        weights = []
-        for row in dataset.rows:
-            weight = (
-                source_weights[row["source"]]
-                * config.task_weights[row["task"]]
-                / task_mass[row["source"]]
-            )
-            if config.balance_slices:
-                weight /= counts[row["slice"]] * slices_per_task[row["source"], row["task"]]
-            else:
-                weight /= source_tasks[row["source"], row["task"]]
-            weights.append(weight)
+        resolved = inherited_values(config.weights, dataset.all_leaves)
+        total = sum(resolved[key] for key in counts)
+        if total <= 0:
+            raise ValueError("No eligible positive training weight")
+        self.ratios = {key: resolved[key] / total for key in sorted(counts)}
+        self.counts = dict(counts)
+        weights = [self.ratios[row["slice"]] / counts[row["slice"]] for row in dataset.rows]
         self.weights = torch.tensor(weights, dtype=torch.double)
-        if not torch.isfinite(self.weights).all() or (self.weights <= 0).any():
-            raise ValueError("Mixture weights must be positive and finite")
+        if not torch.isfinite(self.weights).all() or (self.weights < 0).any():
+            raise ValueError("Mixture weights must be nonnegative and finite")
         requested = config.samples_per_epoch or len(dataset)
-        self.num_samples = math.ceil(requested / world_size)
+        if global_batch_size % world_size:
+            raise ValueError("Global batch must be divisible by student DP size")
+        # Draw complete optimizer batches so the scheduler never consumes a short tail.
+        self.num_samples = (
+            math.ceil(requested / global_batch_size) * global_batch_size // world_size
+        )
         self.rank, self.world_size, self.seed = rank, world_size, seed
         self.epoch, self.cursor = 0, 0
 

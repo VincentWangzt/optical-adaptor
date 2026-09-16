@@ -1,10 +1,6 @@
+recipe: optical_adaptor.automodel.recipe.OpticalKDRecipe
 # Canonical online training configuration. Launch from the repository root.
 seed: 42
-model: &adapter
-  _target_: optical_adaptor.adapters.MLPAdapter
-  input_dim: 1280
-  hidden_dim: 2560
-  output_dim: 2560
 dist_env:
   backend: nccl
   timeout_minutes: 20
@@ -49,7 +45,7 @@ kd_loss_fn:
   ignore_index: -100
   temperature: 1.0
   fp32_upcast: true
-  chunk_size: 64
+  chunk_size: 0
 checkpoint:
   enabled: true
   checkpoint_dir: outputs/automodel/checkpoints
@@ -64,13 +60,13 @@ wandb:
   mode: online
 optical:
   render_config: configs/render.training.yaml
-  llm:
+  llm: &llm
     model_id: Qwen/Qwen3.5-4B
     revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
     text_config_key: text_config
     attn_implementation: sdpa
     gradient_checkpointing: true
-  vision:
+  vision: &vision
     _target_: optical_adaptor.automodel.vision.DeepSeekOCRVision
     model_id: deepseek-ai/DeepSeek-OCR
     revision: 9f30c71f441d010e5429c532364a86705536c53a
@@ -78,7 +74,10 @@ optical:
     output_dim: 1280
     tokens_per_image: 111
     expected_tensors: 476
-  adapter: *adapter
+  adapter: &adapter
+    input_dim: 1280
+    hidden_dim: 2560
+    output_dim: 2560
   prepare:
     output_dir: outputs/automodel/data
     sources:
@@ -90,7 +89,6 @@ optical:
         split: train
         thinking: false
         max_records: 10000
-        weight: 1.0
       - name: swe_qwen38_27b
         kind: swe
         dataset_id: nvidia/Open-SWE-Traces
@@ -99,7 +97,6 @@ optical:
         split: train
         thinking: true
         max_records: 2000
-        weight: 1.0
       - name: swe_qwen35_122b
         kind: swe
         dataset_id: nvidia/Open-SWE-Traces
@@ -108,7 +105,6 @@ optical:
         split: train
         thinking: false
         max_records: 2000
-        weight: 1.0
     eval_fraction: 0.1
     min_observation_chars: 256
     lines_per_image: 50
@@ -149,13 +145,11 @@ optical:
     vision_start: '<|vision_start|>'
     vision_end: '<|vision_end|>'
     preserve_all_reasoning: true
-    loss_chunk_tokens: 64
-    image_microbatch_size: 4
+    image_microbatch_size: &image_microbatch 4
   data:
     train_filter:
       sources: null
       tasks: null
-      views: null
       image_bins: null
       turn_bins: null
       min_images: 1
@@ -163,18 +157,32 @@ optical:
     eval_filter:
       sources: null
       tasks: null
-      views: null
       image_bins: null
       turn_bins: null
       min_images: 1
       max_images: null
-    balance_slices: true
-    task_weights: {reconstruction: 1.0, continuation: 1.0, next_action: 1.0}
+    weights: {"": 1.0}
     samples_per_epoch: null
-    eval_samples_per_slice: 16
+    eval_samples: {"": 16}
     num_workers: 0
   evaluation:
     generation_every: 500
-    generation_samples_per_slice: 2
-    max_new_tokens: 4096
+    generation_samples: {"": 2}
+    max_new_tokens: {"": 4096}
     tasks: [reconstruction]
+model:
+  _target_: optical_adaptor.automodel.model.OpticalModel.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+  llm: *llm
+  vision: *vision
+  adapter: *adapter
+  role: student
+  image_microbatch_size: *image_microbatch
+teacher_model:
+  _target_: optical_adaptor.automodel.model.OpticalModel.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+  llm: *llm
+  vision: *vision
+  adapter: *adapter
+  role: teacher
+  image_microbatch_size: *image_microbatch

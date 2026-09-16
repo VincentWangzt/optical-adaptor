@@ -1318,8 +1318,8 @@ wheels = [
 
 [[package]]
 name = "nemo-automodel"
-version = "0.7.0+2c0df17e"
-source = { git = "https://github.com/NVIDIA-NeMo/Automodel.git?rev=2c0df17efff1fc9d5128a9df1a2ed716d0f2c54a#2c0df17efff1fc9d5128a9df1a2ed716d0f2c54a" }
+version = "0.7.0+optical.2c0df17e"
+source = { editable = "third_party/Automodel" }
 dependencies = [
     { name = "datasets", marker = "sys_platform == 'linux'" },
     { name = "flashoptim", marker = "sys_platform == 'linux'" },
@@ -1928,7 +1928,7 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8,<1" },
     { name = "flash-linear-attention", specifier = "==0.5.2" },
     { name = "fonttools", specifier = ">=4.60,<5" },
-    { name = "nemo-automodel", git = "https://github.com/NVIDIA-NeMo/Automodel.git?rev=2c0df17efff1fc9d5128a9df1a2ed716d0f2c54a" },
+    { name = "nemo-automodel", editable = "third_party/Automodel" },
     { name = "numpy", specifier = ">=2.0,<3" },
     { name = "pillow", specifier = ">=11.1,<12" },
     { name = "polars", specifier = ">=1.30,<2" },

@@ -1,0 +1,221 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import importlib
+import logging
+from typing import TYPE_CHECKING, Any, Callable, Literal, Type, Union
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+else:
+    # Keep importing NeMoAutoTokenizer lightweight while allowing runtime
+    # annotation consumers such as typing.get_type_hints() to resolve the name.
+    PreTrainedTokenizerBase = Any
+
+logger = logging.getLogger(__name__)
+
+
+def _get_model_type(pretrained_model_name_or_path: str, trust_remote_code: bool = False) -> str | None:
+    """
+    Determine the model type from the config.
+
+    Args:
+        pretrained_model_name_or_path: Model identifier or path
+        trust_remote_code: Whether to trust remote code
+
+    Returns:
+        The model_type string, or None if it cannot be determined
+    """
+    try:
+        # Ensure AutoModel's local custom configs are registered before asking
+        # AutoConfig to inspect a checkpoint that advertises remote code.
+        importlib.import_module("nemo_automodel._transformers.registry")
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+        return getattr(config, "model_type", None)
+    except Exception as e:
+        logger.debug(f"Could not load config to determine model type: {e}")
+        return None
+
+
+def _get_tokenizer_registry():
+    # Import lazily to avoid pulling in optional/custom backends (and transformers)
+    # when users only do `from nemo_automodel import NeMoAutoTokenizer`.
+    from nemo_automodel._transformers.tokenization.registry import TokenizerRegistry
+
+    return TokenizerRegistry
+
+
+class NeMoAutoTokenizer:
+    """
+    Auto tokenizer class that dispatches to appropriate tokenizer implementations.
+
+    Similar to HuggingFace's AutoTokenizer, but with a custom registry for specialized
+    tokenizer implementations.
+
+    ``tokenizer_backend`` selects one of four loading routes:
+    1. ``"nemo_auto"`` (default) uses a registered tokenizer when available,
+       otherwise it falls back to the wrapped HuggingFace tokenizer.
+    2. ``"nemo_wrapped_auto"`` bypasses registered tokenizers and uses Transformers
+       ``AutoTokenizer`` with NeMo's tokenizer compatibility wrapper.
+    3. ``"transformers_auto"`` uses Transformers ``AutoTokenizer`` directly.
+    4. ``"tokenizers"`` loads ``tokenizer.json`` through Transformers
+       ``TokenizersBackend``.
+
+    Example:
+        >>> # Will use MistralCommonBackend if available for Mistral models
+        >>> tokenizer = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+
+        >>> # Use the NeMo-wrapped AutoTokenizer instead of a registered tokenizer
+        >>> tokenizer = NeMoAutoTokenizer.from_pretrained("gpt2", tokenizer_backend="nemo_wrapped_auto")
+
+        >>> # Explicitly opt in to BOS/EOS insertion
+        >>> tokenizer = NeMoAutoTokenizer.from_pretrained("gpt2", add_bos_token=True, add_eos_token=True)
+    """
+
+    # Make registry accessible at class level
+    _registry = None
+
+    @classmethod
+    def register(cls, model_type: str, tokenizer_cls: Union[Type, Callable]) -> None:
+        """
+        Register a custom tokenizer for a specific model type.
+
+        Args:
+            model_type: The model type string (e.g., "mistral", "llama")
+            tokenizer_cls: The tokenizer class or factory function
+        """
+        _get_tokenizer_registry().register(model_type, tokenizer_cls)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *args,
+        force_default: bool = False,
+        force_hf: bool = False,
+        tokenizer_backend: Literal["nemo_auto", "nemo_wrapped_auto", "transformers_auto", "tokenizers"] | None = None,
+        trust_remote_code: bool = False,
+        **kwargs,
+    ) -> "PreTrainedTokenizerBase":
+        """
+        Load a tokenizer from a pretrained model.
+
+        Args:
+            pretrained_model_name_or_path: Model identifier or path
+            force_default: Legacy flag equivalent to ``tokenizer_backend="nemo_wrapped_auto"``. It may be combined
+                with ``tokenizer_backend=None`` or ``"nemo_wrapped_auto"``; contradictory backend selections raise
+                ``ValueError``.
+            force_hf: Backward-compatible alias for ``tokenizer_backend="transformers_auto"``.
+            tokenizer_backend: Tokenizer loading route. ``"nemo_auto"`` preserves the default NeMo dispatch,
+                ``"nemo_wrapped_auto"`` uses Transformers AutoTokenizer with NeMo's compatibility wrapper while
+                bypassing registered tokenizers, ``"transformers_auto"`` uses Transformers AutoTokenizer directly,
+                and ``"tokenizers"`` loads ``tokenizer.json`` directly through Transformers TokenizersBackend.
+            trust_remote_code: Whether to trust remote code when loading config
+            **kwargs: Additional arguments passed to the tokenizer's from_pretrained
+
+        Returns:
+            A tokenizer instance appropriate for the model type
+        """
+        valid_backends = {"nemo_auto", "nemo_wrapped_auto", "transformers_auto", "tokenizers"}
+        if tokenizer_backend is not None and tokenizer_backend not in valid_backends:
+            raise ValueError(f"tokenizer_backend must be one of {sorted(valid_backends)}, got {tokenizer_backend!r}")
+        if force_default and force_hf:
+            raise ValueError("force_default=True and force_hf=True are mutually exclusive.")
+        if force_default and tokenizer_backend not in (None, "nemo_wrapped_auto"):
+            raise ValueError(
+                "force_default=True is equivalent to tokenizer_backend='nemo_wrapped_auto' and cannot be combined "
+                f"with tokenizer_backend={tokenizer_backend!r}."
+            )
+        if force_hf and tokenizer_backend not in (None, "transformers_auto"):
+            raise ValueError(
+                "force_hf=True is equivalent to tokenizer_backend='transformers_auto' and cannot be combined "
+                f"with tokenizer_backend={tokenizer_backend!r}."
+            )
+
+        resolved_backend = tokenizer_backend or "nemo_auto"
+        if force_default:
+            resolved_backend = "nemo_wrapped_auto"
+        elif force_hf:
+            resolved_backend = "transformers_auto"
+
+        if resolved_backend == "transformers_auto":
+            from transformers import AutoTokenizer
+
+            return AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
+            )
+
+        if resolved_backend == "nemo_wrapped_auto":
+            from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+                NeMoAutoTokenizerWithBosEosEnforced,
+            )
+
+            return NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(
+                pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
+            )
+
+        if resolved_backend == "tokenizers":
+            from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+            tokenizer = TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _ensure_pad_token_id
+
+            _ensure_pad_token_id(tokenizer, pretrained_model_name_or_path)
+            return tokenizer
+
+        # Try to determine model type from config
+        model_type = _get_model_type(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+
+        registry = _get_tokenizer_registry()
+
+        if model_type:
+            tokenizer_cls = registry.get_custom_tokenizer_cls(model_type)
+            if tokenizer_cls is not None:
+                logger.info(f"Using custom tokenizer {tokenizer_cls.__name__} for model type '{model_type}'")
+                tokenizer = tokenizer_cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+                from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _ensure_pad_token_id
+
+                _ensure_pad_token_id(tokenizer, pretrained_model_name_or_path)
+                return tokenizer
+
+        # Fall back to the default wrapped HuggingFace tokenizer. BOS/EOS insertion
+        # is enabled only when callers opt in via add_bos_token/add_eos_token.
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
+
+        return NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(
+            pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
+        )
+
+
+__all__ = [
+    "NeMoAutoTokenizer",
+    "NeMoAutoTokenizerWithBosEosEnforced",
+    "TokenizerRegistry",
+]
+
+
+def __getattr__(name: str):
+    if name == "TokenizerRegistry":
+        return _get_tokenizer_registry()
+    if name == "NeMoAutoTokenizerWithBosEosEnforced":
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
+
+        return NeMoAutoTokenizerWithBosEosEnforced
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(__all__)

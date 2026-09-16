@@ -1,0 +1,173 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Consumed by config_resolver.py.
+#
+# Resolution stack (last wins):
+#   1. Recipe top-level
+#   2. phases[<phase>]       defaults per phase
+#   3. conditional[...]      recipe-name-pattern overrides
+#   4. recipe.ci.<phase>     per-recipe overrides
+#   5. env[...]              env-driven overrides
+#   6. computed[...]         per-run dynamic values
+#
+# Override targets are flat dotted keys into the recipe's top-level config.
+# `fixture_keys` (see bottom) lists keys to skip when applying recipe.ci.<phase>.
+
+phases:
+  nightly: &nightly_defaults
+    step_scheduler.max_steps: 50
+    step_scheduler.ckpt_every_steps: 50
+    step_scheduler.val_every_steps: 50
+
+  release: *nightly_defaults
+
+  convergence:
+    step_scheduler.max_steps: 200
+    step_scheduler.ckpt_every_steps: 200
+    step_scheduler.val_every_steps: 200
+    wandb.entity: Nemo-automodel
+    wandb.dir: /tmp/wandb/
+
+  performance: {}
+
+  # Phase key matches the recipe's ci.checkpoint_robustness section so per-recipe
+  # overrides resolve naturally.
+  checkpoint_robustness:
+    step_scheduler.max_steps: 5
+    step_scheduler.ckpt_every_steps: 5
+    step_scheduler.val_every_steps: 5
+    step_scheduler.global_batch_size: 32
+    step_scheduler.local_batch_size: 2
+    checkpoint.enabled: true
+    checkpoint.model_save_format: safetensors
+    checkpoint.save_consolidated: true
+
+# Recipe-name-pattern overrides. Predicate keys:
+#   when_recipe_contains_all   stem must contain every listed substring
+#   when_recipe_contains_any   stem must contain at least one
+# `phases` is optional (default = all). `apply` values support {var} substitution.
+conditional:
+  # customizer_* recipes use sample datasets under NEMO_CI_PATH;
+  # the chat-flavored subset overrides to chat paths (last-wins).
+  - when_recipe_contains_all: [customizer_]
+    apply:
+      dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/prompt_completion/train.jsonl"
+      validation_dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/prompt_completion/validation.jsonl"
+
+  - when_recipe_contains_all: [customizer_, chat]
+    apply:
+      dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/chat/train.jsonl"
+      validation_dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/chat/validation.jsonl"
+
+  # peft/lora recipes disable triton in the robustness pytest harness.
+  - when_recipe_contains_any: [peft, lora]
+    phases: [checkpoint_robustness]
+    apply:
+      peft.use_triton: false
+
+# Env var -> { target, phases }. Applied iff env is set and phase matches.
+# Values coerced to int -> float -> str.
+env:
+  MAX_STEPS:
+    target: step_scheduler.max_steps
+    phases: [nightly, release, convergence, performance]
+  LOCAL_BATCH_SIZE:
+    target: step_scheduler.local_batch_size
+    phases: [nightly, release, convergence, performance]
+  EP_SIZE:
+    target: distributed.ep_size
+    phases: [nightly, release, convergence, performance]
+
+# Computed dynamic overrides. `format` is str.format() over env vars + built-in `date`.
+computed:
+  - target: checkpoint.checkpoint_dir
+    format: "{PIPELINE_DIR}/{TEST_NAME}/checkpoint"
+    phases: [nightly, release, convergence, performance]
+
+  - target: checkpoint.checkpoint_dir
+    format: "{PIPELINE_DIR}/{TEST_NAME}/robustness_checkpoint"
+    phases: [checkpoint_robustness]
+
+  - target: wandb.name
+    format: "{TEST_NAME}"
+    phases: [convergence]
+
+  - target: wandb.project
+    format: "automodel-convergence-test-{date:%Y%m%d}"
+    phases: [convergence]
+
+# Keys in recipe.ci.<phase> that are read by phase-specific consumers (pytest
+# fixtures, etc.) -- NOT config overrides. The resolver leaves them in the
+# resolved YAML's ci.<phase> block but does not apply them to the top-level.
+fixture_keys:
+  checkpoint_robustness:
+    # Specialized structural and loading controls.
+    - check_fused_qkv_keys
+    - check_phantom_keys
+    - cross_tp_size
+    - experts_implementation
+    - hf_adapter_ignored_key_prefix
+    - hf_device_map_auto
+    - hf_device_map_cpu_max_memory_gib
+    - hf_device_map_max_memory_gib
+    - hf_reload_timeout_seconds
+    - hf_source_post_load_dequantize
+    # Optional routed-MoE evidence to determine whether parity outliers are
+    # caused by numerically fragile router choices. Currently implemented only
+    # for GLM 4.7 Flash.
+    - capture_router_diagnostics
+    # Optional HF self-comparison across sequence lengths, used to distinguish
+    # shape-sensitive numerics from a cross-framework loading or parity bug. A
+    # shorter cross-framework gate measures its gate length automatically.
+    - shape_diagnostic
+    # Full-logit parity defaults to 2048 tokens from the repository's fixed
+    # long-form document. Named profiles gate mean KL, p95 KL, and cosine.
+    # Max KL, JSD, and absolute-difference metrics are report-only.
+    - parity_sequence_length
+    # Optional prefix of the same long forward used to gate cross-framework
+    # source/HF-reload parity. Full-sequence metrics remain report-only.
+    - cross_framework_gate_sequence_length
+    - parity_tolerance_profile
+    # Optional source_load, automodel_reload, hf_reload, or cross_tp profile
+    # selections. Unspecified comparisons inherit parity_tolerance_profile.
+    - parity_tolerance_profile_overrides
+    # Prefer a profile. This optional mapping overrides only specified gates
+    # for a measured one-model exception in source_load, automodel_reload,
+    # hf_reload, or cross_tp; every other gate remains profile-owned.
+    - parity_threshold_overrides
+    - process_isolation
+    # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
+    # reported separately and never gates checkpoint resume correctness.
+    - training_reproducibility_loss_threshold
+    # Named profiles provide scale-aware absolute-plus-relative envelopes for
+    # the first forward and later optimizer steps. Prefer
+    # resume_tolerance_profile (strict, standard, or relaxed) over numeric
+    # overrides; the numeric fields remain absolute-only and authoritative.
+    - resume_tolerance_profile
+    - resume_first_loss_threshold
+    - resume_loss_threshold
+    # Core phases are enabled by default. Use only these semantic skip controls
+    # for a documented model or backend blocker.
+    - skip_resume
+    - skip_source_load_parity
+    - skip_source_load_logit_parity
+    - skip_hf_reload
+    - skip_automodel_reload_logit_parity
+    - skip_hf_reload_logit_parity
+    - tokenizer_name
+    - trust_remote_code
+    # Removed positive check aliases and legacy max-KL fields are intentionally
+    # unsupported. Use the default-on phases, semantic skip fields, and named
+    # tolerance profiles above.

@@ -1,10 +1,11 @@
-"""Prepare repository-disjoint SFT slices. Pixels and model states stay online."""
+"""Curate fixed sample-level holdouts per leaf. Pixels and model states stay online."""
 
 from __future__ import annotations
 
 import argparse
 import fnmatch
 import json
+import math
 from collections import Counter, deque
 from pathlib import Path
 
@@ -22,6 +23,26 @@ from optical_adaptor.automodel.conversations import (
 )
 from optical_adaptor.renderer import font_codepoints, load_render_config
 from optical_adaptor.text import canonicalize
+
+
+def assign_holdouts(rows: list[dict], fraction: float, seed: int) -> list[str]:
+    """Round half up per leaf; keep a training row where the leaf has at least two.
+
+    Singleton leaves stay in training and their evaluation shortfall is reported.
+    Membership depends on sample IDs, never on repository or iteration order.
+    """
+    leaves = {}
+    for row in rows:
+        leaves.setdefault(row["slice"], []).append(row)
+    heldout = []
+    for key, leaf in sorted(leaves.items()):
+        leaf.sort(key=lambda row: fingerprint([seed, key, row["sample_id"]]))
+        count = min(len(leaf) - 1, math.floor(len(leaf) * fraction + 0.5))
+        for index, row in enumerate(leaf):
+            row["split"] = "eval" if index < count else "train"
+            if index < count:
+                heldout.append(row["sample_id"])
+    return sorted(heldout)
 
 
 def source_rows(source):
@@ -62,7 +83,7 @@ def source_rows(source):
             streams.append(stream)
 
 
-def prepare(config_path: str) -> dict:
+def prepare(config_path: str, originals_dir: str | None = None) -> dict:
     raw, optical = read_config(config_path)
     config, seed = optical.prepare, raw["seed"]
     root = Path(config.output_dir)
@@ -77,7 +98,13 @@ def prepare(config_path: str) -> dict:
     )
     rows, counts, originals, seen = [], Counter(), Counter(), set()
     for source in config.sources:
-        dataset = source_rows(source)
+        if originals_dir is None:
+            dataset = source_rows(source)
+        else:
+            original_path = Path(originals_dir) / f"{source.name}.jsonl"
+            dataset = [json.loads(line) for line in original_path.read_text().splitlines()]
+            if source.max_records is None or len(dataset) < source.max_records:
+                raise ValueError("Original-record replay requires a finite available source limit")
         raw_path = root / "originals" / f"{source.name}.jsonl"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         limit = source.max_records
@@ -111,7 +138,7 @@ def prepare(config_path: str) -> dict:
                         continue
                     seen.add(sample_id)
                     key = slice_key(record)
-                    path = Path("slices") / key / f"{record['split']}.jsonl"
+                    path = Path("slices") / key / "records.jsonl"
                     output = root / path
                     output.parent.mkdir(parents=True, exist_ok=True)
                     payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
@@ -127,13 +154,11 @@ def prepare(config_path: str) -> dict:
                                     "group_id",
                                     "source",
                                     "task",
-                                    "view",
                                     "thinking",
                                     "image_count",
                                     "turn_count",
                                     "image_bin",
                                     "turn_bin",
-                                    "split",
                                 )
                             },
                             "slice": key,
@@ -143,15 +168,13 @@ def prepare(config_path: str) -> dict:
                             "sha256": fingerprint(record),
                         }
                     )
-                    counts[f"{record['split']}/{key}"] += 1
                 if originals[source.name] % 100 == 0:
                     print(f"{source.name}: {originals[source.name]} source records", flush=True)
     if not rows:
         raise ValueError("No eligible records were found")
+    heldout = assign_holdouts(rows, config.eval_fraction, seed)
+    counts.update(f"{row['split']}/{row['slice']}" for row in rows)
     frame = pl.DataFrame(rows)
-    leakage = frame.group_by("group_id").agg(pl.col("split").n_unique()).filter(pl.col("split") > 1)
-    if leakage.height:
-        raise AssertionError("Repository leakage between train and eval")
     frame.write_parquet(manifest)
     summary = {
         "preparation_fingerprint": preparation_fingerprint(optical, seed),
@@ -159,6 +182,9 @@ def prepare(config_path: str) -> dict:
         "counts": dict(sorted(counts.items())),
         "samples": len(rows),
         "dataset_fingerprint": fingerprint(rows),
+        "validation_scope": "sample-level; related repositories/trajectories may cross splits",
+        "holdout_rounding": "nearest integer, ties up; reserve at least one training row",
+        "holdout_ids": heldout,
     }
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     (root / "preparation.incomplete").unlink()
@@ -169,9 +195,12 @@ def prepare(config_path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/automodel.yaml")
+    parser.add_argument(
+        "--originals-dir", help="Re-curate saved complete source records (finite limits required)"
+    )
     args = parser.parse_args()
     load_dotenv()
-    prepare(args.config)
+    prepare(args.config, args.originals_dir)
 
 
 if __name__ == "__main__":

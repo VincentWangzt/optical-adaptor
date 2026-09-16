@@ -14,8 +14,8 @@ from urllib.parse import unquote, urlparse
 
 from PIL import Image
 
+from optical_adaptor.artifacts import file_sha256
 from optical_adaptor.inference.messages import chat_ids
-from optical_adaptor.training.config import file_sha256
 
 
 @dataclass(frozen=True)
@@ -135,16 +135,18 @@ class VllmBackend:
 
         self.settings = settings
         self.torch = torch
-        model = pipeline.config.models
-        self.tokenizer = AutoTokenizer.from_pretrained(model.qwen_id, revision=model.qwen_revision)
+        model = pipeline.optical.llm
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model["model_id"], revision=model["revision"]
+        )
         self.image_token = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self.end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         self.checkpoint = checkpoint
         self.vision = None
         self.llm = LLM(
-            model=model.qwen_id,
-            revision=model.qwen_revision,
-            tokenizer_revision=model.qwen_revision,
+            model=model["model_id"],
+            revision=model["revision"],
+            tokenizer_revision=model["revision"],
             dtype="bfloat16",
             seed=seed,
             tensor_parallel_size=1,
@@ -162,8 +164,8 @@ class VllmBackend:
         )
         self.identity = {
             "backend": "vllm-live-adapter" if checkpoint else "vllm-native",
-            "qwen_revision": model.qwen_revision,
-            "encoder_revision": model.encoder_revision if checkpoint else None,
+            "qwen_revision": model["revision"],
+            "encoder_revision": pipeline.optical.vision["revision"] if checkpoint else None,
             "checkpoint_sha256": file_sha256(checkpoint / "adapter.safetensors")
             if checkpoint
             else None,
@@ -179,44 +181,51 @@ class VllmBackend:
         from safetensors import safe_open
         from safetensors.torch import load_file
 
-        from optical_adaptor.training.models import DeepSeekVision, build_adapter
+        from optical_adaptor.adapters import MLPAdapter
+        from optical_adaptor.automodel.vision import DeepSeekOCRVision
 
         torch = self.torch
-        metadata = json.loads((checkpoint / "adapter.json").read_text())
-        if metadata != {"kind": "mlp", "config": pipeline.config.adapter.model_dump()}:
-            raise ValueError("checkpoint must be the configured MLP architecture")
-        state = json.loads((checkpoint / "state.json").read_text())
-        self.identity["checkpoint_state_sha256"] = file_sha256(checkpoint / "state.json")
-        self.identity["checkpoint_state_step"] = state["step"]
-        self.adapter = build_adapter("mlp", pipeline.config.adapter)
+        metadata = json.loads((checkpoint / "optical-model.json").read_text())
+        optical = pipeline.optical
+        expected = {"llm": optical.llm, "vision": optical.vision, "adapter": optical.adapter}
+        if metadata["model"] != expected or metadata["schema_version"] != 2:
+            raise ValueError("Exported optical model differs from the configured model")
+        self.identity["checkpoint_step"] = metadata["step"]
+        self.identity["checkpoint_metadata_sha256"] = file_sha256(checkpoint / "optical-model.json")
+        self.adapter = MLPAdapter(**optical.adapter)
         self.adapter.load_state_dict(load_file(checkpoint / "adapter.safetensors"), strict=True)
-        # Match training/evaluation: FP32 adapter parameters with BF16 autocast.
         self.adapter.to(device="cuda:0").requires_grad_(False).eval()
-        self.vision = DeepSeekVision(pipeline, torch.device("cuda:0"))
-        model = pipeline.config.models
+        self.vision = DeepSeekOCRVision(
+            **{k: v for k, v in optical.vision.items() if k != "_target_"}
+        )
+        self.vision.to(device="cuda:0", dtype=torch.bfloat16)
+        model = pipeline.optical.llm
         index = hf_hub_download(
-            model.qwen_id, "model.safetensors.index.json", revision=model.qwen_revision
+            model["model_id"], "model.safetensors.index.json", revision=model["revision"]
         )
         weights = json.loads(Path(index).read_text())["weight_map"]
         name = "model.language_model.embed_tokens.weight"
-        path = hf_hub_download(model.qwen_id, weights[name], revision=model.qwen_revision)
+        path = hf_hub_download(model["model_id"], weights[name], revision=model["revision"])
         with safe_open(path, framework="pt", device="cpu") as source:
             self.embedding_table = source.get_tensor(name).to(torch.bfloat16)
 
     def encode_images(self, images):
-        """Keep the encoder's microbatch geometry identical to cache extraction.
+        """Encode bounded image groups with the same preprocessing as training."""
+        from optical_adaptor.automodel.vision import image_pixels
 
-        BF16 vision kernels are measurably batch-shape dependent. Pad the final
-        microbatch with repeated pixels and discard those duplicate outputs.
-        """
         if not images:
             raise ValueError("encode_images requires at least one image")
-        outputs = []
-        for offset in range(0, len(images), self.settings.vision_batch_size):
-            batch = images[offset : offset + self.settings.vision_batch_size]
-            padded = batch + [batch[-1]] * (self.settings.vision_batch_size - len(batch))
-            outputs.append(self.vision(padded)[: len(batch)])
-        return self.torch.cat(outputs)
+        return self.torch.cat(
+            [
+                self.vision(
+                    image_pixels(
+                        images[start : start + self.settings.vision_batch_size],
+                        self.vision.image_size,
+                    )
+                )
+                for start in range(0, len(images), self.settings.vision_batch_size)
+            ]
+        )
 
     def _adapted_prompt(self, ids, images):
         torch = self.torch

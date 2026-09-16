@@ -1,0 +1,1150 @@
+#!/usr/bin/env python
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""End-to-end hybrid NemotronV3 CP test.
+
+Validates that a hybrid model with interleaved attention and mamba layers
+produces matching outputs/gradients between CP=1 and CP=N across six
+configurations:
+
+  Config 1 (bshd_te):        3D BSHD input, TE p2p CP, DualChunkSwap
+  Config 2 (thd_te):         2D THD input, TE p2p CP, DualChunkSwap, cu_seqlens
+  Config 3 (thd_te_packed):  2D THD input, TE p2p CP, multi-sequence packing, seq_idx
+  Config 4 (bshd_sdpa):      3D BSHD input, DTensor context_parallel(), SDPA backend
+  Config 5 (thd_te_mtp):     packed THD MTP loss, activations, gradients, optimizer step
+  Config 6 (bshd_sdpa_mtp):  packed BSHD SDPA MTP-Mamba loss and gradient parity
+
+Usage:
+    torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_hybrid_nemotron_v3_cp.py
+"""
+
+import os
+import sys
+
+import torch
+import torch.distributed as dist
+
+from nemo_automodel.components.models.common.mtp import shift_packed_tensor
+
+
+def dual_chunk_swap_unsplit(chunks_per_rank, cp_size, seq_dim=1):
+    """Reconstruct full sequence from DualChunkSwap-ordered rank outputs."""
+    all_chunks = [None] * (2 * cp_size)
+    for rank_idx, rank_output in enumerate(chunks_per_rank):
+        c0, c1 = torch.chunk(rank_output, 2, dim=seq_dim)
+        all_chunks[rank_idx] = c0
+        all_chunks[2 * cp_size - rank_idx - 1] = c1
+    return torch.cat(all_chunks, dim=seq_dim)
+
+
+def init_distributed():
+    """Initialize distributed environment from torchrun env vars."""
+    if not (dist.is_available() and dist.is_initialized()):
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+
+class MockHybridConfig:
+    """Mock configuration for a hybrid NemotronV3 model (attention + mamba layers).
+
+    Provides only the fields required by NemotronV3Model and its block types.
+    MoE-related fields are still required because NemotronV3Model constructs
+    a MoEConfig in __init__ regardless of layer types; they are set to minimal
+    values that avoid errors without activating MoE layers.
+    """
+
+    def __init__(self, cp_size=2):
+        # Attention config
+        self.num_attention_heads = 8
+        self.num_key_value_heads = 4
+        self.head_dim = 32
+        self.hidden_size = 256  # num_attention_heads * head_dim
+        self.attention_bias = False
+        self.attention_dropout = 0.0
+
+        # Mamba config
+        # Preserve the established 8-head CP=2/4 test topology. Odd CP sizes
+        # need a synthetic divisible topology to exercise the generic MTP path.
+        uses_default_mamba_topology = 8 % cp_size == 0
+        self.mamba_num_heads = 8 if uses_default_mamba_topology else 2 * cp_size
+        self.mamba_head_dim = 32
+        self.ssm_state_size = 16
+        self.n_groups = 2 if uses_default_mamba_topology else cp_size
+        self.chunk_size = 256
+        self.conv_kernel = 4
+        self.use_conv_bias = True
+        self.mamba_hidden_act = "silu"
+        self.time_step_limit = (0.0, float("inf"))
+        self.time_step_min = 0.001
+        self.time_step_max = 0.1
+        self.time_step_floor = 1e-4
+        self.use_bias = False
+
+        # Shared norm / model config
+        self.layer_norm_epsilon = 1e-5
+        self.num_hidden_layers = 4
+        self.vocab_size = 128
+        self.torch_dtype = "bfloat16"
+        self.initializer_range = 0.02
+        self.rescale_prenorm_residual = True
+        self.residual_in_fp32 = False
+
+        # Hybrid layer schedule: interleaved attention and mamba
+        self.layers_block_type = ["attention", "mamba", "attention", "mamba"]
+
+        # MLP config (required by MLP block type, kept here for completeness)
+        self.intermediate_size = 512
+        self.mlp_bias = False
+        self.mlp_hidden_act = "silu"
+
+        # MoE config fields
+        self.n_routed_experts = 4
+        self.num_experts_per_tok = 2
+        self.n_group = 1
+        self.topk_group = 1
+        self.routed_scaling_factor = 1.0
+        self.moe_intermediate_size = self.intermediate_size
+        self.norm_topk_prob = False
+        self.moe_shared_expert_intermediate_size = self.intermediate_size
+
+        # MTP config: one native Nemotron depth (attention + MoE).
+        self.num_nextn_predict_layers = 1
+        self.mtp_hybrid_override_pattern = "*E"
+
+    def to_dict(self):
+        """Return the config fields expected by the Hugging Face-compatible wrapper."""
+        return vars(self)
+
+
+def _create_baseline_model(config, backend, device):
+    """Create and sync a baseline model (CP=1)."""
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+    model = NemotronV3Model(config, backend=backend).to(device=device, dtype=torch.bfloat16)
+    model.train()
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
+    return model
+
+
+def _create_cp_model(config, backend, baseline_model, device):
+    """Create a CP model with weights copied from baseline."""
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+    model = NemotronV3Model(config, backend=backend).to(device=device, dtype=torch.bfloat16)
+    model.train()
+    model.load_state_dict(baseline_model.state_dict(), strict=False)
+    model.zero_grad()
+    return model
+
+
+def _wire_te_cp(model, cp_group, config):
+    """Wire TE-based CP on each hybrid layer (p2p for attention, hidden-parallel for mamba)."""
+    from transformer_engine.pytorch.attention import DotProductAttention
+
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
+
+    layers = model.layers.values() if hasattr(model.layers, "values") else model.layers
+    for layer in layers:
+        if layer.block_type == "mamba":
+            mixer = layer.mixer
+            mixer.cp = MambaContextParallel(
+                cp_group=cp_group,
+                num_heads=mixer.num_heads,
+                head_dim=mixer.head_dim,
+                n_groups=mixer.n_groups,
+                d_state=mixer.ssm_state_size,
+                mixer=mixer,
+            )
+        elif layer.block_type == "attention":
+            attn_module = layer.mixer.attn_module
+            if isinstance(attn_module, DotProductAttention):
+                attn_module.set_context_parallel_group(
+                    cp_group,
+                    torch.distributed.get_process_group_ranks(cp_group),
+                    torch.cuda.Stream(),
+                    cp_comm_type="p2p",
+                )
+
+
+def _wire_sdpa_cp(model, cp_group):
+    """Wire SDPA-based CP on mamba layers. Attention uses context_parallel().
+
+    MambaContextParallel always undoes/redoes DualChunkSwap around the SSM
+    kernel, matching the reordering applied by both TE CP and PyTorch's
+    context_parallel(allgather).
+    """
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
+
+    layers = model.layers.values() if hasattr(model.layers, "values") else model.layers
+    for layer in layers:
+        if layer.block_type == "mamba":
+            mixer = layer.mixer
+            mixer.cp = MambaContextParallel(
+                cp_group=cp_group,
+                num_heads=mixer.num_heads,
+                head_dim=mixer.head_dim,
+                n_groups=mixer.n_groups,
+                d_state=mixer.ssm_state_size,
+                mixer=mixer,
+            )
+        # Attention layers use DTensor context_parallel() -- no explicit CP wiring needed
+
+
+def _compare_results(
+    config_name,
+    rank,
+    output_cp_full,
+    output_baseline,
+    grad_cp,
+    grad_baseline,
+    output_atol,
+    output_rtol,
+    grad_atol,
+    grad_rtol,
+):
+    """Compare CP vs baseline results and return 0 on pass, 1 on fail."""
+    output_diff = (output_cp_full - output_baseline).abs()
+    grad_diff = (grad_cp - grad_baseline).abs()
+
+    if rank == 0:
+        print(f"\n{'=' * 70}")
+        print(f"Config: {config_name} - Hybrid NemotronV3 (Attention + Mamba)")
+        print(f"{'=' * 70}")
+        print(f"Output shape: CP={output_cp_full.shape}, Baseline={output_baseline.shape}")
+        print(f"Output diff - mean: {output_diff.mean().item():.6f}, max: {output_diff.max().item():.6f}")
+        print(f"Param grad diff - mean: {grad_diff.mean().item():.6f}, max: {grad_diff.max().item():.6f}")
+
+    try:
+        torch.testing.assert_close(
+            output_cp_full,
+            output_baseline,
+            rtol=output_rtol,
+            atol=output_atol,
+            msg=f"[{config_name}][Rank {rank}] Forward outputs differ",
+        )
+        torch.testing.assert_close(
+            grad_cp,
+            grad_baseline,
+            rtol=grad_rtol,
+            atol=grad_atol,
+            msg=f"[{config_name}][Rank {rank}] Parameter gradients differ",
+        )
+        if rank == 0:
+            print("  PASSED")
+            print(f"{'=' * 70}")
+        return 0
+    except AssertionError as e:
+        if rank == 0:
+            print(f"  FAILED: {e}")
+            print(f"{'=' * 70}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Config 1: BSHD + TE
+# ---------------------------------------------------------------------------
+def run_bshd_te(rank, world_size, device, config):
+    """Config 1: 3D BSHD input with TE p2p CP and DualChunkSwap."""
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = BackendConfig(linear="torch", attn="te", rms_norm="torch", enable_hf_state_dict_adapter=False)
+
+    model_baseline = _create_baseline_model(config, backend, device)
+
+    batch_size, seq_len = 2, 128
+    torch.manual_seed(42)
+    input_ids_full = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+    dist.broadcast(input_ids_full, src=0)
+
+    output_baseline = model_baseline(input_ids=input_ids_full)
+    output_baseline.sum().backward()
+    out_base = output_baseline.detach().clone()
+    embed_grad_base = model_baseline.embed_tokens.weight.grad.detach().clone()
+    dist.barrier()
+
+    # CP=2
+    model_cp = _create_cp_model(config, backend, model_baseline, device)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_te_cp(model_cp, cp_group, config)
+
+    import transformer_engine.pytorch  # noqa: F401
+    import transformer_engine_torch as tex
+
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    indices = tex.thd_get_partitioned_indices(cu_seqlens, seq_len, world_size, rank)
+    input_ids_local = input_ids_full[:, indices]
+
+    output_cp_local = model_cp(input_ids=input_ids_local)
+    output_cp_local.sum().backward()
+
+    local_seq = output_cp_local.shape[1]
+    output_gathered = [
+        torch.zeros(batch_size, local_seq, config.hidden_size, device=device, dtype=torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(output_gathered, output_cp_local.detach().contiguous(), group=cp_group)
+    out_cp_full = dual_chunk_swap_unsplit(output_gathered, cp_size=world_size, seq_dim=1)
+
+    embed_grad_cp = model_cp.embed_tokens.weight.grad.detach().clone()
+    dist.all_reduce(embed_grad_cp, op=dist.ReduceOp.SUM, group=cp_group)
+
+    return _compare_results(
+        "bshd_te",
+        rank,
+        out_cp_full,
+        out_base,
+        embed_grad_cp,
+        embed_grad_base,
+        output_atol=5e-2,
+        output_rtol=1e-2,
+        grad_atol=1e-1,
+        grad_rtol=5e-2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config 2: THD + TE
+# ---------------------------------------------------------------------------
+def run_thd_te(rank, world_size, device, config):
+    """Config 2: 2D THD input with TE p2p CP and DualChunkSwap."""
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = BackendConfig(linear="torch", attn="te", rms_norm="torch", enable_hf_state_dict_adapter=False)
+
+    model_baseline = _create_baseline_model(config, backend, device)
+
+    batch_size, seq_len = 1, 128
+    torch.manual_seed(42)
+    input_ids_full = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+    dist.broadcast(input_ids_full, src=0)
+
+    # Baseline: use batch=1 BSHD path (model.forward expects input_ids)
+    output_baseline = model_baseline(input_ids=input_ids_full)
+    output_baseline.sum().backward()
+    out_base = output_baseline.detach().clone()
+    embed_grad_base = model_baseline.embed_tokens.weight.grad.detach().clone()
+    dist.barrier()
+
+    # CP=2
+    model_cp = _create_cp_model(config, backend, model_baseline, device)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_te_cp(model_cp, cp_group, config)
+
+    import transformer_engine.pytorch  # noqa: F401
+    import transformer_engine_torch as tex
+
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    indices = tex.thd_get_partitioned_indices(cu_seqlens, seq_len, world_size, rank)
+    input_ids_local = input_ids_full[:, indices]
+
+    # TE CP with p2p operates in BSHD format; do NOT pass cu_seqlens here
+    # (passing cu_seqlens triggers THD squeeze in NemotronV3Model.forward which
+    # is incompatible with TE p2p CP).  Single-sequence batch_size=1 BSHD is
+    # numerically equivalent.
+    output_cp_local = model_cp(input_ids=input_ids_local)
+    output_cp_local.sum().backward()
+
+    local_seq = output_cp_local.shape[1]
+    output_gathered = [
+        torch.zeros(batch_size, local_seq, config.hidden_size, device=device, dtype=torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(output_gathered, output_cp_local.detach().contiguous(), group=cp_group)
+    out_cp_full = dual_chunk_swap_unsplit(output_gathered, cp_size=world_size, seq_dim=1)
+
+    embed_grad_cp = model_cp.embed_tokens.weight.grad.detach().clone()
+    dist.all_reduce(embed_grad_cp, op=dist.ReduceOp.SUM, group=cp_group)
+
+    return _compare_results(
+        "thd_te",
+        rank,
+        out_cp_full,
+        out_base,
+        embed_grad_cp,
+        embed_grad_base,
+        output_atol=5e-2,
+        output_rtol=1e-2,
+        grad_atol=1e-1,
+        grad_rtol=5e-2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config 3: THD + TE + packing
+# ---------------------------------------------------------------------------
+def run_thd_te_packed(rank, world_size, device, config):
+    """Config 3: 2D THD with TE p2p CP, multi-sequence packing, and seq_idx."""
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = BackendConfig(linear="torch", attn="te", rms_norm="torch", enable_hf_state_dict_adapter=False)
+
+    model_baseline = _create_baseline_model(config, backend, device)
+
+    # Two packed sequences: each 64 tokens for total 128.
+    # For the hybrid model, the mamba layers need sequence lengths divisible
+    # by 2 * cp_size = 4. 64 satisfies this.
+    seq_len_a, seq_len_b = 64, 64
+    total_len = seq_len_a + seq_len_b
+
+    torch.manual_seed(42)
+    input_ids_full = torch.randint(0, config.vocab_size, (1, total_len), device=device)
+    dist.broadcast(input_ids_full, src=0)
+
+    # Baseline: pass seq_idx (not cu_seqlens) to keep BSHD format for attention
+    # while letting mamba layers know about packed sequence boundaries.
+    # Using cu_seqlens would trigger THD squeeze in NemotronV3Model.forward,
+    # causing TE to use a different code path than the BSHD CP run.
+    cu_seqlens_full = torch.tensor([0, seq_len_a, total_len], dtype=torch.int32, device=device)
+    positions_full = torch.arange(total_len, device=device)
+    seq_idx_full = torch.searchsorted(cu_seqlens_full[1:], positions_full).unsqueeze(0).to(torch.int32)
+    output_baseline = model_baseline(input_ids=input_ids_full, seq_idx=seq_idx_full)
+    output_baseline.sum().backward()
+    out_base = output_baseline.detach().clone()
+    embed_grad_base = model_baseline.embed_tokens.weight.grad.detach().clone()
+    dist.barrier()
+
+    # CP=2
+    model_cp = _create_cp_model(config, backend, model_baseline, device)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_te_cp(model_cp, cp_group, config)
+
+    import transformer_engine.pytorch  # noqa: F401
+    import transformer_engine_torch as tex
+
+    # TE CP with p2p operates in BSHD format; passing cu_seqlens to the model
+    # triggers THD squeeze which is incompatible.  Use single-sequence DCS
+    # indices (treating the entire packed sequence as one) so that the attention
+    # DCS reordering matches the full-causal mask applied by BSHD attention.
+    cu_seqlens_single = torch.tensor([0, total_len], dtype=torch.int32, device=device)
+    indices = tex.thd_get_partitioned_indices(cu_seqlens_single, total_len, world_size, rank)
+    input_ids_local = input_ids_full[:, indices]
+    local_len = input_ids_local.shape[1]
+
+    # Pre-compute seq_idx so mamba layers know about packed sequence boundaries.
+    # The mamba kernel sees the global sequence (after all-to-all gather), so
+    # seq_idx must cover the full (global) sequence length.
+    positions = torch.arange(total_len, device=device)
+    seq_idx = torch.searchsorted(cu_seqlens_full[1:], positions).unsqueeze(0).to(torch.int32)
+
+    output_cp_local = model_cp(input_ids=input_ids_local, seq_idx=seq_idx)
+    output_cp_local.sum().backward()
+
+    output_gathered = [
+        torch.zeros(1, local_len, config.hidden_size, device=device, dtype=torch.bfloat16) for _ in range(world_size)
+    ]
+    dist.all_gather(output_gathered, output_cp_local.detach().contiguous(), group=cp_group)
+    out_cp_full = dual_chunk_swap_unsplit(output_gathered, cp_size=world_size, seq_dim=1)
+
+    embed_grad_cp = model_cp.embed_tokens.weight.grad.detach().clone()
+    dist.all_reduce(embed_grad_cp, op=dist.ReduceOp.SUM, group=cp_group)
+
+    return _compare_results(
+        "thd_te_packed",
+        rank,
+        out_cp_full,
+        out_base,
+        embed_grad_cp,
+        embed_grad_base,
+        output_atol=1e-1,
+        output_rtol=2e-2,
+        grad_atol=2e-1,
+        grad_rtol=1e-1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config 4: BSHD + SDPA
+# ---------------------------------------------------------------------------
+def run_bshd_sdpa(rank, world_size, device, config):
+    """Config 4: 3D BSHD input with DTensor context_parallel() and SDPA backend."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard, set_rotate_method
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", enable_hf_state_dict_adapter=False)
+
+    model_baseline = _create_baseline_model(config, backend, device)
+
+    batch_size, seq_len = 2, 128
+    torch.manual_seed(42)
+    input_ids_full = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+    dist.broadcast(input_ids_full, src=0)
+
+    output_baseline = model_baseline(input_ids=input_ids_full)
+    output_baseline.sum().backward()
+    out_base = output_baseline.detach().clone()
+    param_grad_base = model_baseline.layers["0"].mixer.q_proj.weight.grad.detach().clone()
+    dist.barrier()
+
+    # CP=2 with SDPA + context_parallel
+    model_cp = _create_cp_model(config, backend, model_baseline, device)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_sdpa_cp(model_cp, cp_group)
+
+    set_rotate_method("allgather")
+
+    # context_parallel() shards the full-sequence buffer itself, so pass the
+    # complete embedding (not a pre-sharded chunk).  Embed on the full input_ids
+    # (all ranks have the same data) and let context_parallel handle sharding.
+    with torch.no_grad():
+        x_full_embed = model_cp.embed_tokens(input_ids_full)
+    x_cp = x_full_embed.detach().clone()
+
+    # context_parallel() cannot handle buffers that require grad, so enable
+    # grad only after entering the context.
+    cp_ctx = context_parallel(
+        cp_mesh,
+        buffers=[x_cp],
+        buffer_seq_dims=[1],
+        no_restore_buffers={x_cp},
+    )
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        with cp_ctx:
+            x_cp.requires_grad_(True)
+            # Forward through layers directly using inputs_embeds
+            hidden_states = x_cp
+            for layer in model_cp.layers.values():
+                hidden_states = layer(hidden_states)
+            hidden_states = model_cp.norm(hidden_states)
+            output_cp_local = hidden_states
+            # backward() must run inside cp_ctx so that the ring-attention
+            # backward hooks registered by context_parallel are still active.
+            output_cp_local.sum().backward()
+
+    # After context_parallel, output_cp_local holds the local shard.
+    # Use context_parallel_unshard to reconstruct the full sequence with
+    # correct token ordering (undoes the head-tail load-balancing).
+    (out_cp_full,) = context_parallel_unshard(
+        cp_mesh,
+        [output_cp_local.detach()],
+        seq_dims=[1],
+    )
+
+    # Embedding is not in the backward graph (detached for context_parallel),
+    # so validate gradients using q_proj.weight which IS in the graph.
+    param_grad_cp = model_cp.layers["0"].mixer.q_proj.weight.grad.detach().clone()
+    dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM, group=cp_group)
+
+    return _compare_results(
+        "bshd_sdpa",
+        rank,
+        out_cp_full,
+        out_base,
+        param_grad_cp,
+        param_grad_base,
+        output_atol=5e-2,
+        output_rtol=1e-2,
+        grad_atol=1e-1,
+        grad_rtol=5e-2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config 5: THD + TE + packed MTP
+# ---------------------------------------------------------------------------
+def _gather_te_partition(local_tensor, local_indices, full_tokens, cp_group):
+    """Restore a tensor sharded with TE packed-CP indices to global order.
+
+    Args:
+        local_tensor: Per-rank tensor of shape [local_tokens, ...].
+        local_indices: Tensor of shape [local_tokens] containing global positions.
+        full_tokens: Global packed-token count.
+        cp_group: Context-parallel process group.
+
+    Returns:
+        Tensor of shape [full_tokens, ...] in global packed-token order.
+    """
+    cp_size = dist.get_world_size(group=cp_group)
+    gathered_tensors = [torch.empty_like(local_tensor) for _ in range(cp_size)]
+    gathered_indices = [torch.empty_like(local_indices) for _ in range(cp_size)]
+    dist.all_gather(gathered_tensors, local_tensor.contiguous(), group=cp_group)
+    dist.all_gather(gathered_indices, local_indices.contiguous(), group=cp_group)
+    output = local_tensor.new_empty((full_tokens, *local_tensor.shape[1:]))
+    for indices, tensor in zip(gathered_indices, gathered_tensors):
+        output.index_copy_(0, indices.to(torch.long), tensor)
+    return output
+
+
+def _create_mtp_model(config, backend, device):
+    """Create a synchronized causal LM with its native Nemotron MTP head."""
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    model = NemotronHForCausalLM(config, backend=backend).to(device=device, dtype=torch.bfloat16)
+    model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
+    model.train()
+    for parameter in model.parameters():
+        dist.broadcast(parameter.data, src=0)
+    return model
+
+
+def run_thd_te_mtp(rank, world_size, device, config):
+    """Config 5: packed THD MTP CP=1/CP=N numerical training parity."""
+    import transformer_engine.pytorch  # noqa: F401
+    import transformer_engine_torch as tex
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = BackendConfig(
+        linear="torch",
+        attn="te",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    model_baseline = _create_mtp_model(config, backend, device)
+
+    # Two unequal documents expose both packed-document boundaries and TE's
+    # head/tail CP partition boundaries. Each length remains divisible by
+    # 2 * CP, so unequal sequence lengths must still contribute the same
+    # aggregate token count to every rank.
+    # TE's DualChunkSwap needs each packed sequence divisible by 2 * CP.
+    # Keeping 32 aggregate tokens per rank also gives every tested size the
+    # same amount of local work (12 from the first document, 20 from the second).
+    seq_len_a = 12 * world_size
+    seq_len_b = 20 * world_size
+    total_len = seq_len_a + seq_len_b
+    cu_seqlens = torch.tensor([0, seq_len_a, total_len], dtype=torch.int32, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32, device=device),
+        torch.tensor([seq_len_a, seq_len_b], device=device),
+    )
+    position_ids = torch.cat([torch.arange(seq_len_a, device=device), torch.arange(seq_len_b, device=device)])
+
+    torch.manual_seed(2026)
+    input_ids = torch.randint(0, config.vocab_size, (1, total_len), device=device)
+    dist.broadcast(input_ids, src=0)
+
+    # SALM labels are already next-token targets. MTP depth 1 therefore needs
+    # one additional global shift, with the final two positions in each
+    # document ignored.
+    seq_idx_batched = seq_idx.unsqueeze(0)
+    labels_full = shift_packed_tensor(input_ids, depth=1, seq_idx=seq_idx_batched, fill_value=-100).squeeze(0)
+    mtp_inputs_full = model_baseline.prepare_mtp_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "labels": labels_full.unsqueeze(0),
+            "position_ids": position_ids.unsqueeze(0),
+            "seq_idx": seq_idx.unsqueeze(0),
+        }
+    )
+    assert mtp_inputs_full is not None
+    mtp_input_ids_full = mtp_inputs_full.input_ids[0]
+    assert mtp_inputs_full.position_ids is not None
+    mtp_position_ids_full = mtp_inputs_full.position_ids[0]
+    mtp_targets_full = mtp_inputs_full.targets[0].squeeze(0)
+    torch.testing.assert_close(
+        mtp_targets_full,
+        shift_packed_tensor(labels_full.unsqueeze(0), depth=1, seq_idx=seq_idx_batched, fill_value=-100).squeeze(0),
+        rtol=0,
+        atol=0,
+    )
+    num_label_tokens = int((labels_full != -100).sum().item())
+    max_seqlen = torch.tensor(max(seq_len_a, seq_len_b), dtype=torch.int32, device=device)
+
+    output_baseline = model_baseline(
+        input_ids,
+        position_ids=position_ids,
+        mtp_per_depth_input_ids=(mtp_input_ids_full,),
+        mtp_per_depth_position_ids=(mtp_position_ids_full,),
+        qkv_format="thd",
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        cp_rank=0,
+        cp_size=1,
+    )
+    mtp_hidden_baseline = output_baseline.mtp_per_depth_h[0].squeeze(0)
+    loss_fn = MaskedCrossEntropy(reduction="sum")
+    mtp_loss_baseline = calculate_mtp_loss(
+        loss_fn,
+        mtp_per_depth_h=output_baseline.mtp_per_depth_h,
+        mtp_per_depth_targets=(mtp_targets_full,),
+        labels=labels_full,
+        model=model_baseline,
+        scaling_factor=1.0,
+        num_label_tokens=num_label_tokens,
+    )
+    mtp_loss_baseline.backward()
+
+    selected_names = (
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "mtp.layers.0.eh_proj.weight",
+        "mtp.layers.0.mixer.q_proj.weight",
+    )
+    baseline_params = dict(model_baseline.named_parameters())
+    baseline_grads = {name: baseline_params[name].grad.detach().clone() for name in selected_names}
+    baseline_before_step = {name: baseline_params[name].detach().clone() for name in selected_names}
+
+    model_cp = _create_mtp_model(config, backend, device)
+    model_cp.load_state_dict(model_baseline.state_dict())
+    model_cp.zero_grad(set_to_none=True)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_te_cp(model_cp.model, cp_group, config)
+    _wire_te_cp(model_cp.mtp, cp_group, config)
+
+    local_indices = tex.thd_get_partitioned_indices(cu_seqlens, total_len, world_size, rank).to(torch.long)
+    local_token_count = torch.tensor(local_indices.numel(), dtype=torch.int64, device=device)
+    token_counts = [torch.empty_like(local_token_count) for _ in range(world_size)]
+    dist.all_gather(token_counts, local_token_count, group=cp_group)
+    token_counts = [int(count.item()) for count in token_counts]
+    if len(set(token_counts)) != 1:
+        raise AssertionError(f"TE packed CP assigned unequal aggregate token counts across ranks: {token_counts}")
+    if token_counts[0] != total_len // world_size:
+        raise AssertionError(
+            f"TE packed CP assigned {token_counts[0]} tokens per rank; expected {total_len // world_size}"
+        )
+    mtp_inputs_cp = model_cp.prepare_mtp_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "labels": labels_full.unsqueeze(0),
+            "position_ids": position_ids.unsqueeze(0),
+            "seq_idx": seq_idx.unsqueeze(0),
+        }
+    )
+    assert mtp_inputs_cp is not None
+    assert mtp_inputs_cp.position_ids is not None
+    input_ids_local = input_ids.reshape(-1).index_select(0, local_indices)
+    mtp_input_ids_local = mtp_inputs_cp.input_ids[0].reshape(-1).index_select(0, local_indices)
+    position_ids_local = position_ids.index_select(0, local_indices)
+    mtp_position_ids_local = mtp_inputs_cp.position_ids[0].reshape(-1).index_select(0, local_indices)
+    labels_local = labels_full.index_select(0, local_indices)
+    mtp_targets_local = mtp_inputs_cp.targets[0].reshape(-1).index_select(0, local_indices)
+
+    output_cp = model_cp(
+        input_ids_local,
+        position_ids=position_ids_local,
+        mtp_per_depth_input_ids=(mtp_input_ids_local,),
+        mtp_per_depth_position_ids=(mtp_position_ids_local,),
+        qkv_format="thd",
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        cp_rank=rank,
+        cp_size=world_size,
+    )
+    mtp_loss_cp = calculate_mtp_loss(
+        loss_fn,
+        mtp_per_depth_h=output_cp.mtp_per_depth_h,
+        mtp_per_depth_targets=(mtp_targets_local,),
+        labels=labels_local,
+        model=model_cp,
+        scaling_factor=1.0,
+        num_label_tokens=num_label_tokens,
+    )
+    mtp_loss_cp.backward()
+
+    mtp_hidden_cp = _gather_te_partition(
+        output_cp.mtp_per_depth_h[0].squeeze(0).detach(),
+        local_indices,
+        total_len,
+        cp_group,
+    )
+    logits_cp = _gather_te_partition(
+        output_cp.logits.squeeze(0).detach(),
+        local_indices,
+        total_len,
+        cp_group,
+    )
+    targets_cp = _gather_te_partition(mtp_targets_local, local_indices, total_len, cp_group)
+    mtp_loss_cp_global = mtp_loss_cp.detach().clone()
+    dist.all_reduce(mtp_loss_cp_global, op=dist.ReduceOp.SUM, group=cp_group)
+
+    for parameter in model_cp.parameters():
+        if parameter.grad is not None:
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=cp_group)
+
+    cp_params = dict(model_cp.named_parameters())
+
+    logits_baseline = output_baseline.logits.squeeze(0).detach()
+    if rank == 0:
+        logits_diff = (logits_cp - logits_baseline).abs()
+        hidden_diff = (mtp_hidden_cp - mtp_hidden_baseline.detach()).abs()
+        logits_cosine = torch.nn.functional.cosine_similarity(
+            logits_cp.float().flatten(), logits_baseline.float().flatten(), dim=0
+        )
+        hidden_cosine = torch.nn.functional.cosine_similarity(
+            mtp_hidden_cp.float().flatten(), mtp_hidden_baseline.detach().float().flatten(), dim=0
+        )
+        print("\n" + "=" * 70)
+        print("Config: thd_te_mtp - packed Nemotron MTP training parity")
+        print("=" * 70)
+        print(f"Targets: exact global reconstruction = {torch.equal(targets_cp, mtp_targets_full)}")
+        print(
+            f"Backbone logits diff - mean: {logits_diff.mean().item():.6f}, "
+            f"max: {logits_diff.max().item():.6f}, cosine: {logits_cosine.item():.8f}"
+        )
+        print(
+            f"MTP hidden diff - mean: {hidden_diff.mean().item():.6f}, "
+            f"max: {hidden_diff.max().item():.6f}, cosine: {hidden_cosine.item():.8f}"
+        )
+        print(f"MTP loss: CP={mtp_loss_cp_global.item():.6f}, baseline={mtp_loss_baseline.detach().item():.6f}")
+        for name in selected_names:
+            grad_diff = (cp_params[name].grad - baseline_grads[name]).abs()
+            print(f"Grad {name} - mean: {grad_diff.mean().item():.6f}, max: {grad_diff.max().item():.6f}")
+    try:
+        torch.testing.assert_close(targets_cp, mtp_targets_full, rtol=0, atol=0)
+        torch.testing.assert_close(
+            logits_cp,
+            logits_baseline,
+            rtol=2e-2,
+            atol=5e-2,
+            msg="CP backbone logits differ from CP=1",
+        )
+        torch.testing.assert_close(
+            mtp_hidden_cp,
+            mtp_hidden_baseline.detach(),
+            rtol=2e-2,
+            # BF16 P2P accumulation error grows slightly with CP rank count;
+            # loss and gradient parity below provide stricter end-result checks.
+            atol=1.25e-1,
+            msg="CP MTP hidden states differ from CP=1",
+        )
+        torch.testing.assert_close(
+            mtp_loss_cp_global,
+            mtp_loss_baseline.detach(),
+            rtol=2e-2,
+            atol=3e-2,
+            msg="global CP MTP loss differs from CP=1",
+        )
+        for name in selected_names:
+            torch.testing.assert_close(
+                cp_params[name].grad,
+                baseline_grads[name],
+                rtol=5e-2,
+                atol=1e-2,
+                msg=f"CP MTP gradient differs for {name}",
+            )
+
+        learning_rate = 0.25
+        torch.optim.SGD(model_baseline.parameters(), lr=learning_rate).step()
+        torch.optim.SGD(model_cp.parameters(), lr=learning_rate).step()
+        for name in selected_names:
+            before = baseline_before_step[name].float()
+            baseline_update = baseline_params[name].detach().float() - before
+            cp_update = cp_params[name].detach().float() - before
+            if not torch.count_nonzero(baseline_update):
+                raise AssertionError(f"baseline optimizer did not update {name}")
+            if not torch.count_nonzero(cp_update):
+                raise AssertionError(f"CP optimizer did not update {name}")
+            if rank == 0:
+                update_diff = (cp_update - baseline_update).abs()
+                print(
+                    f"Update {name} - mean diff: {update_diff.mean().item():.6f}, "
+                    f"max diff: {update_diff.max().item():.6f}"
+                )
+            # Compare update vectors, not final BF16 parameters. The old
+            # parameter atol (5e-2) exactly equaled learning_rate * old grad_atol
+            # (0.25 * 2e-1). The update atol below is also stricter than
+            # learning_rate * current grad_atol (0.25 * 1e-2 = 2.5e-3).
+            torch.testing.assert_close(
+                cp_update,
+                baseline_update,
+                rtol=5e-2,
+                atol=2e-3,
+                msg=f"CP optimizer update differs for {name}",
+            )
+    except AssertionError as error:
+        if rank == 0:
+            print(f"  thd_te_mtp: FAILED - {error}")
+        return 1
+
+    if rank == 0:
+        print("  PASSED")
+        print("=" * 70)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Config 6: BSHD + SDPA + packed MTP Mamba
+# ---------------------------------------------------------------------------
+def run_bshd_sdpa_mtp(rank, world_size, device, config):
+    """Packed BSHD MTP-Mamba CP=1/CP=N loss and gradient parity."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard, set_rotate_method
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.common.mtp import shift_packed_tensor
+
+    config.mtp_hybrid_override_pattern = "M"
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    model_baseline = _create_mtp_model(config, backend, device)
+
+    seq_len_a = seq_len_b = 32 * world_size
+    total_len = seq_len_a + seq_len_b
+    cu_seqlens = torch.tensor([0, seq_len_a, total_len], dtype=torch.int32, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.long, device=device),
+        torch.tensor([seq_len_a, seq_len_b], device=device),
+    ).unsqueeze(0)
+    position_ids = torch.cat(
+        [torch.arange(seq_len_a, device=device), torch.arange(seq_len_b, device=device)]
+    ).unsqueeze(0)
+
+    torch.manual_seed(2027)
+    input_ids = torch.randint(0, config.vocab_size, (1, total_len), device=device)
+    dist.broadcast(input_ids, src=0)
+    labels_full = shift_packed_tensor(input_ids, depth=1, seq_idx=seq_idx, fill_value=-100)
+    raw_packed_batch = {
+        "input_ids": input_ids,
+        "labels": labels_full,
+        "position_ids": position_ids,
+        "seq_lens": torch.tensor([[seq_len_a, seq_len_b]], device=device),
+        "seq_lens_padded": torch.tensor([[seq_len_a, seq_len_b]], device=device),
+    }
+    mtp_inputs_full = model_baseline.prepare_mtp_inputs_for_cp(raw_packed_batch)
+    assert mtp_inputs_full is not None
+    assert mtp_inputs_full.position_ids is not None
+    mtp_input_ids_full = mtp_inputs_full.input_ids[0]
+    mtp_position_ids_full = mtp_inputs_full.position_ids[0]
+    mtp_targets_full = mtp_inputs_full.targets[0]
+    num_label_tokens = int((labels_full != -100).sum().item())
+
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        output_baseline = model_baseline(
+            input_ids,
+            position_ids=position_ids,
+            mtp_per_depth_input_ids=(mtp_input_ids_full,),
+            mtp_per_depth_position_ids=(mtp_position_ids_full,),
+            qkv_format="thd",
+            cu_seqlens=cu_seqlens,
+            cp_rank=0,
+            cp_size=1,
+        )
+        loss_fn = MaskedCrossEntropy(reduction="sum")
+        mtp_loss_baseline = calculate_mtp_loss(
+            loss_fn,
+            mtp_per_depth_h=output_baseline.mtp_per_depth_h,
+            mtp_per_depth_targets=(mtp_targets_full,),
+            labels=labels_full,
+            model=model_baseline,
+            scaling_factor=1.0,
+            num_label_tokens=num_label_tokens,
+        )
+        mtp_loss_baseline.backward()
+
+    selected_names = (
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "mtp.layers.0.mixer.in_proj.weight",
+    )
+    baseline_params = dict(model_baseline.named_parameters())
+    baseline_grads = {name: baseline_params[name].grad.detach().clone() for name in selected_names}
+
+    model_cp = _create_mtp_model(config, backend, device)
+    model_cp.load_state_dict(model_baseline.state_dict())
+    model_cp.zero_grad(set_to_none=True)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_sdpa_cp(model_cp.model, cp_group)
+    _wire_sdpa_cp(model_cp.mtp, cp_group)
+    set_rotate_method("allgather")
+
+    mtp_inputs_cp = model_cp.prepare_mtp_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "labels": labels_full,
+            "position_ids": position_ids,
+            "seq_lens": raw_packed_batch["seq_lens"],
+            "seq_lens_padded": raw_packed_batch["seq_lens_padded"],
+        }
+    )
+    assert mtp_inputs_cp is not None
+    assert mtp_inputs_cp.position_ids is not None
+
+    input_ids_cp = input_ids.clone()
+    position_ids_cp = position_ids.clone()
+    labels_cp = labels_full.clone()
+    mtp_input_ids_cp = mtp_inputs_cp.input_ids[0].clone()
+    mtp_position_ids_cp = mtp_inputs_cp.position_ids[0].clone()
+    mtp_targets_cp = mtp_inputs_cp.targets[0].clone()
+    cp_buffers = [
+        input_ids_cp,
+        position_ids_cp,
+        labels_cp,
+        mtp_input_ids_cp,
+        mtp_position_ids_cp,
+        mtp_targets_cp,
+    ]
+    cp_ctx = context_parallel(
+        cp_mesh,
+        buffers=cp_buffers,
+        buffer_seq_dims=[1] * len(cp_buffers),
+        no_restore_buffers=set(cp_buffers),
+    )
+
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        with cp_ctx:
+            output_cp = model_cp(
+                input_ids_cp,
+                position_ids=position_ids_cp,
+                mtp_per_depth_input_ids=(mtp_input_ids_cp,),
+                mtp_per_depth_position_ids=(mtp_position_ids_cp,),
+                qkv_format="thd",
+                cu_seqlens=cu_seqlens,
+                cp_rank=rank,
+                cp_size=world_size,
+            )
+            mtp_loss_cp = calculate_mtp_loss(
+                loss_fn,
+                mtp_per_depth_h=output_cp.mtp_per_depth_h,
+                mtp_per_depth_targets=(mtp_targets_cp,),
+                labels=labels_cp,
+                model=model_cp,
+                scaling_factor=1.0,
+                num_label_tokens=num_label_tokens,
+            )
+            mtp_loss_cp.backward()
+
+    logits_cp, mtp_hidden_cp, targets_cp = context_parallel_unshard(
+        cp_mesh,
+        [
+            output_cp.logits.detach(),
+            output_cp.mtp_per_depth_h[0].detach(),
+            mtp_targets_cp,
+        ],
+        seq_dims=[1, 1, 1],
+    )
+    mtp_loss_cp_global = mtp_loss_cp.detach().clone()
+    dist.all_reduce(mtp_loss_cp_global, op=dist.ReduceOp.SUM, group=cp_group)
+    for parameter in model_cp.parameters():
+        if parameter.grad is not None:
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=cp_group)
+
+    cp_params = dict(model_cp.named_parameters())
+    logits_baseline = output_baseline.logits.detach()
+    mtp_hidden_baseline = output_baseline.mtp_per_depth_h[0].detach()
+
+    if rank == 0:
+        print("\n" + "=" * 70)
+        print("Config: bshd_sdpa_mtp - packed SDPA MTP-Mamba training parity")
+        print("=" * 70)
+        print(f"Targets: exact global reconstruction = {torch.equal(targets_cp, mtp_targets_full)}")
+        print(f"MTP loss: CP={mtp_loss_cp_global.item():.6f}, baseline={mtp_loss_baseline.detach().item():.6f}")
+        print(f"Backbone logits max diff: {(logits_cp - logits_baseline).abs().max().item():.6f}")
+        print(f"MTP hidden max diff: {(mtp_hidden_cp - mtp_hidden_baseline).abs().max().item():.6f}")
+
+    try:
+        torch.testing.assert_close(targets_cp, mtp_targets_full, rtol=0, atol=0)
+        torch.testing.assert_close(logits_cp, logits_baseline, rtol=2e-2, atol=5e-2)
+        torch.testing.assert_close(mtp_hidden_cp, mtp_hidden_baseline, rtol=2e-2, atol=1.25e-1)
+        torch.testing.assert_close(mtp_loss_cp_global, mtp_loss_baseline.detach(), rtol=2e-2, atol=3e-2)
+        for name in selected_names:
+            torch.testing.assert_close(
+                cp_params[name].grad,
+                baseline_grads[name],
+                rtol=1e-1,
+                atol=2e-1,
+                msg=f"CP MTP gradient differs for {name}",
+            )
+    except AssertionError as error:
+        if rank == 0:
+            print(f"  bshd_sdpa_mtp: FAILED - {error}")
+        return 1
+
+    if rank == 0:
+        print("  PASSED")
+        print("=" * 70)
+    return 0
+
+
+def main():
+    init_distributed()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{rank}")
+
+    if world_size < 2:
+        if rank == 0:
+            print(f"ERROR: This test requires at least 2 GPUs, got {world_size}", file=sys.stderr)
+        sys.exit(1)
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    config = MockHybridConfig(cp_size=world_size)
+
+    configs = {
+        "bshd_te": lambda: run_bshd_te(rank, world_size, device, config),
+        "thd_te": lambda: run_thd_te(rank, world_size, device, config),
+        "thd_te_packed": lambda: run_thd_te_packed(rank, world_size, device, config),
+        "bshd_sdpa": lambda: run_bshd_sdpa(rank, world_size, device, config),
+        "thd_te_mtp": lambda: run_thd_te_mtp(rank, world_size, device, config),
+        "bshd_sdpa_mtp": lambda: run_bshd_sdpa_mtp(rank, world_size, device, config),
+    }
+    requested_config = os.environ.get("NEMOTRON_CP_TEST_CONFIG")
+    if requested_config:
+        if requested_config not in configs:
+            raise ValueError(f"Unknown NEMOTRON_CP_TEST_CONFIG={requested_config!r}; choose from {tuple(configs)}")
+        configs = {requested_config: configs[requested_config]}
+
+    results = {}
+    for name, fn in configs.items():
+        dist.barrier()
+        try:
+            results[name] = fn()
+        except Exception as e:
+            if rank == 0:
+                print(f"  {name}: ERROR - {e}")
+            results[name] = 1
+
+    if rank == 0:
+        print(f"\n{'=' * 70}")
+        print("Summary - Hybrid NemotronV3 CP Tests")
+        print(f"{'=' * 70}")
+        for name, result in results.items():
+            status = "PASSED" if result == 0 else "FAILED"
+            print(f"  {name}: {status}")
+        print(f"{'=' * 70}\n")
+
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+    sys.exit(1 if any(r != 0 for r in results.values()) else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1280 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from contextlib import nullcontext
+from typing import Any, Dict
+
+import torch
+import torch.distributed as dist
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+
+from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
+from nemo_automodel.components.distributed.utils import get_sync_ctx
+from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
+from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
+from nemo_automodel.components.training.utils import (
+    clip_grad_norm,
+    prepare_after_first_microbatch,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+)
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
+from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
+from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.utils import dtype_from_str
+
+# Removed diffusion-only YAML keys and their standard replacements. The diffusion
+# recipe now shares the LLM/VLM ``optimizer:`` / ``clip_grad_norm:`` /
+# ``step_scheduler:`` schema; configs still using the old keys fail fast with the
+# mapping below instead of being silently misread.
+_REMOVED_KEY_MIGRATIONS = {
+    "optim.learning_rate": "optimizer.lr",
+    "optim.optimizer": "optimizer (with an explicit _target_, e.g. torch.optim.AdamW)",
+    "optim.clip_grad": "clip_grad_norm.max_norm",
+    "step_scheduler.log_every": "step_scheduler.log_remote_every_steps",
+}
+
+
+def _reject_removed_diffusion_keys(cfg: Any) -> None:
+    """Raise with old->new key mapping when a removed diffusion YAML key is present.
+
+    Args:
+        cfg: Raw recipe config (``ConfigNode`` or ``RecipeConfig``) as loaded from YAML.
+
+    Raises:
+        ValueError: If any key from ``_REMOVED_KEY_MIGRATIONS`` is present.
+    """
+    found = [key for key in _REMOVED_KEY_MIGRATIONS if cfg.get(key, None) is not None]
+    if cfg.get("optim", None) is not None:
+        found = sorted(set(found) | {"optim.learning_rate"})
+    if found:
+        mapping = "; ".join(f"'{key}' -> '{_REMOVED_KEY_MIGRATIONS[key]}'" for key in found)
+        raise ValueError(
+            f"Config uses removed diffusion-only keys: {mapping}. "
+            "The diffusion recipe now uses the same optimizer/clip_grad_norm/step_scheduler "
+            "YAML schema as the LLM/VLM recipes; see examples/diffusion/**/*.yaml."
+        )
+
+
+def _resolve_model_dtypes(cfg: Any) -> tuple[torch.dtype, torch.dtype]:
+    """Resolve model storage and compute dtypes from the recipe config."""
+    return (
+        dtype_from_str(cfg.get("model.torch_dtype", None), default=torch.bfloat16),
+        dtype_from_str(cfg.get("model.compute_dtype", None), default=torch.bfloat16),
+    )
+
+
+def _validate_precision_configuration(
+    dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+    *,
+    ddp_cfg: Dict[str, Any] | None,
+    peft_cfg: Any,
+) -> None:
+    """Reject split storage/compute dtypes on paths without FSDP param casting."""
+    if dtype == compute_dtype:
+        return
+
+    unsupported_modes = []
+    if ddp_cfg is not None:
+        unsupported_modes.append("DDP")
+    if peft_cfg is not None:
+        unsupported_modes.append("PEFT/LoRA")
+    if not unsupported_modes:
+        return
+
+    modes = " and ".join(unsupported_modes)
+    raise ValueError(
+        f"model.torch_dtype ({dtype}) and model.compute_dtype ({compute_dtype}) must match for {modes}. "
+        "Split storage/compute dtypes require FSDP full-parameter training, where FSDP can cast gathered "
+        "parameters to the compute dtype."
+    )
+
+
+def _get_diffusion_microbatch_size(batch: Dict[str, Any]) -> int:
+    """Return the number of samples in one local diffusion micro-batch."""
+    for key in ("video_latents", "image_latents", "latents", "text_embeddings", "text_embeddings_2"):
+        value = batch.get(key)
+        if value is not None and hasattr(value, "shape") and len(value.shape) > 0:
+            return int(value.shape[0])
+    return 0
+
+
+def _count_local_batch_group_samples(batch_group: list[Dict[str, Any]]) -> int:
+    """Count local samples processed by one optimizer step."""
+    return sum(_get_diffusion_microbatch_size(batch) for batch in batch_group)
+
+
+def _calculate_throughput_metrics(
+    *,
+    elapsed_seconds: float,
+    optimizer_steps: int,
+    global_samples: int,
+    world_size: int,
+) -> Dict[str, float]:
+    """Calculate directly measured training throughput metrics."""
+    elapsed_seconds = max(float(elapsed_seconds), 1e-12)
+    optimizer_steps = max(int(optimizer_steps), 0)
+    global_samples = max(int(global_samples), 0)
+    world_size = max(int(world_size), 1)
+    nonzero_steps = max(optimizer_steps, 1)
+
+    samples_per_sec = global_samples / elapsed_seconds
+    return {
+        "step_time": elapsed_seconds / nonzero_steps,
+        "optimizer_steps_per_sec": optimizer_steps / elapsed_seconds,
+        "samples_per_sec": samples_per_sec,
+        "samples_per_sec_per_gpu": samples_per_sec / world_size,
+        "samples_per_step": global_samples / nonzero_steps,
+        "log_window_seconds": elapsed_seconds,
+        "log_window_steps": float(optimizer_steps),
+        "log_window_samples": float(global_samples),
+    }
+
+
+def _build_diffusion_parallel_manager_args(
+    *,
+    fsdp_cfg: Dict[str, Any] | None,
+    ddp_cfg: Dict[str, Any] | None,
+    world_size: int,
+    dtype: torch.dtype,
+    compute_dtype: torch.dtype | None = None,
+    lora_enabled: bool,
+) -> Dict[str, Any]:
+    """Build diffusion transformer manager args through the shared distributed parser."""
+    if compute_dtype is None:
+        compute_dtype = dtype
+
+    # The recipe passes ConfigNode sections, which support .to_dict() but not dict().
+    if hasattr(fsdp_cfg, "to_dict"):
+        fsdp_cfg = fsdp_cfg.to_dict()
+    if hasattr(ddp_cfg, "to_dict"):
+        ddp_cfg = ddp_cfg.to_dict()
+
+    if fsdp_cfg is not None and ddp_cfg is not None:
+        raise ValueError(
+            "Cannot specify both 'fsdp' and 'ddp' configurations. "
+            "Please provide only one distributed training strategy."
+        )
+
+    if ddp_cfg is not None:
+        ddp_options = dict(ddp_cfg)
+        ddp_options.pop("backend", None)
+        parsed = parse_distributed_section({"strategy": "ddp", **ddp_options})
+        return {
+            "_manager_type": "ddp",
+            "world_size": world_size,
+            **parsed["strategy_config"].to_dict(),
+            "activation_checkpointing": parsed["activation_checkpointing"],
+        }
+
+    fsdp_options = dict(fsdp_cfg or {})
+    ignored_options = {"use_hf_tp_plan": fsdp_options.pop("use_hf_tp_plan", False)}
+    # Diffusion-specific CP knobs (consumed by _enable_context_parallel, not the
+    # shared distributed parser): how the cp axis splits into ring x ulysses.
+    cp_ring_degree = int(fsdp_options.pop("cp_ring_degree", 1))
+    cp_ulysses_degree = fsdp_options.pop("cp_ulysses_degree", None)
+    fsdp_options.pop("backend", None)
+    cpu_offload = bool(fsdp_options.pop("cpu_offload", False))
+    reduce_dtype = dtype_from_str(fsdp_options.pop("reduce_dtype", None), default=torch.float32)
+
+    param_dtype = None if lora_enabled else compute_dtype
+    parsed = parse_distributed_section(
+        {
+            "strategy": "fsdp2",
+            "activation_checkpointing": True,
+            "defer_fsdp_grad_sync": True,
+            "enable_fsdp2_prefetch": True,
+            **fsdp_options,
+            "mp_policy": MixedPrecisionPolicy(
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                output_dtype=compute_dtype,
+            ),
+            # CPU offload: sharded params + optimizer state live on host RAM and are
+            # paged to GPU per-block during forward/backward (saves GPU memory, adds H2D).
+            "offload_policy": CPUOffloadPolicy(pin_memory=True) if cpu_offload else None,
+        }
+    )
+
+    if cp_ulysses_degree is None:
+        # Default to pure Ulysses: ring-attention backward is broken in diffusers<=0.39.
+        cp_ulysses_degree = max(1, parsed["cp_size"] // cp_ring_degree)
+
+    return {
+        "_manager_type": "fsdp2",
+        "world_size": world_size,
+        "dp_size": parsed["dp_size"],
+        "dp_replicate_size": parsed["dp_replicate_size"],
+        "tp_size": parsed["tp_size"],
+        "cp_size": parsed["cp_size"],
+        "cp_ring_degree": cp_ring_degree,
+        "cp_ulysses_degree": int(cp_ulysses_degree),
+        "pp_size": parsed["pp_size"],
+        "ep_size": parsed["ep_size"],
+        **parsed["strategy_config"].to_dict(),
+        "activation_checkpointing": parsed["activation_checkpointing"],
+        **ignored_options,
+    }
+
+
+def _build_transformer_engine_fp8_recipe(
+    recipe_name: str,
+    *,
+    amax_history_len: int,
+    amax_compute_algo: str,
+) -> Any:
+    """Build a Transformer Engine FP8 recipe from CLI-friendly config values."""
+    normalized_recipe_name = recipe_name.replace("-", "_").lower()
+    if normalized_recipe_name in {"delayed", "delayed_scaling"}:
+        available, delayed_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "DelayedScaling",
+            msg="model.transformer_engine_fp8=true requires Transformer Engine DelayedScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8=true requires Transformer Engine DelayedScaling")
+        return delayed_scaling(amax_history_len=amax_history_len, amax_compute_algo=amax_compute_algo)
+
+    if normalized_recipe_name in {"current", "current_scaling"}:
+        available, current_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "Float8CurrentScaling",
+            msg="model.transformer_engine_fp8_recipe=current requires Transformer Engine Float8CurrentScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8_recipe=current requires Float8CurrentScaling")
+        return current_scaling()
+
+    if normalized_recipe_name in {"mxfp8", "mx", "mx_fp8"}:
+        available, mxfp8_block_scaling = safe_import_from(
+            "transformer_engine.common.recipe",
+            "MXFP8BlockScaling",
+            msg="model.transformer_engine_fp8_recipe=mxfp8 requires Transformer Engine MXFP8BlockScaling",
+        )
+        if not available:
+            raise ImportError("model.transformer_engine_fp8_recipe=mxfp8 requires MXFP8BlockScaling")
+        return mxfp8_block_scaling()
+
+    raise ValueError(
+        f"model.transformer_engine_fp8_recipe must be one of 'delayed', 'current', or 'mxfp8', got {recipe_name!r}"
+    )
+
+
+def _resolve_transformer_engine_autocast() -> Any:
+    """Resolve Transformer Engine's quantization autocast context manager."""
+    available, te_autocast = safe_import_from(
+        "transformer_engine.pytorch.quantization",
+        "autocast",
+        msg="model.transformer_engine_fp8=true requires transformer_engine.pytorch.quantization.autocast",
+    )
+    if not available:
+        raise ImportError("model.transformer_engine_fp8=true requires transformer_engine.pytorch.quantization.autocast")
+    return te_autocast
+
+
+def build_diffusion_pipeline(
+    *,
+    model_id: str,
+    finetune_mode: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+    compute_dtype: torch.dtype | None = None,
+    cpu_offload: bool = False,
+    fsdp_cfg: Dict[str, Any] | None = None,
+    ddp_cfg: Dict[str, Any] | None = None,
+    attention_backend: str | None = None,
+    transformer_engine_linear: bool = False,
+    transformer_engine_fp8_safe_only: bool = False,
+    fuse_qkv_projections: bool = False,
+    compact_fused_qkv_projections: bool = False,
+    pipeline_spec: Dict[str, Any] | None = None,
+    peft_cfg=None,
+    model_type=None,
+    active_transformer: str | None = None,
+) -> tuple[NeMoAutoDiffusionPipeline, Any]:
+    """Build the sharded diffusion pipeline (model + parallel scheme).
+
+    The optimizer is built separately by the recipe via
+    ``OptimizerConfig.build(...)`` on the returned pipeline's transformer, so
+    that parameters are collected after FSDP2 wrapping.
+
+    Args:
+        model_id: Pretrained model name or path.
+        finetune_mode: Whether to load for finetuning (True) or pretraining (False).
+        device: Target device.
+        dtype: Model parameter storage dtype.
+        compute_dtype: Forward/FSDP compute dtype. Defaults to dtype when unset.
+        cpu_offload: Whether to enable CPU offload (FSDP only).
+        fsdp_cfg: FSDP configuration dict. Mutually exclusive with ddp_cfg.
+        ddp_cfg: DDP configuration dict. Mutually exclusive with fsdp_cfg.
+        attention_backend: Optional attention backend override.
+        transformer_engine_linear: Whether to replace transformer torch.nn.Linear modules with Transformer Engine Linear.
+        transformer_engine_fp8_safe_only: Whether to skip TE conversion for known FP8-incompatible modules.
+        fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer before FSDP.
+        compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
+        pipeline_spec: Pipeline specification for pretraining (from_config).
+            Required when finetune_mode is False. Should contain:
+            - transformer_cls: str (e.g., "WanTransformer3DModel", "FluxTransformer2DModel")
+            - subfolder: str (e.g., "transformer")
+            - Optional: pipeline_cls, load_full_pipeline
+        peft_cfg: PeftConfig instance or None. When provided, only LoRA params
+            are trained; base weights are frozen and sharded by FSDP2 for memory.
+        model_type: "flux" | "flux2" | "wan" | "hunyuan" | "ltx2". Required when peft_cfg is provided.
+        active_transformer: For two-transformer pipelines (Wan2.2), select which
+            transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
+            or ``"transformer_2"`` (low-noise). The unused transformer is dropped
+            before device placement so only one transformer lives on GPU.
+
+    Returns:
+        Tuple of (pipeline, device_mesh or None).
+
+    Raises:
+        ValueError: If both fsdp_cfg and ddp_cfg are provided.
+        ValueError: If finetune_mode is False and pipeline_spec is not provided.
+    """
+    logging.info("[INFO] Building NeMoAutoDiffusionPipeline with transformer parallel scheme...")
+
+    if not dist.is_initialized():
+        logging.info("[WARN] torch.distributed not initialized; proceeding in single-process mode")
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if compute_dtype is None:
+        compute_dtype = dtype
+
+    lora_enabled = peft_cfg is not None
+    _validate_precision_configuration(dtype, compute_dtype, ddp_cfg=ddp_cfg, peft_cfg=peft_cfg)
+
+    if ddp_cfg is not None:
+        logging.info("[INFO] Using DDP (DistributedDataParallel) for training")
+    else:
+        logging.info("[INFO] Using FSDP2 (Fully Sharded Data Parallel) for training")
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=fsdp_cfg,
+        ddp_cfg=ddp_cfg,
+        world_size=world_size,
+        dtype=dtype,
+        compute_dtype=compute_dtype,
+        lora_enabled=lora_enabled,
+    )
+
+    parallel_scheme = {"transformer": manager_args}
+
+    if finetune_mode:
+        # Finetuning: load from pretrained weights
+        logging.info("[INFO] Loading pretrained model for finetuning")
+        if active_transformer is not None:
+            logging.info("[INFO] Active transformer: %s", active_transformer)
+        pipe, created_managers = NeMoAutoDiffusionPipeline.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            device=device,
+            parallel_scheme=parallel_scheme,
+            components_to_load=["transformer"],
+            load_for_training=True,
+            low_cpu_mem_usage=True,
+            peft_cfg=peft_cfg,
+            model_type=model_type,
+            active_transformer=active_transformer,
+            transformer_engine_linear=transformer_engine_linear,
+            transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            fuse_qkv_projections=fuse_qkv_projections,
+            compact_fused_qkv_projections=compact_fused_qkv_projections,
+            attention_backend=attention_backend,
+        )
+    else:
+        # Pretraining: initialize with random weights using pipeline_spec
+        if pipeline_spec is None:
+            raise ValueError(
+                "pipeline_spec is required for pretraining (finetune_mode=False). "
+                "Please provide pipeline_spec in your YAML config with at least:\n"
+                "  pipeline_spec:\n"
+                "    transformer_cls: 'WanTransformer3DModel'  # or 'FluxTransformer2DModel', etc.\n"
+                "    subfolder: 'transformer'"
+            )
+        logging.info("[INFO] Initializing model with random weights for pretraining")
+        pipe, created_managers = NeMoAutoDiffusionPipeline.from_config(
+            model_id,
+            pipeline_spec=pipeline_spec,
+            torch_dtype=dtype,
+            device=device,
+            parallel_scheme=parallel_scheme,
+            components_to_load=["transformer"],
+            transformer_engine_linear=transformer_engine_linear,
+            transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
+            fuse_qkv_projections=fuse_qkv_projections,
+            compact_fused_qkv_projections=compact_fused_qkv_projections,
+            attention_backend=attention_backend,
+        )
+    fsdp2_manager = created_managers["transformer"]
+    transformer_module = pipe.transformer
+
+    if lora_enabled:
+        # LoRA params must be collected AFTER FSDP2 wrapping from the live wrapped
+        # module. Pre-FSDP2 refs (pipe._lora_params) are stale after fully_shard() —
+        # FSDP2 replaces parameter storage, so an optimizer holding stale refs never
+        # commits updates to the actual sharded parameters. The recipe builds the
+        # optimizer from this returned pipeline for exactly that reason; this check
+        # only produces a diffusion-specific error message early.
+        lora_params = [p for n, p in transformer_module.named_parameters() if "lora_" in n and p.requires_grad]
+        if not lora_params:
+            raise RuntimeError(
+                "peft_cfg is set but no LoRA params found. "
+                "Check that peft.target_modules match module names in the transformer."
+            )
+        logging.info(
+            "[LoRA] Trainable: %d param tensors, %s elements",
+            len(lora_params),
+            f"{sum(p.numel() for p in lora_params):,}",
+        )
+
+    trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
+    frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)
+    logging.info(f"[INFO] Trainable parameters: {trainable_count}, Frozen parameters: {frozen_count}")
+
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated(device) / 1024**3
+        memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
+        logging.info(f"[INFO] GPU memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+
+    logging.info("[INFO] NeMoAutoDiffusion pipeline setup complete")
+
+    return pipe, getattr(fsdp2_manager, "device_mesh", None)
+
+
+class TrainDiffusionRecipe(BaseRecipe):
+    """Training recipe for diffusion models."""
+
+    def __init__(self, cfg):
+        _reject_removed_diffusion_keys(cfg)
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
+
+    def setup(self):
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
+        setup_logging()
+
+        if self.dist_env.is_main and self.cfg.wandb is not None:
+            suppress_wandb_log_messages()
+            # For two-stage Wan2.2 finetuning, suffix the wandb run name with the
+            # active stage so high-noise and low-noise runs are distinguishable.
+            # Normalize to lowercase to match self.stage so the wandb suffix and the
+            # internal stage name stay consistent. Mutating the cached WandbConfig
+            # before build() makes the suffix take effect (build() uses self.name).
+            stage_for_wandb = self.cfg.get("model.stage", None)
+            if stage_for_wandb is not None:
+                stage_for_wandb = str(stage_for_wandb).lower()
+                current_name = self.cfg.get("wandb.name", None)
+                if current_name is not None and not str(current_name).endswith(f"_{stage_for_wandb}"):
+                    self.cfg.wandb.name = f"{current_name}_{stage_for_wandb}"
+            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
+            if run is not None:
+                logging.info("🚀 View run at {}".format(run.url))
+
+        self.seed = self.cfg.get("seed", 42)
+        self.rng = StatefulRNG(seed=self.seed, ranked=True)
+
+        self.model_id = self.cfg.get("model.pretrained_model_name_or_path")
+        self.attention_backend = self.cfg.get("model.attention_backend")
+        self.transformer_engine_linear = bool(self.cfg.get("model.transformer_engine_linear", False))
+        self.transformer_engine_fp8 = bool(self.cfg.get("model.transformer_engine_fp8", False))
+        self.transformer_engine_fp8_recipe_name = str(self.cfg.get("model.transformer_engine_fp8_recipe", "delayed"))
+        self.transformer_engine_fp8_amax_history_len = int(
+            self.cfg.get("model.transformer_engine_fp8_amax_history_len", 1024)
+        )
+        self.transformer_engine_fp8_amax_compute_algo = str(
+            self.cfg.get("model.transformer_engine_fp8_amax_compute_algo", "max")
+        )
+        self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
+        self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
+        self.optimize_hunyuan_flash_varlen_mask = bool(self.cfg.get("model.optimize_hunyuan_flash_varlen_mask", False))
+        if self.transformer_engine_fp8:
+            self.transformer_engine_linear = True
+        if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
+            raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
+        self.clip_grad_max_norm = float(self.cfg.get("clip_grad_norm.max_norm", 1.0))
+        self.model_dtype, self.compute_dtype = _resolve_model_dtypes(self.cfg)
+        performance_cfg = self.cfg.get("performance", {}) or {}
+        self.check_loss = bool(performance_cfg.get("check_loss", False))
+        self.grad_clip_foreach = bool(performance_cfg.get("grad_clip_foreach", True))
+
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda", self.local_rank)
+        else:
+            self.device = torch.device("cpu")
+
+        self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", self.world_size))
+        self.local_world_size = max(self.local_world_size, 1)
+        self.num_nodes = max(1, self.world_size // self.local_world_size)
+        self.node_rank = dist.get_rank() // self.local_world_size if dist.is_initialized() else 0
+        self._te_fp8_autocast = None
+        self._te_fp8_recipe = None
+        self._te_fp8_group = None
+        if self.transformer_engine_fp8:
+            self._te_fp8_autocast = _resolve_transformer_engine_autocast()
+            self._te_fp8_recipe = _build_transformer_engine_fp8_recipe(
+                self.transformer_engine_fp8_recipe_name,
+                amax_history_len=self.transformer_engine_fp8_amax_history_len,
+                amax_compute_algo=self.transformer_engine_fp8_amax_compute_algo,
+            )
+            self._te_fp8_group = dist.group.WORLD if dist.is_initialized() else None
+
+        logging.info("[INFO] Diffusion Trainer with Flow Matching")
+        logging.info(
+            f"[INFO] Total GPUs: {self.world_size}, GPUs per node: {self.local_world_size}, Num nodes: {self.num_nodes}"
+        )
+        logging.info(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
+        logging.info("[INFO] Transformer Engine Linear: %s", self.transformer_engine_linear)
+        logging.info(
+            "[INFO] Transformer Engine FP8: %s (recipe=%s, amax_history_len=%s, amax_compute_algo=%s)",
+            self.transformer_engine_fp8,
+            self.transformer_engine_fp8_recipe_name,
+            self.transformer_engine_fp8_amax_history_len,
+            self.transformer_engine_fp8_amax_compute_algo,
+        )
+        logging.info("[INFO] Fuse QKV projections: %s", self.fuse_qkv_projections)
+        logging.info("[INFO] Compact fused QKV projections: %s", self.compact_fused_qkv_projections)
+        logging.info("[INFO] Optimize Hunyuan flash-varlen mask: %s", self.optimize_hunyuan_flash_varlen_mask)
+        logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
+        logging.info(
+            "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
+            self.check_loss,
+            self.grad_clip_foreach,
+        )
+
+        # Get distributed training configs (mutually exclusive)
+        fsdp_cfg = self.cfg.get("fsdp", None)
+        ddp_cfg = self.cfg.get("ddp", None)
+        fm_cfg = self.cfg.get("flow_matching", {})
+
+        # Validate mutually exclusive distributed configs
+        if fsdp_cfg is not None and ddp_cfg is not None:
+            raise ValueError(
+                "Cannot specify both 'fsdp' and 'ddp' configurations in YAML. "
+                "Please provide only one distributed training strategy."
+            )
+
+        self.cpu_offload = fsdp_cfg.get("cpu_offload", False) if fsdp_cfg else False
+        self.defer_fsdp_grad_sync = fsdp_cfg.get("defer_fsdp_grad_sync", True) if fsdp_cfg else True
+
+        # Flow matching configuration
+        self.adapter_type = fm_cfg.get("adapter_type", "simple")
+        self.timestep_sampling = fm_cfg.get("timestep_sampling", "logit_normal")
+        self.logit_mean = fm_cfg.get("logit_mean", 0.0)
+        self.logit_std = fm_cfg.get("logit_std", 1.0)
+        self.flow_shift = fm_cfg.get("flow_shift", 3.0)
+        self.mix_uniform_ratio = fm_cfg.get("mix_uniform_ratio", 0.1)
+        self.beta_alpha = fm_cfg.get("beta_alpha", 2.5)
+        self.beta_beta = fm_cfg.get("beta_beta", 1.5)
+        self.use_sigma_noise = fm_cfg.get("use_sigma_noise", True)
+        self.sigma_min = fm_cfg.get("sigma_min", 0.0)
+        self.sigma_max = fm_cfg.get("sigma_max", 1.0)
+        self.num_train_timesteps = fm_cfg.get("num_train_timesteps", 1000)
+        self.i2v_prob = fm_cfg.get("i2v_prob", 0.3)
+        self.cfg_dropout_prob = fm_cfg.get("cfg_dropout_prob", 0.1)
+        self.use_loss_weighting = fm_cfg.get("use_loss_weighting", True)
+        self.loss_weighting_scheme = fm_cfg.get("loss_weighting_scheme", "linear")
+        self.log_interval = fm_cfg.get("log_interval", 100)
+        self.summary_log_interval = fm_cfg.get("summary_log_interval", 10)
+
+        # Adapter-specific configuration
+        adapter_kwargs = fm_cfg.get("adapter_kwargs", {})
+        self.adapter_kwargs = (
+            adapter_kwargs.to_dict() if hasattr(adapter_kwargs, "to_dict") else dict(adapter_kwargs or {})
+        )
+        if self.optimize_hunyuan_flash_varlen_mask:
+            if self.adapter_type != "hunyuan":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires flow_matching.adapter_type=hunyuan"
+                )
+            if self.attention_backend != "flash_varlen":
+                raise ValueError(
+                    "model.optimize_hunyuan_flash_varlen_mask=true requires model.attention_backend=flash_varlen"
+                )
+
+        # Two-stage finetuning (Wan2.2 T2V-A14B): each stage trains only one
+        # transformer against a restricted timestep range. The stage knob both
+        # selects the active transformer and clamps the sigma sampling window so
+        # this run only sees noise levels its transformer is responsible for.
+        self.stage = self.cfg.get("model.stage", None)
+        self.boundary_ratio = self.cfg.get("model.boundary_ratio", None)
+        self.active_transformer = None
+        if self.stage is not None:
+            stage = str(self.stage).lower()
+            if stage not in ("high_noise", "low_noise"):
+                raise ValueError(f"model.stage must be 'high_noise' or 'low_noise', got {self.stage!r}")
+            self.stage = stage
+            self.active_transformer = "transformer" if stage == "high_noise" else "transformer_2"
+
+        logging.info("[INFO] Flow Matching V2 Pipeline")
+        logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
+        logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
+        logging.info(f"[INFO]   - Flow shift: {self.flow_shift}")
+        logging.info(f"[INFO]   - Mix uniform ratio: {self.mix_uniform_ratio}")
+        logging.info(f"[INFO]   - Use sigma noise: {self.use_sigma_noise}")
+        logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
+        logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
+        logging.info(f"[INFO]   - Loss weighting scheme: {self.loss_weighting_scheme}")
+        if self.stage is not None:
+            logging.info(f"[INFO]   - Two-stage finetune: stage={self.stage}, active={self.active_transformer}")
+
+        # Get pipeline_spec for pretraining mode (required when mode != "finetune")
+        pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
+        pipeline_spec = pipeline_spec_cfg.to_dict() if pipeline_spec_cfg is not None else None
+
+        # ── PEFT / LoRA configuration ─────────────────────────────────────────
+        # Mirrors the LLM recipe pattern: peft block in YAML with _target_ pointing
+        # to PeftConfig is instantiated directly, no intermediate wrapper class.
+        self.peft_cfg = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_cfg = self.cfg.peft.instantiate()
+
+        # model_type is explicit in yaml — no fragile string detection.
+        # Required when peft block is present.
+        self.model_type = self.cfg.get("model.model_type", None)
+        if self.peft_cfg is not None and not self.model_type:
+            raise ValueError(
+                "model.model_type must be set when peft config is provided. "
+                "Options: 'flux', 'flux2', 'wan', 'hunyuan', 'ltx2'"
+            )
+
+        lora_status = (
+            f"enabled (dim={self.peft_cfg.dim}, alpha={self.peft_cfg.alpha})"
+            if self.peft_cfg is not None
+            else "disabled (full fine-tune)"
+        )
+        logging.info(f"[INFO] LoRA: {lora_status}")
+
+        self.pipe, self.device_mesh = build_diffusion_pipeline(
+            model_id=self.model_id,
+            finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
+            device=self.device,
+            dtype=self.model_dtype,
+            compute_dtype=self.compute_dtype,
+            cpu_offload=self.cpu_offload,
+            fsdp_cfg=fsdp_cfg,
+            ddp_cfg=ddp_cfg,
+            transformer_engine_linear=self.transformer_engine_linear,
+            transformer_engine_fp8_safe_only=self.transformer_engine_fp8,
+            fuse_qkv_projections=self.fuse_qkv_projections,
+            compact_fused_qkv_projections=self.compact_fused_qkv_projections,
+            attention_backend=self.attention_backend,
+            pipeline_spec=pipeline_spec,
+            peft_cfg=self.peft_cfg,
+            model_type=self.model_type,
+            active_transformer=self.active_transformer,
+        )
+
+        self.model = self.pipe.transformer
+        # LoRA and random-pretraining parameters are initialized before TP is
+        # applied. Align their replicated local storage before the optimizer
+        # captures the sharded model parameters.
+        broadcast_tp_replicas([self.model], self.device_mesh)
+
+        # FSDP2's MixedPrecisionPolicy is what casts parameters to compute_dtype, and
+        # parallelization is skipped entirely on a single-rank mesh. Autocast covers
+        # that path so split-dtype configs behave the same on 1 GPU as on many, while
+        # leaving resident parameters and their gradients in model_dtype.
+        fsdp_casts_parameters = self.device_mesh is not None and fsdp2_sharding_enabled(self.device_mesh)
+        self._autocast_dtype = None
+        if self.model_dtype != self.compute_dtype and not fsdp_casts_parameters:
+            self._autocast_dtype = self.compute_dtype
+            logging.info(
+                "[INFO] FSDP2 parameter casting inactive (single-rank mesh); running the forward pass under "
+                "torch.autocast(%s) so parameters stay in %s",
+                self._autocast_dtype,
+                self.model_dtype,
+            )
+
+        self.cp_size = int((fsdp_cfg or {}).get("cp_size", 1) or 1)
+        if self.cp_size > 1:
+            # CP peers receive the same batch (dataloader shards by dp rank, cp
+            # excluded) but the flow-matching step samples noise, timesteps, and
+            # CFG dropout per rank. Re-seed by data rank so all CP peers draw
+            # identical values while DP ranks stay decorrelated; the initial
+            # ranked=True seeding above only covered pre-mesh setup. Seeds are
+            # reinitialized in place because self.rng is checkpoint-tracked and
+            # must not be reassigned.
+            init_all_rng(self.seed + self._get_dp_rank(), ranked=False)
+            logging.info(
+                "[CP] Re-seeded RNG for context parallelism: seed=%d + dp_rank=%d (cp_size=%d)",
+                self.seed,
+                self._get_dp_rank(),
+                self.cp_size,
+            )
+
+        if self.optimize_hunyuan_flash_varlen_mask:
+            from nemo_automodel.components.flow_matching.adapters.hunyuan import (
+                enable_hunyuan_flash_varlen_mask_optimization,
+            )
+
+            if not enable_hunyuan_flash_varlen_mask_optimization():
+                raise RuntimeError("Failed to enable Hunyuan flash-varlen mask optimization")
+            logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
+
+        self.peft_config = getattr(self.pipe, "_peft_config", None)
+
+        # Optimizer params are collected here, after FSDP2 wrapping inside
+        # build_diffusion_pipeline — pre-shard parameter refs would be stale.
+        # ``OptimizerConfig.build`` filters on ``requires_grad``; diffusion freezes
+        # base weights before this point, so with LoRA the trainable set is the LoRA set.
+        if self.cfg.optimizer is None:
+            raise ValueError(
+                "optimizer config is required in YAML, e.g.\noptimizer:\n  _target_: torch.optim.AdamW\n  lr: 5e-6"
+            )
+        self.optimizer = self.cfg.optimizer.build(
+            self.model, device_mesh=self.device_mesh, is_peft=self.peft_cfg is not None
+        )
+
+        # Resolve sigma range for two-stage finetuning now that the pipeline
+        # is loaded and we can read its boundary_ratio config.
+        if self.stage is not None:
+            if self.boundary_ratio is None:
+                pipe_cfg = getattr(self.pipe, "config", None)
+                self.boundary_ratio = pipe_cfg.get("boundary_ratio") if pipe_cfg is not None else None
+            if self.boundary_ratio is None:
+                raise ValueError(
+                    "model.stage is set but no boundary_ratio could be resolved. "
+                    "Set model.boundary_ratio in YAML, or use a pipeline whose config "
+                    "carries boundary_ratio (e.g. Wan-AI/Wan2.2-T2V-A14B-Diffusers)."
+                )
+            self.boundary_ratio = float(self.boundary_ratio)
+            # A boundary outside (0, 1) collapses the stage sigma window to an empty
+            # or degenerate range (e.g. boundary_ratio=0.0 with stage=low_noise gives
+            # sigma_min=sigma_max=0.0), silently yielding a useless model.
+            if not (0.0 < self.boundary_ratio < 1.0):
+                raise ValueError(f"model.boundary_ratio must be in (0, 1), got {self.boundary_ratio}")
+            if self.stage == "high_noise":
+                self.sigma_min = self.boundary_ratio
+                self.sigma_max = 1.0
+            else:
+                self.sigma_min = 0.0
+                self.sigma_max = self.boundary_ratio
+            logging.info(
+                "[INFO]   - Stage sigma range: [%.4f, %.4f] (boundary_ratio=%.4f)",
+                self.sigma_min,
+                self.sigma_max,
+                self.boundary_ratio,
+            )
+
+        # Strictly require checkpoint config from YAML — ``RecipeConfig.checkpoint``
+        # would otherwise silently fall back to component defaults.
+        if self.cfg.get("checkpoint", None) is None:
+            raise ValueError(
+                "checkpoint config is required in YAML (enabled, checkpoint_dir, model_save_format, save_consolidated)"
+            )
+
+        # Typed checkpoint config from the YAML ``checkpoint:`` block; model-derived
+        # fields (model_repo_id, model_cache_dir, is_peft) are filled by RecipeConfig.
+        # The checkpointer discovers the pre-shard state-dict keys via the
+        # `_pre_shard_hf_state_dict_keys` attribute stamped on the transformer in
+        # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py).
+        self.checkpoint_config = self.cfg.checkpoint
+        self.restore_from = self.cfg.get("checkpoint.restore_from", None)
+        self.checkpointer = self.checkpoint_config.build(
+            dp_rank=self._get_dp_rank(include_cp=True),
+            tp_rank=self._get_tp_rank(),
+            pp_rank=self._get_pp_rank(),
+            moe_mesh=None,
+        )
+
+        dataloader_config = self.cfg.diffusion_dataloader
+        if dataloader_config is None:
+            raise ValueError("Diffusion training requires a data.dataloader config")
+        dataloader_build = dataloader_config.build(
+            dp_rank=self._get_dp_rank(),
+            dp_world_size=self._get_dp_group_size(),
+            batch_size=self.cfg.get("step_scheduler.local_batch_size"),
+        )
+        self.dataloader = dataloader_build.dataloader
+        self.sampler = dataloader_build.sampler
+
+        if len(self.dataloader) == 0:
+            raise RuntimeError("Training dataloader is empty; cannot proceed with training")
+
+        # Optional held-out loader; same typed contract and dp sharding as the training one.
+        validation_dataloader_config = self.cfg.diffusion_validation_dataloader
+        self.val_dataloader = None
+        self.val_sampler = None
+        val_every_steps = self.cfg.get("step_scheduler.val_every_steps", None)
+        if validation_dataloader_config is not None:
+            validation_build = validation_dataloader_config.build(
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                batch_size=self.cfg.get("step_scheduler.local_batch_size"),
+            )
+            self.val_dataloader = validation_build.dataloader
+            self.val_sampler = validation_build.sampler
+            if len(self.val_dataloader) == 0:
+                raise RuntimeError("Validation dataloader is empty; remove data.validation_dataloader or fix its path")
+            if val_every_steps is None:
+                # is_val_step is also true on checkpoint steps, so validation is not dead here.
+                logging.warning(
+                    "[WARN] data.validation_dataloader is set without step_scheduler.val_every_steps; "
+                    "validation will only run at checkpoint steps"
+                )
+        elif val_every_steps is not None:
+            logging.warning(
+                "[WARN] step_scheduler.val_every_steps=%s is set but no data.validation_dataloader is configured; "
+                "validation is skipped",
+                val_every_steps,
+            )
+
+        # Derive DP size consistent with model parallel config
+        # (manual until the distributed section is standardized; DistributedSetup owns this math)
+        if ddp_cfg is not None:
+            # DDP uses pure data parallelism across all ranks
+            self.dp_size = self.world_size
+        else:
+            # FSDP may have TP/CP/PP dimensions
+            _fsdp_cfg = fsdp_cfg or {}
+            tp_size = _fsdp_cfg.get("tp_size", 1)
+            cp_size = _fsdp_cfg.get("cp_size", 1)
+            pp_size = _fsdp_cfg.get("pp_size", 1)
+            denom = max(1, tp_size * cp_size * pp_size)
+            self.dp_size = _fsdp_cfg.get("dp_size", None)
+            if self.dp_size is None:
+                self.dp_size = max(1, self.world_size // denom)
+
+        # Local micro-batch and global effective batch sizes, used for loop logging
+        self.local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
+        self.global_batch_size = self.cfg.get("step_scheduler.global_batch_size")
+
+        self.step_scheduler = self.cfg.step_scheduler.build(
+            self.dataloader,
+            int(self.dp_size),
+            self.cfg.get("step_scheduler.local_batch_size"),
+        )
+        self.num_epochs = self.step_scheduler.num_epochs
+
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
+
+        self.load_checkpoint(self.restore_from)
+
+        # Init Flow Matching Pipeline V2 with model adapter
+        model_adapter = create_adapter(self.adapter_type, **self.adapter_kwargs)
+        self.flow_matching_pipeline = FlowMatchingPipeline(
+            model_adapter=model_adapter,
+            num_train_timesteps=self.num_train_timesteps,
+            timestep_sampling=self.timestep_sampling,
+            flow_shift=self.flow_shift,
+            i2v_prob=self.i2v_prob,
+            cfg_dropout_prob=self.cfg_dropout_prob,
+            logit_mean=self.logit_mean,
+            logit_std=self.logit_std,
+            mix_uniform_ratio=self.mix_uniform_ratio,
+            beta_alpha=self.beta_alpha,
+            beta_beta=self.beta_beta,
+            use_sigma_noise=self.use_sigma_noise,
+            sigma_min=self.sigma_min,
+            sigma_max=self.sigma_max,
+            use_loss_weighting=self.use_loss_weighting,
+            loss_weighting_scheme=self.loss_weighting_scheme,
+            log_interval=self.log_interval,
+            summary_log_interval=self.summary_log_interval,
+            device=self.device,
+        )
+        logging.info(f"[INFO] Flow Matching Pipeline V2 initialized with {self.adapter_type} adapter")
+
+        if self.dist_env.is_main:
+            os.makedirs(self.checkpoint_config.checkpoint_dir, exist_ok=True)
+
+        if dist.is_initialized():
+            dist.barrier()
+
+    def _autocast_context(self) -> Any:
+        """Return the per-forward autocast context used when FSDP2 does not cast parameters."""
+        if self._autocast_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self._autocast_dtype)
+
+    def _transformer_engine_fp8_context(self) -> Any:
+        """Return the per-forward Transformer Engine FP8 context."""
+        if not self.transformer_engine_fp8:
+            return nullcontext()
+        return self._te_fp8_autocast(
+            enabled=True,
+            recipe=self._te_fp8_recipe,
+            amax_reduction_group=self._te_fp8_group,
+        )
+
+    def _run_validation_epoch(self, global_step: int) -> float:
+        """Score the held-out set with the training flow-matching objective.
+
+        Seeding by data rank mirrors training: every evaluation draws the same timesteps, noise,
+        and CFG dropout, so ``val_loss`` tracks the model rather than the sampling, while
+        data-parallel ranks stay decorrelated and context-parallel peers of one rank draw
+        identical values for their shared batch. ``ScopedRNG`` restores the training RNG state
+        afterwards, leaving the training trajectory unchanged.
+
+        The forward runs under the same compute-dtype autocast as training, so a single-rank
+        split-dtype config evaluates the way it trains. FP8 autocast is left out: delayed-scaling
+        amax history is training state and must not be updated from held-out batches.
+
+        Args:
+            global_step: Current optimizer step, forwarded to the flow-matching pipeline for
+                its periodic diagnostics.
+
+        Returns:
+            Mean loss over the validation batches of the data-parallel group, comparable to the
+            logged ``train_loss``.
+        """
+        self.model.eval()
+        local_loss_sum = 0.0
+        local_num_batches = 0
+        try:
+            with (
+                ScopedRNG(seed=self.seed + self._get_dp_rank(), ranked=False),
+                torch.no_grad(),
+                self._autocast_context(),
+            ):
+                for batch in self.val_dataloader:
+                    _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                        model=self.model,
+                        batch=batch,
+                        device=self.device,
+                        dtype=self.compute_dtype,
+                        global_step=global_step,
+                        collect_metrics=False,
+                        check_loss=False,
+                    )
+                    local_loss_sum += float(average_weighted_loss.detach())
+                    local_num_batches += 1
+        finally:
+            self.model.train()
+
+        # Ranks can hold a different number of batches, so reduce sum and count and divide once.
+        # CP peers all compute the same full-sequence loss, so the reduction excludes the cp axis.
+        totals = torch.tensor(
+            [local_loss_sum, float(local_num_batches)],
+            device=self._get_collective_device(),
+            dtype=torch.float64,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=self._get_dp_group())
+        global_loss_sum, global_num_batches = totals.tolist()
+        if global_num_batches == 0:
+            raise RuntimeError("Validation produced no batches; cannot compute validation loss")
+        return global_loss_sum / global_num_batches
+
+    def run_train_validation_loop(self):
+        logging.info("[INFO] Starting T2V training with Flow Matching")
+        logging.info(f"[INFO] Global Batch size: {self.global_batch_size}; Local Batch size: {self.local_batch_size}")
+        logging.info(f"[INFO] Num nodes: {self.num_nodes}; DP size: {self.dp_size}")
+
+        # Keep global_step synchronized with scheduler
+        global_step = int(self.step_scheduler.step)
+        self._sync_device()
+        perf_window_start_time = time.perf_counter()
+        perf_window_steps = 0
+        perf_window_local_samples = 0
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        for epoch in self.step_scheduler.epochs:
+            if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+                self.sampler.set_epoch(epoch)
+
+            # Optionally wrap dataloader with tqdm for rank-0
+            if self.dist_env.is_main:
+                from tqdm import tqdm
+
+                self.step_scheduler.dataloader = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
+            else:
+                self.step_scheduler.dataloader = self.dataloader
+
+            epoch_loss = 0.0
+            num_steps = 0
+
+            for batch_group in self.step_scheduler:
+                for optimizer in self.optimizer:
+                    optimizer.zero_grad(set_to_none=True)
+
+                micro_losses = []
+                prepare_for_grad_accumulation([self.model], pp_enabled=False)
+                num_microbatches = len(batch_group)
+                for microbatch_idx, micro_batch in enumerate(batch_group):
+                    is_final_microbatch = microbatch_idx == num_microbatches - 1
+                    if is_final_microbatch:
+                        prepare_for_final_backward([self.model], pp_enabled=False)
+
+                    sync_context = get_sync_ctx(
+                        self.model,
+                        is_final_microbatch,
+                        defer_fsdp_grad_sync=self.defer_fsdp_grad_sync,
+                    )
+                    with sync_context:
+                        try:
+                            with self._autocast_context(), self._transformer_engine_fp8_context():
+                                _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                                    model=self.model,
+                                    batch=micro_batch,
+                                    device=self.device,
+                                    dtype=self.compute_dtype,
+                                    global_step=global_step,
+                                    collect_metrics=False,
+                                    check_loss=self.check_loss,
+                                )
+                        except Exception as exc:
+                            logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
+                            video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
+                            text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
+                            logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
+                            raise
+
+                        # Use average_weighted_loss for backprop (scalar for gradient accumulation).
+                        # With CP, every peer computes the full-sequence loss on the gathered
+                        # output, so each rank's backward yields a partial gradient (its
+                        # sequence chunk's contribution); FSDP2 then mean-reduces over the
+                        # dp_shard_cp mesh. Scaling the loss by cp_size turns that mean into
+                        # a sum over CP peers and a mean over DP ranks, matching the
+                        # single-GPU gradient (verified numerically against a 1-GPU baseline).
+                        (average_weighted_loss * self.cp_size / num_microbatches).backward()
+                    micro_losses.append(average_weighted_loss.detach())
+
+                    if microbatch_idx == 0:
+                        prepare_after_first_microbatch()
+
+                synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
+                grad_norm = clip_grad_norm(
+                    self.clip_grad_max_norm,
+                    [self.model],
+                    device_mesh=getattr(self, "device_mesh", None),
+                    foreach=self.grad_clip_foreach,
+                )
+                grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
+
+                # ── LoRA gradient diagnostic (step 1 only) ───────────────────
+                if global_step == 1 and self.peft_cfg is not None:
+                    for n, p in self.model.named_parameters():
+                        if "lora_B" in n:
+                            try:
+                                grad_val = p.grad.to_local().float().norm().item() if p.grad is not None else None
+                            except Exception:
+                                grad_val = p.grad.float().norm().item() if p.grad is not None else None
+                            logging.info(
+                                f"[GRAD CHECK] {n}: grad_norm={grad_val}, param_norm={p.data.float().norm().item():.6f}"
+                            )
+                            break
+
+                for optimizer in self.optimizer:
+                    optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler[0].step(1)
+
+                perf_window_steps += 1
+                perf_window_local_samples += _count_local_batch_group_samples(batch_group)
+                group_loss_mean = float(torch.stack(micro_losses).mean().item())
+                epoch_loss += group_loss_mean
+                num_steps += 1
+                global_step = int(self.step_scheduler.step)
+
+                log_every = self.step_scheduler.log_remote_every_steps
+                should_log = log_every and log_every > 0 and global_step % log_every == 0
+                if should_log:
+                    elapsed_seconds, perf_window_end_time = self._elapsed_seconds_since(perf_window_start_time)
+                    perf_window_global_samples = self._count_global_samples(perf_window_local_samples)
+                    throughput_metrics = _calculate_throughput_metrics(
+                        elapsed_seconds=elapsed_seconds,
+                        optimizer_steps=perf_window_steps,
+                        global_samples=perf_window_global_samples,
+                        world_size=self.world_size,
+                    )
+                    memory_metrics = self._get_memory_metrics()
+                    perf_window_start_time = perf_window_end_time
+                    perf_window_steps = 0
+                    perf_window_local_samples = 0
+
+                if should_log and self.dist_env.is_main:
+                    avg_loss = epoch_loss / num_steps
+                    log_dict = {
+                        "train_loss": group_loss_mean,
+                        "train_avg_loss": avg_loss,
+                        "lr": self.optimizer[0].param_groups[0]["lr"],
+                        "grad_norm": grad_norm,
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        **throughput_metrics,
+                        **memory_metrics,
+                    }
+                    if _HAS_WANDB and wandb.run is not None:
+                        wandb.log(log_dict, step=global_step)
+                    logging.info(
+                        "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
+                        "step_time=%.3fs samples_per_sec=%.2f samples_per_sec_per_gpu=%.2f mem=%.2fGB",
+                        global_step,
+                        epoch,
+                        group_loss_mean,
+                        avg_loss,
+                        self.optimizer[0].param_groups[0]["lr"],
+                        grad_norm,
+                        throughput_metrics["step_time"],
+                        throughput_metrics["samples_per_sec"],
+                        throughput_metrics["samples_per_sec_per_gpu"],
+                        memory_metrics["max_memory_allocated_gb"],
+                    )
+
+                    # Update tqdm if present
+                    if hasattr(self.step_scheduler.dataloader, "set_postfix"):
+                        self.step_scheduler.dataloader.set_postfix(
+                            {
+                                "loss": f"{group_loss_mean:.4f}",
+                                "avg": f"{(avg_loss):.4f}",
+                                "lr": f"{self.optimizer[0].param_groups[0]['lr']:.2e}",
+                                "gn": f"{grad_norm:.2f}",
+                                "s/s": f"{throughput_metrics['samples_per_sec']:.1f}",
+                                "s/s/gpu": f"{throughput_metrics['samples_per_sec_per_gpu']:.2f}",
+                            }
+                        )
+
+                if self.val_dataloader is not None and self.step_scheduler.is_val_step:
+                    val_loss = self._run_validation_epoch(global_step)
+                    if self.dist_env.is_main:
+                        if _HAS_WANDB and wandb.run is not None:
+                            wandb.log({"val_loss": val_loss}, step=global_step)
+                        logging.info(
+                            "[VAL] step=%s epoch=%s val_loss=%.6f",
+                            global_step,
+                            epoch,
+                            val_loss,
+                        )
+
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
+
+            if num_steps == 0:
+                logging.info(f"[INFO] Epoch {epoch + 1} skipped (already completed in previous run)")
+                continue
+            avg_loss = epoch_loss / num_steps
+            logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
+
+            if self.dist_env.is_main and _HAS_WANDB and wandb.run is not None:
+                wandb.log({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
+
+        if self.dist_env.is_main:
+            logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
+            if _HAS_WANDB and wandb.run is not None:
+                wandb.finish()
+
+        self._finalize_and_close_checkpointer()
+        logging.info("[INFO] Training complete!")
+
+    def _get_dp_rank(self, include_cp: bool = False) -> int:
+        """Get data parallel rank, handling DDP mode where device_mesh is None."""
+        # In DDP mode, device_mesh is None, so use torch.distributed directly
+        device_mesh = getattr(self, "device_mesh", None)
+        if device_mesh is None:
+            return dist.get_rank() if dist.is_initialized() else 0
+        # Otherwise, use the parent implementation
+        return super()._get_dp_rank(include_cp=include_cp)
+
+    def _get_dp_group_size(self, include_cp: bool = False) -> int:
+        """Get data parallel world size, handling DDP mode where device_mesh is None."""
+        # In DDP mode, device_mesh is None, so use torch.distributed directly
+        device_mesh = getattr(self, "device_mesh", None)
+        if device_mesh is None:
+            return dist.get_world_size() if dist.is_initialized() else 1
+        # Otherwise, use the parent implementation
+        return super()._get_dp_group_size(include_cp=include_cp)
+
+    def _sync_device(self) -> None:
+        """Wait for queued CUDA work so timing reflects completed training work."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def _get_collective_device(self) -> torch.device:
+        """Return a tensor device compatible with the active distributed backend."""
+        if dist.is_initialized() and str(dist.get_backend()).lower() == "nccl" and torch.cuda.is_available():
+            return self.device
+        return torch.device("cpu")
+
+    def _elapsed_seconds_since(self, start_time: float) -> tuple[float, float]:
+        """Return the max elapsed wall-clock seconds across ranks since start_time."""
+        self._sync_device()
+        end_time = time.perf_counter()
+        elapsed_seconds = max(end_time - start_time, 1e-12)
+        if dist.is_initialized():
+            elapsed = torch.tensor(elapsed_seconds, device=self._get_collective_device(), dtype=torch.float64)
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+            elapsed_seconds = float(elapsed.item())
+        return elapsed_seconds, end_time
+
+    def _count_global_samples(self, local_samples: int) -> int:
+        """Count samples processed across the data-parallel group."""
+        global_samples = int(local_samples)
+        if dist.is_initialized():
+            sample_count = torch.tensor(global_samples, device=self._get_collective_device(), dtype=torch.long)
+            dist.all_reduce(sample_count, op=dist.ReduceOp.SUM, group=self._get_dp_group())
+            global_samples = int(sample_count.item())
+        return global_samples
+
+    def _get_memory_metrics(self) -> Dict[str, float]:
+        """Return PyTorch CUDA allocator memory counters, max-reduced across ranks."""
+        if not torch.cuda.is_available():
+            return {
+                "mem": 0.0,
+                "memory_allocated_gb": 0.0,
+                "memory_reserved_gb": 0.0,
+                "max_memory_allocated_gb": 0.0,
+                "max_memory_reserved_gb": 0.0,
+            }
+
+        scale = 1024**3
+        memory = torch.tensor(
+            [
+                torch.cuda.memory_allocated(self.device) / scale,
+                torch.cuda.memory_reserved(self.device) / scale,
+                torch.cuda.max_memory_allocated(self.device) / scale,
+                torch.cuda.max_memory_reserved(self.device) / scale,
+            ],
+            device=self._get_collective_device(),
+            dtype=torch.float64,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+
+        allocated, reserved, max_allocated, max_reserved = memory.tolist()
+        return {
+            "mem": max_allocated,
+            "memory_allocated_gb": allocated,
+            "memory_reserved_gb": reserved,
+            "max_memory_allocated_gb": max_allocated,
+            "max_memory_reserved_gb": max_reserved,
+        }

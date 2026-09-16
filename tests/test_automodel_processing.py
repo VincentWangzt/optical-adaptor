@@ -11,6 +11,7 @@ from optical_adaptor.automodel.conversations import (
     make_record,
     naive_messages,
     normalize_messages,
+    parse_visual_areas,
     stack_records,
     swe_records,
     visual_spans,
@@ -129,10 +130,10 @@ def test_full_swe_record_preserves_complete_history_and_split(settings):
     records = list(
         swe_records(row, messages, settings.prepare.sources[1], settings.prepare, 42, 100)
     )
-    full = next(record for record in records if record["view"] == "full")
-    assert full["messages"] == messages
+    full = next(record for record in records if record["origin"]["view"] == "full")
+    assert parse_visual_areas(full["messages"])[0] == messages
     assert full["turn_count"] == 5 and full["image_count"] == 10
-    assert len({record["split"] for record in records}) == 1
+    assert full["source"].endswith("_full")
     assert any(record["turn_count"] == 1 and record["task"] == "next_action" for record in records)
 
 

@@ -1,0 +1,431 @@
+name: Installation Test
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
+  # PR updates can supersede stale runs, but main must finish populating the
+  # canonical CUDA wheelhouse cache used by every copied PR branch.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
+  CUDA_CONTAINER_IMAGE: nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
+
+jobs:
+  pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
+
+  setup-install-image:
+    runs-on: ubuntu-latest
+    outputs:
+      cuda_image: ${{ steps.cfg.outputs.cuda_image }}
+    steps:
+      - id: cfg
+        shell: bash
+        run: |
+          echo "cuda_image=${CUDA_CONTAINER_IMAGE}" >> "$GITHUB_OUTPUT"
+
+  pip-test:
+    runs-on: ${{ matrix.arch }}
+    name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
+    needs: [pre-flight]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["ubuntu-latest", "macos-latest"] # After setting the repo to public: "ubuntu-24.04-arm"]
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Install project
+        run: |
+          pip install "."
+
+      - name: Checkout check-imports
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: python
+
+  ngc-cuda-test-uv:
+    runs-on: linux-amd64-cpu16
+    name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
+    needs: [pre-flight, setup-install-image]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    container:
+      image: ${{ needs.setup-install-image.outputs.cuda_image }}
+    environment: nemo-ci
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install wget
+        run: |
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y wget git && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.9.26
+
+      - name: Set up yq
+        shell: bash
+        run: |
+          wget https://github.com/mikefarah/yq/releases/download/v4.45.4/yq_linux_amd64.tar.gz
+          tar -xzf yq_linux_amd64.tar.gz
+          mkdir -p ./bin
+          mv yq_linux_amd64 ./bin/yq
+          chmod +x ./bin/yq
+
+      - name: Install project
+        env:
+          PAT: ${{ secrets.PAT }}
+          UV_PROJECT_ENVIRONMENT: ./venv
+          TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
+        shell: bash
+        run: |
+          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --all-groups --no-group magi --extra all
+
+          uv pip install --no-deps -e .
+
+      - name: Checkout check-imports
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
+
+  cuda-wheelhouse:
+    runs-on: linux-amd64-cpu16
+    name: Build CUDA wheelhouse - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
+    container:
+      image: ${{ needs.setup-install-image.outputs.cuda_image }}
+    environment: nemo-ci
+    needs: [pre-flight, setup-install-image]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+    env:
+      WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
+      TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
+      PLATFORM_MACHINE: x86_64
+      PYTHON_VERSION: ${{ matrix.python-version }}
+      SYS_PLATFORM: linux
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compute CUDA wheelhouse cache key
+        id: cuda-wheelhouse-key
+        shell: bash
+        run: |
+          fingerprint="$(
+            python scripts/cuda_wheelhouse_lock.py \
+              --output fingerprint \
+              --lock uv.lock \
+              --torch-index "${TORCH_CU_INDEX}" \
+              --python-version "${PYTHON_VERSION}" \
+              --platform-machine "${PLATFORM_MACHINE}" \
+              --sys-platform "${SYS_PLATFORM}" \
+              --runner-os "${RUNNER_OS}" \
+              --cuda-container-image "${CUDA_CONTAINER_IMAGE}" \
+              --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
+              --build-script .github/scripts/build-cuda-wheelhouse.sh
+          )"
+          echo "key=install-test-cuda-wheelhouse-v3-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
+
+      # Keep the canonical wheelhouse on main. Copied PR branches restore it
+      # without creating duplicate branch-scoped multi-GB cache entries.
+      # Use exact keys only: pip wheel cannot incrementally consume an older
+      # wheelhouse, so a prefix fallback downloads gigabytes before rebuilding.
+      - name: Restore and save CUDA wheelhouse cache
+        id: cuda-wheelhouse-cache-main
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.WHEELHOUSE_DIR }}
+          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
+
+      - name: Restore CUDA wheelhouse cache
+        id: cuda-wheelhouse-cache-branch
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.WHEELHOUSE_DIR }}
+          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
+
+      - name: Build cached CUDA dependency wheels
+        if: |
+          steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
+          && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
+        shell: bash -x -e -u -o pipefail {0}
+        run: .github/scripts/build-cuda-wheelhouse.sh
+
+      - name: Verify CUDA wheelhouse contents
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          # Ensure cache hit and freshly-built paths both provide the expected heavy wheels.
+          ls -1 "${WHEELHOUSE_DIR}"/*.whl
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/causal_conv1d*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/flash_attn*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/mamba_ssm*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/nv_grouped_gemm*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
+
+      - name: Upload CUDA wheelhouse artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          path: ${{ env.WHEELHOUSE_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  ngc-cuda-test-pip:
+    runs-on: linux-amd64-cpu16
+    name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
+    container:
+      image: ${{ needs.setup-install-image.outputs.cuda_image }}
+    environment: nemo-ci
+    needs: [pre-flight, setup-install-image, cuda-wheelhouse]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+        extra-groups: ["", "cuda", "fa", "vlm", "media", "all"]
+    env:
+      EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+      WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download cached CUDA wheelhouse
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          path: ${{ env.WHEELHOUSE_DIR }}
+
+      - name: Install automodel${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y python3 python3-pip python3-venv git && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          python3 -m venv ./venv
+
+          . ./venv/bin/activate
+
+          export PIP_FIND_LINKS="${WHEELHOUSE_DIR}"
+          export PIP_PREFER_BINARY=1
+
+          PIP_ARGS=()
+
+          if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
+            LOCK_ARGS=(
+              --lock uv.lock
+              --torch-index "${TORCH_CU_INDEX}"
+              --python-version "${{ matrix.python-version }}"
+              --platform-machine x86_64
+              --sys-platform linux
+            )
+            TORCH_REQUIREMENT="$(
+              python scripts/cuda_wheelhouse_lock.py --output torch "${LOCK_ARGS[@]}"
+            )"
+            TORCHVISION_REQUIREMENT="$(
+              python scripts/cuda_wheelhouse_lock.py --output torchvision "${LOCK_ARGS[@]}"
+            )"
+            BUILD_TOOLS="$(
+              python scripts/cuda_wheelhouse_lock.py --output build-tools "${LOCK_ARGS[@]}"
+            )"
+            mapfile -t BUILD_TOOL_REQUIREMENTS <<< "${BUILD_TOOLS}"
+            CONSTRAINTS_FILE="${RUNNER_TEMP}/cuda-wheelhouse-constraints.txt"
+            python scripts/cuda_wheelhouse_lock.py \
+              --output constraints \
+              "${LOCK_ARGS[@]}" > "${CONSTRAINTS_FILE}"
+
+            pip install --find-links "${PIP_FIND_LINKS}" "${BUILD_TOOL_REQUIREMENTS[@]}"
+            pip install \
+              --find-links "${PIP_FIND_LINKS}" \
+              --index-url "${TORCH_CU_INDEX}" \
+              "${TORCH_REQUIREMENT}" \
+              "${TORCHVISION_REQUIREMENT}"
+            PIP_ARGS=(--no-build-isolation --constraint "${CONSTRAINTS_FILE}")
+            export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
+          fi
+
+          pip install --find-links "${PIP_FIND_LINKS}" ${PIP_ARGS[@]} .$EXTRA
+
+      - name: Checkout check-imports
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
+
+  uv-test:
+    runs-on: ${{ matrix.arch }}
+    name: UV - Python ${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || 'ARM64/Darwin' }} - No CUDA
+    needs: [pre-flight]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    environment: nemo-ci
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}", "macos-latest"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.9.26
+
+      - name: Install dependencies with UV
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
+          PAT: ${{ secrets.PAT }}
+        run: |
+
+          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+
+          export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
+
+          # Keep runner packages isolated, but seed pip for the check-imports action.
+          uv venv ${UV_PROJECT_ENVIRONMENT} --seed
+
+          uv sync --link-mode copy --locked --only-group build
+
+          uv sync --link-mode copy --locked --all-groups --no-group magi
+
+          uv pip install --no-deps -e .
+
+      - name: Checkout check-imports
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.39.0
+          path: FW-CI-templates
+
+      - name: Check imports for nemo_automodel
+        uses: ./FW-CI-templates/.github/actions/check-imports
+        with:
+          package-name: nemo_automodel
+          python-binary: ./venv/bin/python
+
+  install-test-summary:
+    needs: [pip-test, uv-test, ngc-cuda-test-uv, cuda-wheelhouse, ngc-cuda-test-pip, pre-flight, setup-install-image]
+    runs-on: ubuntu-latest
+    name: Install test summary
+    if: |
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        || always()
+      )
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Get workflow result
+        id: result
+        shell: bash -x -e -u -o pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+        run: |
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+
+          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
+          else
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              # Show which jobs failed
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              exit 1
+          fi

@@ -1,4 +1,4 @@
-"""SFT conversations and offset-addressed visual areas, independent of tokenization."""
+"""SFT conversations with readable inline visual-area annotations."""
 
 from __future__ import annotations
 
@@ -8,6 +8,43 @@ import random
 from collections.abc import Iterator
 
 from optical_adaptor.automodel.config import PrepareConfig, Source, bin_name, fingerprint
+
+VISUAL_START = "<visual_AREA_start>"
+VISUAL_END = "<visual_AREA_end>"
+
+
+def annotated_messages(messages: list[dict], areas: list[dict]) -> list[dict]:
+    result = copy.deepcopy(messages)
+    for message in result:
+        if VISUAL_START in message["content"] or VISUAL_END in message["content"]:
+            raise ValueError("Source text contains a reserved visual-area annotation")
+    for area in reversed(areas):
+        message = result[area["message"]]
+        text, start, end = message["content"], area["start"], area["end"]
+        message["content"] = text[:start] + VISUAL_START + text[start:end] + VISUAL_END + text[end:]
+    return result
+
+
+def parse_visual_areas(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Compile storage annotations to plain messages and internal position maps."""
+    plain, areas = copy.deepcopy(messages), []
+    for index, message in enumerate(plain):
+        text, parts, offset = message["content"], [], 0
+        while VISUAL_START in text:
+            prefix, rest = text.split(VISUAL_START, 1)
+            if VISUAL_END in prefix or VISUAL_END not in rest:
+                raise ValueError("Unbalanced visual-area annotations")
+            visual, text = rest.split(VISUAL_END, 1)
+            if not visual or VISUAL_START in visual:
+                raise ValueError("Empty or nested visual-area annotation")
+            parts.extend((prefix, visual))
+            start = offset + len(prefix)
+            areas.append({"message": index, "start": start, "end": start + len(visual)})
+            offset = start + len(visual)
+        if VISUAL_END in text:
+            raise ValueError("Unbalanced visual-area annotations")
+        message["content"] = "".join(parts) + text
+    return plain, areas
 
 
 def normalize_messages(messages: list[dict]) -> list[dict]:
@@ -64,11 +101,13 @@ def visual_spans(text: str, max_rows: int, line_width: int) -> list[tuple[int, i
 
 
 def validate_record(record: dict) -> None:
-    messages = record["messages"]
+    if record["schema_version"] != 2:
+        raise ValueError("Expected inline-annotation schema 2; curate fresh data")
+    messages, areas = parse_visual_areas(record["messages"])
     if not any(m["role"] == "assistant" for m in messages):
         raise ValueError("Every SFT sample requires a genuine assistant target")
     previous = (-1, -1)
-    for area in record["visual_areas"]:
+    for area in areas:
         index, start, end = area["message"], area["start"], area["end"]
         if not 0 <= index < len(messages):
             raise ValueError("Visual message index out of range")
@@ -79,7 +118,7 @@ def validate_record(record: dict) -> None:
         if index < previous[0] or (index == previous[0] and start < previous[1]):
             raise ValueError("Visual areas must be ordered and non-overlapping")
         previous = (index, end)
-    if not record["visual_areas"] or len(record["visual_areas"]) != record["image_count"]:
+    if not areas or len(areas) != record["image_count"]:
         raise ValueError("image_count must equal the number of visual areas")
 
 
@@ -98,27 +137,29 @@ def make_record(
     seed: int,
     config: PrepareConfig,
 ) -> dict:
-    split_value = int(fingerprint([seed, "repository", group.casefold()])[:16], 16) / 2**64
+    family = view.split("_")[0]
+    logical_source = source.name
+    if source.kind == "stack" or task == "next_action":
+        logical_source += "_" + family
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "sample_id": fingerprint([source.name, origin_id, task, view, messages, areas])[:24],
         "group_id": group.casefold(),
-        "source": source.name,
+        "source": logical_source,
         "task": task,
-        "view": view,
         "thinking": thinking,
-        "messages": messages,
+        "messages": annotated_messages(messages, areas),
         "tools": tools,
-        "visual_areas": areas,
         "image_count": len(areas),
         "turn_count": turn_count,
         "image_bin": bin_name(len(areas), config.image_bins),
         "turn_bin": bin_name(turn_count, config.turn_bins),
-        "split": "eval" if split_value < config.eval_fraction else "train",
         "origin": {
             "dataset_id": source.dataset_id,
             "revision": source.revision,
             "record_id": origin_id,
+            "source": source.name,
+            "view": view,
         },
     }
     validate_record(record)
@@ -363,17 +404,9 @@ def swe_records(
 
 
 def slice_key(record: dict) -> str:
-    view = (
-        "full"
-        if record["view"] == "full"
-        else ("window" if record["view"].startswith("window_") else record["view"].split("_")[0])
+    size = (
+        "turns-" + record["turn_bin"]
+        if record["task"] == "next_action"
+        else "images-" + record["image_bin"]
     )
-    return "/".join(
-        (
-            record["source"],
-            record["task"],
-            view,
-            "images-" + record["image_bin"],
-            "turns-" + record["turn_bin"],
-        )
-    )
+    return "/".join((record["source"], record["task"], size))

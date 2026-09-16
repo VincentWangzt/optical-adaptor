@@ -9,7 +9,7 @@ dependencies = [
     "pillow>=11.1,<12",
     "pyyaml>=6.0.2,<7",
     "transformers==5.15.1",
-    "nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git@2c0df17efff1fc9d5128a9df1a2ed716d0f2c54a",
+    "nemo-automodel",
     "torch==2.13.0",
     "accelerate>=1.10,<2",
     "datasets>=4,<5",
@@ -36,7 +36,6 @@ ocr-infer = "optical_adaptor.infer_ocr:main"
 ocr-edit-distance = "optical_adaptor.edit_distance:main"
 ocr-evaluate = "optical_adaptor.evaluate_ocr:main"
 prepare-adapter-data = "optical_adaptor.automodel.prepare:main"
-train-optical-adapter = "optical_adaptor.automodel.recipe:main"
 prepare-live-benchmark = "optical_adaptor.benchmark.prepare:main"
 evaluate-live-benchmark = "optical_adaptor.benchmark.run:main"
 serve-optical = "optical_adaptor.inference.serve:main"
@@ -65,9 +64,12 @@ addopts = "-q"
 testpaths = ["tests"]
 
 [tool.ruff]
-extend-exclude = [".huggingface", ".venv-*", "outputs"]
+extend-exclude = [".huggingface", ".venv-*", "outputs", "third_party"]
 line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.uv.sources]
+nemo-automodel = { path = "third_party/Automodel", editable = true }

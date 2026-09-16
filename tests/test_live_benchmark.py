@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from optical_adaptor.artifacts import file_sha256, load_pipeline
 from optical_adaptor.benchmark.compare import lcb_answer
 from optical_adaptor.benchmark.prepare import join_lines, source_lines
 from optical_adaptor.benchmark.run import case_messages, score, task_decoding
@@ -14,7 +15,6 @@ from optical_adaptor.inference.backend import (
     normalize_messages,
 )
 from optical_adaptor.inference.messages import chat_ids
-from optical_adaptor.training.config import file_sha256, load_pipeline
 
 
 def test_image_order_and_message_boundaries():
@@ -76,10 +76,10 @@ def test_upstream_lcb_answer_policy_is_reported_separately():
 
 
 def test_reconstruction_decoding_matches_training_while_qa_stays_greedy():
-    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "configs/training.yaml")
+    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "configs/automodel.yaml")
     reconstruction = task_decoding("reconstruction", pipeline)
     assert reconstruction.to_vllm_kwargs() == {
-        "temperature": 1.0,
+        "temperature": 0.0,
         "top_p": 1.0,
         "top_k": 0,
         "presence_penalty": 0.0,
@@ -92,10 +92,10 @@ def test_reconstruction_decoding_matches_training_while_qa_stays_greedy():
 def test_qwen_template_matches_adjacent_vision_blocks():
     from transformers import AutoTokenizer
 
-    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "configs/training.yaml")
-    model = pipeline.config.models
+    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "configs/automodel.yaml")
+    model = pipeline.optical.llm
     tokenizer = AutoTokenizer.from_pretrained(
-        model.qwen_id, revision=model.qwen_revision, local_files_only=True
+        model["model_id"], revision=model["revision"], local_files_only=True
     )
     for count in (2, 4, 8):
         ids = chat_ids(

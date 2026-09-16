@@ -1,0 +1,4692 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import io
+import json
+import logging
+import os
+import pickle
+import random
+from contextlib import ExitStack
+from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
+
+import numpy as np
+import pytest
+import torch
+import torch.distributed.checkpoint as dcp
+import yaml
+from safetensors.torch import load_file, save_file
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.nn.parallel import DistributedDataParallel
+
+from nemo_automodel.components.checkpoint._backports.hf_storage import (
+    _DIFFUSERS_INDEX_FN,
+    _extract_file_index_with_status,
+    _is_integrated_cuda_device,
+    get_fqn_to_dtype_mapping,
+    get_fqn_to_file_index_mapping,
+)
+from nemo_automodel.components.checkpoint._backports.hf_utils import (
+    FQN_TO_DTYPE_MAPPING_FILENAME,
+    FQN_TO_FILE_INDEX_MAPPING_FILENAME,
+)
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    SaveConsolidatedMode,
+    _collect_global_tensor_sizes,
+    _divide_keys_by_size,
+    _ensure_dirs,
+    _ensure_shared_dirs,
+    _equally_divide_layers,
+    _is_custom_model,
+    _load_hf_bin_checkpoint,
+    _load_hf_safetensors_checkpoint,
+    _model_has_dtensors,
+    _new_gloo_process_group,
+    _normalize_dtype_mapping_to_state_dict_keys,
+    _reinit_non_persistent_buffers,
+    _should_write_consolidated_safetensors,
+    _summarize_state_dict_key_diff,
+    _warn_if_large_inline_consolidation,
+    is_cloud_path,
+    save_config,
+)
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    ModelState,
+    OptimizerState,
+    _get_lm_head_weight_and_name,
+)
+from nemo_automodel.components.checkpoint.utils import (
+    has_local_tied_lm_head,
+    materialize_missing_tied_lm_head,
+)
+from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
+from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
+
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
+CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
+CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
+LOCAL_PATH_MODEL = "/ckpts/step-100/model"
+
+
+@pytest.mark.parametrize(
+    ("device_type", "is_integrated", "expected"),
+    [
+        pytest.param("cpu", True, False, id="cpu-never-stages"),
+        pytest.param("cuda", False, False, id="discrete-cuda-keeps-mmap"),
+        pytest.param("cuda", True, True, id="integrated-cuda-stages"),
+    ],
+)
+def test_integrated_cuda_device_detection(device_type, is_integrated, expected):
+    device = torch.device(device_type)
+    with patch(
+        "nemo_automodel.components.checkpoint._backports.hf_storage.torch.cuda.get_device_properties",
+        return_value=SimpleNamespace(is_integrated=is_integrated),
+    ) as get_properties:
+        assert _is_integrated_cuda_device(device) is expected
+
+    assert get_properties.call_count == (1 if device_type == "cuda" else 0)
+
+
+def test_load_on_global_ranks_falls_back_to_legacy_rng_state(tmp_path, caplog):
+    """Global-rank restore warns and requires the trusted-pickle opt-in for legacy RNG state."""
+    init_all_rng(123)
+    legacy_state = RNGState(
+        random_rng_state=random.getstate(),
+        np_rng_state=np.random.get_state(),
+        torch_rng_state=torch.get_rng_state(),
+        cuda_rng_state=torch.cuda.get_rng_state_all(),
+    )
+    expected = (random.random(), np.random.rand(), torch.rand(1).item())
+    state_dir = tmp_path / "rng"
+    state_dir.mkdir()
+    torch.save(legacy_state, state_dir / "rng_dp_rank_0.pt")
+
+    rng = StatefulRNG(999)
+    restricted = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(0, 0, 0)
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="Refusing to load torch artifact"),
+    ):
+        restricted.load_on_global_ranks(rng, "rng", str(tmp_path))
+
+    assert "Loading legacy per-DP rng state" in caplog.text
+
+    legacy = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        save_consolidated=False,
+        allow_legacy_pickle_restore=True,
+    ).build(0, 0, 0)
+    legacy.load_on_global_ranks(rng, "rng", str(tmp_path))
+
+    assert (random.random(), np.random.rand(), torch.rand(1).item()) == expected
+
+
+class TestConsolidationProcessGroup:
+    """Tests for the process group that isolates inline consolidation from NCCL."""
+
+    @staticmethod
+    def _config(tmp_path, save_consolidated="final", consolidation_timeout_minutes=30):
+        return CheckpointingConfig(
+            checkpoint_dir=str(tmp_path),
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=save_consolidated,
+            consolidation_timeout_minutes=consolidation_timeout_minutes,
+        )
+
+    def test_creates_gloo_group_with_configured_timeout(self, tmp_path):
+        model_process_group = MagicMock()
+        consolidation_process_group = MagicMock()
+        config = self._config(tmp_path, consolidation_timeout_minutes=45)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2) as get_world_size,
+            patch("torch.distributed.get_process_group_ranks", return_value=[2, 3]) as get_ranks,
+            patch("torch.distributed.new_group", return_value=consolidation_process_group) as new_group,
+        ):
+            checkpointer = Checkpointer(
+                config,
+                dp_rank=0,
+                tp_rank=0,
+                pp_rank=0,
+                process_group=model_process_group,
+            )
+
+        get_world_size.assert_called_once_with(group=model_process_group)
+        get_ranks.assert_called_once_with(model_process_group)
+        new_group.assert_called_once_with(
+            ranks=[2, 3],
+            backend="gloo",
+            timeout=timedelta(minutes=45),
+            use_local_synchronization=True,
+        )
+        assert checkpointer._consolidation_process_group is consolidation_process_group
+
+    def test_sharded_only_save_does_not_create_group(self, tmp_path):
+        config = self._config(tmp_path, save_consolidated=False)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.new_group") as new_group,
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        new_group.assert_not_called()
+        assert checkpointer._consolidation_process_group is None
+
+    def test_uninitialized_distributed_does_not_create_group(self, tmp_path):
+        config = self._config(tmp_path)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch("torch.distributed.new_group") as new_group,
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        new_group.assert_not_called()
+        assert checkpointer._consolidation_process_group is None
+
+    def test_close_destroys_consolidation_group(self, tmp_path):
+        process_group = MagicMock()
+        config = self._config(tmp_path)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.new_group", return_value=process_group),
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.destroy_process_group") as destroy_process_group,
+        ):
+            checkpointer.close()
+
+        destroy_process_group.assert_called_once_with(process_group)
+        assert checkpointer._consolidation_process_group is None
+
+    def test_save_model_passes_group_to_consolidation(self, tmp_path):
+        process_group = MagicMock()
+        config = self._config(tmp_path)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.new_group", return_value=process_group),
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"weight": 1})
+        checkpointer._maybe_build_original_dtype_mapping = MagicMock(return_value=None)
+        checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
+        checkpointer._do_save = MagicMock(return_value=None)
+        checkpointer._addons = []
+        model = MagicMock()
+        model.state_dict.return_value = {"weight": torch.ones(1)}
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda *args, **kwargs: args[1],
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank"
+            ) as consolidate,
+        ):
+            checkpointer.save_model(model, str(tmp_path / "step_1"), is_final_checkpoint=True)
+
+        assert consolidate.call_args.kwargs["process_group"] is process_group
+
+
+def test_new_gloo_process_group_preserves_subset_membership():
+    """Async checkpoint groups use only the supplied model-process ranks."""
+    model_group = object()
+    gloo_group = object()
+    with (
+        patch("torch.distributed.get_process_group_ranks", return_value=[2, 3]) as get_ranks,
+        patch("torch.distributed.new_group", return_value=gloo_group) as new_group,
+    ):
+        result = _new_gloo_process_group(model_group)
+
+    assert result is gloo_group
+    get_ranks.assert_called_once_with(model_group)
+    new_group.assert_called_once_with(ranks=[2, 3], backend="gloo", use_local_synchronization=True)
+
+
+def _make_keys(count: int) -> list[str]:
+    return [f"layer.{i}" for i in range(count)]
+
+
+def _count_by_shard(mapping: dict[str, int]) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for shard_index in mapping.values():
+        counts[shard_index] = counts.get(shard_index, 0) + 1
+    return counts
+
+
+def test_extract_file_index_with_status_supports_hf_and_qwen35_patterns():
+    assert _extract_file_index_with_status("model-00001-of-00008.safetensors") == (1, True)
+    assert _extract_file_index_with_status("model.safetensors-00002-of-00008.safetensors") == (2, True)
+    assert _extract_file_index_with_status("shard-00000-model-00003-of-00008.safetensors") == (3, True)
+    assert _extract_file_index_with_status("model.safetensors") == (1, True)
+
+
+def test_extract_file_index_with_status_rejects_invalid_encoded_index():
+    assert _extract_file_index_with_status("model-00012-of-00008.safetensors") == (1, False)
+    assert _extract_file_index_with_status("model-00000-of-00008.safetensors") == (1, False)
+    assert _extract_file_index_with_status("weights-a.safetensors") == (1, False)
+
+
+def test_get_fqn_to_file_index_mapping_uses_index_json_for_qwen35_names(tmp_path):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model.safetensors-00001-of-00003.safetensors",
+            "model.layers.1.weight": "model.safetensors-00002-of-00003.safetensors",
+            "lm_head.weight": "model.safetensors-00003-of-00003.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+        "lm_head.weight": 3,
+    }
+
+
+def test_load_indexed_safetensors_opens_each_shard_once(tmp_path):
+    """Indexed loading opens each shard once even when it contains multiple tensors."""
+    shard_1 = tmp_path / "model-00001-of-00002.safetensors"
+    shard_2 = tmp_path / "model-00002-of-00002.safetensors"
+    expected = {
+        "layer.0.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+        "layer.0.bias": torch.arange(2, dtype=torch.float32),
+        "layer.1.weight": torch.arange(4, 8, dtype=torch.float32).reshape(2, 2),
+        "layer.1.bias": torch.arange(2, 4, dtype=torch.float32),
+    }
+    save_file({"layer.0.weight": expected["layer.0.weight"], "layer.0.bias": expected["layer.0.bias"]}, shard_1)
+    save_file({"layer.1.weight": expected["layer.1.weight"], "layer.1.bias": expected["layer.1.bias"]}, shard_2)
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(
+            {
+                "weight_map": {
+                    "layer.0.weight": shard_1.name,
+                    "layer.1.weight": shard_2.name,
+                    "layer.0.bias": shard_1.name,
+                    "layer.1.bias": shard_2.name,
+                }
+            },
+            f,
+        )
+
+    from safetensors import safe_open
+
+    with patch("safetensors.safe_open", wraps=safe_open) as mock_safe_open:
+        loaded = _load_hf_safetensors_checkpoint(str(tmp_path))
+
+    assert loaded is not None
+    assert mock_safe_open.call_count == 2
+    assert set(loaded) == set(expected)
+    for key, tensor in expected.items():
+        torch.testing.assert_close(loaded[key], tensor)
+
+
+def test_prefault_safetensors_reads_tensor_without_replacing_returned_view(tmp_path):
+    checkpoint_path = tmp_path / "model.safetensors"
+    checkpoint_path.touch()
+    tensor = MagicMock(spec=torch.Tensor)
+    safe_handle = MagicMock()
+    safe_handle.__enter__.return_value = safe_handle
+    safe_handle.keys.return_value = ["weight"]
+    safe_handle.get_tensor.return_value = tensor
+
+    with patch("safetensors.safe_open", return_value=safe_handle):
+        loaded = _load_hf_safetensors_checkpoint(str(checkpoint_path), prefault_mmap=True)
+
+    assert loaded == {"weight": tensor}
+    tensor.clone.assert_called_once_with()
+
+
+def test_get_fqn_to_dtype_mapping_reads_safetensors_headers_and_applies_key_mapping(tmp_path):
+    save_file(
+        {
+            "orig.layers.0.weight": torch.ones(2, dtype=torch.bfloat16),
+            "orig.layers.1.weight": torch.ones(2, dtype=torch.float32),
+        },
+        tmp_path / "model-00001-of-00001.safetensors",
+    )
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "orig.layers.0.weight": "model-00001-of-00001.safetensors",
+            "orig.layers.1.weight": "model-00001-of-00001.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    mapping = get_fqn_to_dtype_mapping(str(tmp_path), {r"^orig\.": "model."})
+
+    assert mapping == {
+        "model.layers.0.weight": "BF16",
+        "model.layers.1.weight": "F32",
+    }
+
+
+def test_get_fqn_to_file_index_mapping_warns_when_multiple_files_fallback_to_one(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "weights-a.safetensors",
+            "model.layers.1.weight": "weights-b.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "parsing failed or produced unexpected indices" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_warns_when_only_some_files_parse(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model-00001-of-00002.safetensors",
+            "model.layers.1.weight": "weights-b.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "weights-b.safetensors" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_reserves_single_file_index_for_fallback_assignment(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model.safetensors",
+            "model.layers.1.weight": "weights-b.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "parsing failed or produced unexpected indices" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_reassigns_invalid_encoded_index(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model-00001-of-00008.safetensors",
+            "model.layers.1.weight": "model-00012-of-00008.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "parsing failed or produced unexpected indices" in caplog.text
+    assert "model-00012-of-00008.safetensors" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_remaps_when_parsed_indices_are_not_dense(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model-00001-of-00012.safetensors",
+            "model.layers.1.weight": "model-00012-of-00012.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "Expected indices to be 1..2; falling back to sorted filename order for output indices" in caplog.text
+
+
+def test_equally_divide_layers_num_shards_gt_num_layers():
+    keys = _make_keys(3)
+
+    mapping = _equally_divide_layers(5, keys)
+
+    assert mapping == {keys[0]: 1, keys[1]: 2, keys[2]: 3}
+    assert set(mapping.values()) == {1, 2, 3}
+
+
+def test_equally_divide_layers_num_shards_eq_num_layers():
+    keys = _make_keys(4)
+
+    mapping = _equally_divide_layers(4, keys)
+
+    assert mapping == {keys[0]: 1, keys[1]: 2, keys[2]: 3, keys[3]: 4}
+
+
+def test_equally_divide_layers_num_shards_lt_num_layers():
+    keys = _make_keys(10)
+
+    mapping = _equally_divide_layers(3, keys)
+
+    assert _count_by_shard(mapping) == {1: 4, 2: 3, 3: 3}
+    assert [mapping[key] for key in keys] == [1, 1, 1, 1, 2, 2, 2, 3, 3, 3]
+
+
+def test_equally_divide_layers_num_shards_one():
+    keys = _make_keys(5)
+
+    mapping = _equally_divide_layers(1, keys)
+
+    assert len(mapping) == len(keys)
+    assert set(mapping.values()) == {1}
+
+
+def test_divide_keys_by_size_keeps_small_state_dict_in_one_shard():
+    state_dict = {
+        "a.weight": torch.empty(2, dtype=torch.float32),
+        "b.weight": torch.empty(3, dtype=torch.float32),
+    }
+
+    mapping = _divide_keys_by_size(list(state_dict), state_dict, target_shard_bytes=32)
+
+    assert mapping == {
+        "a.weight": 1,
+        "b.weight": 1,
+    }
+
+
+def test_divide_keys_by_size_splits_without_empty_shards():
+    state_dict = {
+        "a.weight": torch.empty(6, dtype=torch.uint8),
+        "b.weight": torch.empty(6, dtype=torch.uint8),
+        "c.weight": torch.empty(1, dtype=torch.uint8),
+    }
+
+    mapping = _divide_keys_by_size(list(state_dict), state_dict, target_shard_bytes=10)
+
+    assert mapping == {
+        "a.weight": 1,
+        "b.weight": 2,
+        "c.weight": 2,
+    }
+
+
+def test_divide_keys_by_size_places_oversized_tensor_alone():
+    state_dict = {
+        "huge.weight": torch.empty(12, dtype=torch.uint8),
+        "small.weight": torch.empty(1, dtype=torch.uint8),
+    }
+
+    mapping = _divide_keys_by_size(list(state_dict), state_dict, target_shard_bytes=10)
+
+    assert mapping == {
+        "huge.weight": 1,
+        "small.weight": 2,
+    }
+
+
+def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path, caplog):
+    class FakeTensor:
+        def __init__(self, bytes_: int):
+            self.bytes = bytes_
+
+        def numel(self):
+            return self.bytes
+
+        def element_size(self):
+            return 1
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="config-only/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    state_dict = {
+        "a.weight": FakeTensor(4 * 1024**3),
+        "b.weight": FakeTensor(4 * 1024**3),
+        "c.weight": FakeTensor(1),
+    }
+    model_state = SimpleNamespace(model=[SimpleNamespace()])
+    caplog.set_level(logging.INFO)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path", return_value=None
+    ):
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
+
+    assert mapping == {
+        "a.weight": 1,
+        "b.weight": 2,
+        "c.weight": 2,
+    }
+    assert dtype_mapping is None
+    assert "No original HF safetensors reference path found for config-only/model" in caplog.text
+    assert "2 output shard(s)" in caplog.text
+
+
+def _run_consolidated_index_pp_worker(rank: int, init_file: str, checkpoint_dir: str) -> None:
+    """Every stage must derive the expected global mapping using only its local tensors."""
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        checkpointer = CheckpointingConfig(checkpoint_dir=checkpoint_dir, save_consolidated=False).build(
+            dp_rank=0, tp_rank=0, pp_rank=rank, pp_group=torch.distributed.group.WORLD
+        )
+        keys = [f"layers.{index}.weight" for index in range(4)]
+        # For size fallback, each 4-GiB logical tensor needs its own shard; meta avoids allocating the payload.
+        state_dict = {
+            key: torch.empty(4 * 1024**3, dtype=torch.uint8, device="meta") for key in keys[rank * 2 : rank * 2 + 2]
+        }
+        cases = [
+            ("fully_pruned_index", {"language_model.weight": 1}, True, [1, 2, 3, 4]),
+            ("missing_reference", None, True, [1, 2, 3, 4]),
+            ("partial_index_no_global_keys", {"layers.0.weight": 2, "unused.weight": 1}, False, [2, 2, 2, 2]),
+            ("missing_reference_no_global_keys", None, False, [1, 2, 3, 4]),
+        ]
+        for case, source_mapping, has_global_keys, expected_indices in cases:
+            model = SimpleNamespace(_pre_shard_hf_state_dict_keys=keys if has_global_keys else None)
+            model_state = SimpleNamespace(model=[model])
+            with (
+                patch(
+                    "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                    return_value=checkpoint_dir if source_mapping is not None else None,
+                ),
+                patch(
+                    "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                    return_value=source_mapping,
+                ),
+            ):
+                mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+            # Spawn propagates assertion failures from either rank, including the failing case name.
+            assert mapping == dict(zip(keys, expected_indices)), case
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidated_index_agrees_across_pp_ranks(tmp_path):
+    """Exercise all source-index fallbacks in one process group, including absent global key metadata."""
+    torch.multiprocessing.spawn(
+        _run_consolidated_index_pp_worker,
+        args=(str(tmp_path / "dist_init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_fully_pruned_original_index_does_not_readd_excluded_tied_lm_head(tmp_path):
+    """Rebuilding a parent index must not restore an explicitly excluded tied-weight alias."""
+    state_dict = {"embed_tokens.weight": torch.empty(1), "lm_head.weight": torch.empty(1)}
+    model_state = SimpleNamespace(
+        model=[SimpleNamespace(_pre_shard_hf_state_dict_keys=list(state_dict))],
+        has_local_tied_lm_head=True,
+        lm_head_param_name="lm_head.weight",
+    )
+    checkpointer = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(
+        dp_rank=0, tp_rank=0, pp_rank=0
+    )
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            return_value={"language_model.embed_tokens.weight": 1},
+        ),
+    ):
+        assert checkpointer._maybe_build_consolidated_index(model_state, state_dict) == {"embed_tokens.weight": 1}
+
+
+@pytest.mark.parametrize("has_global_keys", [True, False])
+def test_extracted_model_export_reloads_all_tensors_from_size_bounded_shards(tmp_path, monkeypatch, has_global_keys):
+    """A real parent index with different prefixes produces complete, reloadable output shards."""
+    model = torch.nn.Sequential(*(torch.nn.Linear(4, 4, dtype=torch.float32) for _ in range(3)))
+    expected = {key: tensor.clone() for key, tensor in model.state_dict().items()}
+    model._pre_shard_hf_state_dict_keys = list(expected) if has_global_keys else None
+    source = tmp_path / "source"
+    source.mkdir()
+    parent_state = {f"language_model.{key}": tensor for key, tensor in expected.items()}
+    source_filename = "model-00001-of-00001.safetensors"
+    save_file(parent_state, str(source / source_filename))
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(parent_state, source_filename)})
+    )
+    checkpointer = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_repo_id=str(source),
+        save_consolidated=True,
+        is_peft=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+    # One FP32 [4, 4] weight and [4] bias exactly fill an 80-byte payload shard.
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.checkpointing._DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES", 80
+    )
+
+    checkpointer.save_model(model, str(tmp_path / "checkpoint"))
+
+    output = tmp_path / "checkpoint" / "model" / "consolidated"
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+    assert set(weight_map) == set(expected)
+    assert len(set(weight_map.values())) == 3
+    assert {path.name for path in output.glob("*.safetensors")} == set(weight_map.values())
+    restored = {}
+    for filename in set(weight_map.values()):
+        tensors = load_file(str(output / filename))
+        assert set(tensors) == {key for key, mapped_file in weight_map.items() if mapped_file == filename}
+        assert not set(restored).intersection(tensors)
+        assert sum(tensor.numel() * tensor.element_size() for tensor in tensors.values()) == 80
+        restored.update(tensors)
+
+    reloaded = torch.nn.Sequential(*(torch.nn.Linear(4, 4, dtype=torch.float32) for _ in range(3)))
+    reloaded.load_state_dict(restored, strict=True)
+    for key, tensor in reloaded.state_dict().items():
+        assert restored[key].dtype == expected[key].dtype
+        torch.testing.assert_close(tensor, expected[key], rtol=0, atol=0, check_dtype=True)
+
+
+def test_collect_global_tensor_sizes_rejects_missing_rank_metadata():
+    """An incomplete collective result must fail explicitly instead of dropping a stage."""
+    group = object()
+
+    def omit_remote_mapping(gathered, local_sizes, group):
+        gathered[0] = local_sizes
+
+    with (
+        patch("torch.distributed.is_available", return_value=True),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.all_gather_object", side_effect=omit_remote_mapping),
+        pytest.raises(RuntimeError, match="Pipeline rank 1 did not provide tensor sizes for consolidated export"),
+    ):
+        _collect_global_tensor_sizes({"weight": torch.empty(2)}, group)
+
+
+def _run_logical_tensor_sizes_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Exercise logical sizes, duplicate keys, empty stages, and conflicts over real Gloo collectives."""
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        group = torch.distributed.group.WORLD
+        mesh = DeviceMesh("cpu", list(range(world_size)))
+        state_dict = {
+            "row_shard": distribute_tensor(torch.arange(15, dtype=torch.float32).reshape(5, 3), mesh, [Shard(0)]),
+            "column_shard": distribute_tensor(torch.arange(15, dtype=torch.float64).reshape(3, 5), mesh, [Shard(1)]),
+            "replicated": distribute_tensor(torch.arange(15, dtype=torch.float16).reshape(5, 3), mesh, [Replicate()]),
+        }
+        assert {key: tensor.to_local().numel() * tensor.element_size() for key, tensor in state_dict.items()} == {
+            "row_shard": 36 if rank == 0 else 24,
+            "column_shard": 72 if rank == 0 else 48,
+            "replicated": 30,
+        }
+        expected_sizes = {"row_shard": 60, "column_shard": 120, "replicated": 30}
+        assert _collect_global_tensor_sizes(state_dict, None) == expected_sizes
+        global_sizes = _collect_global_tensor_sizes(state_dict, group)
+        assert global_sizes == expected_sizes
+        assert _divide_keys_by_size(list(state_dict), state_dict, 70, key_size_mapping=global_sizes) == {
+            "row_shard": 1,
+            "column_shard": 2,
+            "replicated": 3,
+        }
+        # An empty stage must still participate and receive the other stage's metadata.
+        assert _collect_global_tensor_sizes({} if rank else state_dict, group) == expected_sizes
+        # Matching element counts are insufficient: the saved dtype also determines the byte size.
+        for conflicting_tensor in (
+            torch.empty(3 if rank else 2, dtype=torch.float32),
+            torch.empty(2, dtype=torch.float64 if rank else torch.float32),
+        ):
+            with pytest.raises(ValueError, match="Conflicting logical sizes for 'weight' across pipeline ranks"):
+                _collect_global_tensor_sizes({"weight": conflicting_tensor}, group)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.run_only_on("CPU")
+def test_collect_global_tensor_sizes_with_real_dtensors_and_conflicting_pp_metadata(tmp_path):
+    """Uneven local storage cannot change shard assignments; incompatible metadata fails on both ranks."""
+    torch.multiprocessing.spawn(
+        _run_logical_tensor_sizes_worker,
+        args=(2, str(tmp_path / "dist_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_normalize_dtype_mapping_to_state_dict_keys_uses_hf_base_model_prefix():
+    dtype_mapping = {
+        "h.0.ln_1.weight": "BF16",
+        "wte.weight": "BF16",
+        "lm_head.weight": "F32",
+        "unused.weight": "BF16",
+    }
+    state_dict_keys = [
+        "transformer.h.0.ln_1.weight",
+        "transformer.wte.weight",
+        "lm_head.weight",
+    ]
+
+    normalized = _normalize_dtype_mapping_to_state_dict_keys(dtype_mapping, state_dict_keys, "transformer")
+
+    assert normalized == {
+        "transformer.h.0.ln_1.weight": "BF16",
+        "transformer.wte.weight": "BF16",
+        "lm_head.weight": "F32",
+    }
+
+
+def test_original_dtype_mapping_is_keyed_by_export_state_dict(tmp_path):
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    save_file(
+        {
+            "h.0.ln_1.weight": torch.ones(1, dtype=torch.bfloat16),
+            "wte.weight": torch.ones(1, dtype=torch.bfloat16),
+            "unused.weight": torch.ones(1, dtype=torch.float32),
+        },
+        reference_dir / "model.safetensors",
+    )
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    model_state = SimpleNamespace(model=[SimpleNamespace(base_model_prefix="transformer")])
+    state_dict = {
+        "transformer.h.0.ln_1.weight": torch.ones(1),
+        "transformer.wte.weight": torch.ones(1),
+    }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+        return_value=str(reference_dir),
+    ):
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
+
+    assert dtype_mapping == {
+        "transformer.h.0.ln_1.weight": "BF16",
+        "transformer.wte.weight": "BF16",
+    }
+
+
+def test_original_dtype_mapping_applies_adapter_forced_dtypes(tmp_path):
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    save_file(
+        {
+            "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.bfloat16),
+            "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.bfloat16),
+            "unused.weight": torch.ones(1, dtype=torch.float32),
+        },
+        reference_dir / "model.safetensors",
+    )
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+
+    class Adapter:
+        def forced_hf_dtype_mapping(self, state_dict):
+            assert set(state_dict) == {
+                "backbone.layers.0.mixer.A_log",
+                "backbone.layers.0.mixer.in_proj.weight",
+            }
+            return {
+                "backbone.layers.0.mixer.A_log": "F32",
+                "absent.weight": "F32",
+            }
+
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    model_state = SimpleNamespace(model=[SimpleNamespace(state_dict_adapter=Adapter())])
+    state_dict = {
+        "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.float32),
+        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.float32),
+    }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+        return_value=str(reference_dir),
+    ):
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
+
+    assert dtype_mapping == {
+        "backbone.layers.0.mixer.A_log": "F32",
+        "backbone.layers.0.mixer.in_proj.weight": "BF16",
+    }
+
+
+def test_original_dtype_mapping_applies_adapter_forced_dtypes_without_hf_reference(tmp_path):
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="",
+        save_consolidated=False,
+        is_peft=False,
+    )
+
+    class Adapter:
+        def forced_hf_dtype_mapping(self, state_dict):
+            assert set(state_dict) == {
+                "backbone.layers.0.mixer.A_log",
+                "backbone.layers.0.mixer.in_proj.weight",
+            }
+            return {
+                "backbone.layers.0.mixer.A_log": "F32",
+                "absent.weight": "F32",
+            }
+
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    model_state = SimpleNamespace(model=[SimpleNamespace(state_dict_adapter=Adapter())])
+    state_dict = {
+        "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.float32),
+        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.float32),
+    }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+        return_value=None,
+    ):
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
+
+    assert dtype_mapping == {"backbone.layers.0.mixer.A_log": "F32"}
+
+
+def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
+    summary = _summarize_state_dict_key_diff(
+        {"a.weight", "b.bias", "c.weight"},
+        {"a.weight", "c.weight", "extra.weight"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 1
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["b.bias"]
+    assert summary["unexpected_examples"] == ["extra.weight"]
+
+
+def test_summarize_state_dict_key_diff_limits_examples():
+    summary = _summarize_state_dict_key_diff(
+        {"a", "b", "c", "d"},
+        {"x"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 4
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["a", "b"]
+
+
+# =============================================================================
+# Tests for _get_lm_head_weight_and_name
+# =============================================================================
+
+
+class TestGetLmHeadWeightAndName:
+    """Test cases for _get_lm_head_weight_and_name name normalization."""
+
+    def test_normal_model_returns_param_and_name(self):
+        """Normal model without _orig_mod. prefix returns (param, 'lm_head.weight')."""
+        model = torch.nn.Module()
+        model.lm_head = torch.nn.Linear(4, 4, bias=False)
+
+        param, name = _get_lm_head_weight_and_name(model)
+
+        assert name == "lm_head.weight"
+        assert param is model.lm_head.weight
+
+    def test_fp8_compiled_model_strips_orig_mod_prefix(self):
+        """FP8/compiled model with _orig_mod. prefix returns stripped name."""
+        # Simulate a compiled model where parameters have _orig_mod. prefix
+        inner = torch.nn.Module()
+        inner.lm_head = torch.nn.Linear(4, 4, bias=False)
+        wrapper = torch.nn.Module()
+        wrapper._orig_mod = inner
+
+        param, name = _get_lm_head_weight_and_name(wrapper)
+
+        assert name == "lm_head.weight"
+        assert "_orig_mod" not in name
+        assert param is inner.lm_head.weight
+
+    def test_no_lm_head_returns_none(self):
+        """Model without lm_head returns (None, None)."""
+        model = torch.nn.Module()
+        model.encoder = torch.nn.Linear(4, 4)
+
+        param, name = _get_lm_head_weight_and_name(model)
+
+        assert param is None
+        assert name is None
+
+    def test_multiple_orig_mod_prefixes_all_stripped(self):
+        """Multiple _orig_mod. prefixes are all stripped by .replace()."""
+        # Create a deeply nested _orig_mod structure
+        inner = torch.nn.Module()
+        inner.lm_head = torch.nn.Linear(4, 4, bias=False)
+        mid = torch.nn.Module()
+        mid._orig_mod = inner
+        outer = torch.nn.Module()
+        outer._orig_mod = mid
+
+        param, name = _get_lm_head_weight_and_name(outer)
+
+        assert name == "lm_head.weight"
+        assert "_orig_mod" not in name
+
+
+class _PipelineLastStageLikeModel(torch.nn.Module):
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(tie_word_embeddings=True)
+        self.lm_head = torch.nn.Linear(4, 4, bias=False)
+
+
+def test_has_local_tied_lm_head_is_false_for_pp_last_stage_like_partition():
+    model = _PipelineLastStageLikeModel()
+
+    assert has_local_tied_lm_head(model) is False
+
+
+class _LocalUntiedButConfiguredModel(torch.nn.Module):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(tie_word_embeddings=True)
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = torch.nn.Embedding(4, 4)
+        self.lm_head = torch.nn.Linear(4, 4, bias=False)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+
+def test_has_local_tied_lm_head_is_false_when_config_tied_but_storage_untied():
+    model = _LocalUntiedButConfiguredModel()
+
+    assert has_local_tied_lm_head(model) is False
+
+
+def test_model_state_keeps_lm_head_when_config_tied_but_storage_untied():
+    model = _LocalUntiedButConfiguredModel()
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert "lm_head.weight" in saved_state_dict
+    assert "model.embed_tokens.weight" in saved_state_dict
+
+
+def test_model_state_drops_lm_head_when_storage_is_actually_tied():
+    model = _LocalUntiedButConfiguredModel()
+    model.lm_head.weight = model.model.embed_tokens.weight
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert has_local_tied_lm_head(model) is True
+    assert "lm_head.weight" not in saved_state_dict
+    assert "model.embed_tokens.weight" in saved_state_dict
+
+
+def test_model_state_refreshes_tied_lm_head_before_dropping_key():
+    model = _LocalUntiedButConfiguredModel()
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    assert model_state.has_local_tied_lm_head is False
+
+    def fake_get_model_state_dict(model_part, options=None):
+        model_part.lm_head.weight = model_part.model.embed_tokens.weight
+        return {
+            "lm_head.weight": model_part.lm_head.weight,
+            "model.embed_tokens.weight": model_part.model.embed_tokens.weight,
+        }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict",
+        side_effect=fake_get_model_state_dict,
+    ):
+        saved_state_dict = model_state.state_dict()
+
+    assert model_state.has_local_tied_lm_head is True
+    assert "lm_head.weight" not in saved_state_dict
+    assert "model.embed_tokens.weight" in saved_state_dict
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_model_state_passes_cpu_offload_to_dcp(cpu_offload):
+    model = torch.nn.Linear(2, 2)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict",
+        return_value={"weight": model.weight},
+    ) as get_state_dict:
+        ModelState(model, cpu_offload=cpu_offload).state_dict()
+
+    options = get_state_dict.call_args.kwargs["options"]
+    if cpu_offload:
+        assert options.cpu_offload is True
+    else:
+        assert options is None
+
+
+def test_peft_ep_model_load_checks_every_local_pipeline_part():
+    dense_part = torch.nn.Linear(2, 2)
+    expert_part = torch.nn.Module()
+    expert_part.ep_size = 8
+    model_state = ModelState([dense_part, expert_part], is_peft=True)
+
+    with (
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers._set_peft_state_dict") as set_peft_state,
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict") as set_model_state,
+    ):
+        model_state.load_state_dict({})
+
+    assert set_peft_state.call_args_list == [call(dense_part, {}), call(expert_part, {})]
+    set_model_state.assert_not_called()
+
+
+def test_peft_ep_model_load_uses_global_topology_when_local_stage_has_no_experts():
+    model_part = torch.nn.Linear(2, 2)
+    model_state = ModelState(model_part, is_peft=True, has_expert_parallelism=True)
+
+    with (
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers._set_peft_state_dict") as set_peft_state,
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict") as set_model_state,
+    ):
+        model_state.load_state_dict({})
+
+    set_peft_state.assert_called_once_with(model_part, {})
+    set_model_state.assert_not_called()
+
+
+def test_checkpointer_passes_ep_topology_to_model_state(tmp_path):
+    config = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        model_save_format="safetensors",
+        save_consolidated=False,
+        is_peft=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object())
+
+    model = torch.nn.Linear(2, 2)
+    with (
+        patch("os.path.exists", return_value=True),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.ModelState",
+            side_effect=RuntimeError("stop after constructor"),
+        ) as model_state,
+        pytest.raises(RuntimeError, match="stop after constructor"),
+    ):
+        checkpointer.load_model(model, model_path="/fake/path")
+
+    assert model_state.call_args.kwargs["has_expert_parallelism"] is True
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_optimizer_state_passes_cpu_offload_to_dcp(cpu_offload):
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_optimizer_state_dict",
+        return_value={},
+    ) as get_state_dict:
+        OptimizerState(model, optimizer, cpu_offload=cpu_offload).state_dict()
+
+    options = get_state_dict.call_args.kwargs["options"]
+    assert options.cpu_offload is cpu_offload
+    assert options.flatten_optimizer_state_dict is True
+
+
+def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():
+    model = _PipelineLastStageLikeModel()
+    embed_weight = torch.full_like(model.lm_head.weight, 3.0)
+    state_dict = {"model.language_model.embed_tokens.weight": embed_weight}
+
+    materialized = materialize_missing_tied_lm_head(state_dict, model, allow_current_lm_head_fallback=False)
+
+    assert materialized is True
+    assert "lm_head.weight" in state_dict
+    assert torch.equal(state_dict["lm_head.weight"], embed_weight)
+    assert not torch.equal(state_dict["lm_head.weight"], model.lm_head.weight.detach())
+
+
+def test_model_state_retie_lm_head_after_load_state_dict():
+    model = _LocalUntiedButConfiguredModel()
+    model.lm_head.weight = model.model.embed_tokens.weight
+    checkpoint_weight = torch.full_like(model.model.embed_tokens.weight, 5.0)
+    state_dict = {"model.embed_tokens.weight": checkpoint_weight}
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+
+    def fake_set_model_state_dict(model_part, state_dict, options):
+        model_part.model.embed_tokens.weight = torch.nn.Parameter(torch.empty_like(checkpoint_weight))
+        model_part.lm_head.weight = torch.nn.Parameter(torch.empty_like(checkpoint_weight))
+        model_part.model.embed_tokens.weight.data.copy_(state_dict["model.embed_tokens.weight"])
+        model_part.lm_head.weight.data.copy_(state_dict["lm_head.weight"])
+        assert model_part.lm_head.weight.data_ptr() != model_part.model.embed_tokens.weight.data_ptr()
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict",
+        side_effect=fake_set_model_state_dict,
+    ):
+        model_state.load_state_dict(state_dict, strict=False)
+
+    assert has_local_tied_lm_head(model) is True
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+    assert torch.equal(model.model.embed_tokens.weight, checkpoint_weight)
+
+
+def test_model_state_keeps_pp_last_stage_lm_head_in_saved_state_dict():
+    model = _PipelineLastStageLikeModel()
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert "lm_head.weight" in saved_state_dict
+
+
+# =============================================================================
+# Tests for _reinit_non_persistent_buffers
+# =============================================================================
+
+
+class TestReinitRopeBuffers:
+    """Test cases for _reinit_non_persistent_buffers RoPE buffer reinitialization."""
+
+    def test_non_deci_model_returns_early(self):
+        """Non-DeciLM model (e.g. llama) returns early without changes."""
+        model = torch.nn.Module()
+        config = MagicMock()
+        config.model_type = "llama"
+        model.config = config
+
+        # Add a rope module that should NOT be touched
+        rope = torch.nn.Module()
+        rope.inv_freq = torch.ones(4)
+        original_inv_freq = rope.inv_freq.clone()
+        model.rope = rope
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="llama")
+
+        assert torch.equal(model.rope.inv_freq, original_inv_freq)
+
+    def test_deci_model_recomputes_inv_freq(self):
+        """DeciLM model with rope modules gets inv_freq recomputed."""
+        model = torch.nn.Module()
+        config = MagicMock()
+        config.model_type = "nemotron-nas"
+        model.config = config
+
+        new_inv_freq = torch.tensor([1.0, 2.0, 3.0, 4.0])
+
+        rope = MagicMock()
+        rope.rope_init_fn = MagicMock(return_value=(new_inv_freq, None))
+        rope.inv_freq = torch.zeros(4)
+        rope.rope_kwargs = {"seq_len": 128}
+        rope.config = config
+        # Make hasattr checks work
+        rope.original_inv_freq = None
+        del rope.original_inv_freq  # Remove so hasattr returns False
+
+        # Use a real module so named_modules works
+        real_model = torch.nn.Module()
+        real_model.config = config
+        # We need to mock named_modules to return our mock rope
+        with patch.object(real_model, "named_modules", return_value=[("", real_model), ("layers.0.rotary", rope)]):
+            _reinit_non_persistent_buffers(real_model, torch.device("cpu"), model_type="nemotron-nas")
+
+        rope.rope_init_fn.assert_called_once_with(rope.config, torch.device("cpu"), seq_len=128)
+        assert rope.inv_freq is new_inv_freq
+
+    def test_deci_model_updates_original_inv_freq(self):
+        """DeciLM model with original_inv_freq gets both buffers updated."""
+        model = torch.nn.Module()
+        config = MagicMock()
+        config.model_type = "nemotron-nas"
+        model.config = config
+
+        new_inv_freq = torch.tensor([1.0, 2.0, 3.0])
+
+        rope = MagicMock()
+        rope.rope_init_fn = MagicMock(return_value=(new_inv_freq, None))
+        rope.inv_freq = torch.zeros(3)
+        rope.rope_kwargs = {}
+        rope.config = config
+        rope.original_inv_freq = torch.zeros(3)
+
+        with patch.object(model, "named_modules", return_value=[("", model), ("layers.0.rotary", rope)]):
+            _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
+
+        assert rope.inv_freq is new_inv_freq
+        # original_inv_freq should be a clone of new_inv_freq
+        assert torch.equal(rope.original_inv_freq, new_inv_freq)
+
+    def test_deci_model_without_rope_attributes_no_crash(self):
+        """DeciLM model without rope_init_fn/inv_freq/rope_kwargs gracefully skips."""
+        model = torch.nn.Module()
+        config = MagicMock()
+        config.model_type = "nemotron-nas"
+        model.config = config
+
+        # Add a module without any rope attributes
+        model.layer = torch.nn.Linear(4, 4)
+
+        # Should not raise
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
+
+    def test_no_config_returns_early(self):
+        """Model without config attribute returns early."""
+        model = torch.nn.Module()
+
+        # Should not raise — model_type=None is not in the allowlist
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type=None)
+
+    def test_rope_init_fn_failure_logs_warning(self):
+        """If rope_init_fn raises, a warning is logged and other modules continue."""
+        model = torch.nn.Module()
+        config = MagicMock()
+        config.model_type = "nemotron-nas"
+        model.config = config
+
+        rope = MagicMock()
+        rope.rope_init_fn = MagicMock(side_effect=RuntimeError("bad init"))
+        rope.inv_freq = torch.zeros(3)
+        rope.rope_kwargs = {}
+        rope.config = config
+
+        with patch.object(model, "named_modules", return_value=[("", model), ("layers.0.rotary", rope)]):
+            # Should not raise, just log a warning
+            _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
+
+    def test_embed_scale_reinitialized_from_scalar(self):
+        """ScaledWordEmbedding embed_scale buffer is recomputed from scalar_embed_scale."""
+        model = torch.nn.Module()
+        emb = torch.nn.Embedding(10, 8)
+        emb.scalar_embed_scale = 48.0
+        emb.register_buffer("embed_scale", torch.tensor(float("nan")), persistent=False)
+        model.embed_tokens = emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        assert emb.embed_scale.item() == 48.0
+
+    def test_embed_scale_without_scalar_attr_is_skipped(self):
+        """Modules without scalar_embed_scale are not touched."""
+        model = torch.nn.Module()
+        emb = torch.nn.Embedding(10, 8)
+        emb.register_buffer("embed_scale", torch.tensor(float("nan")), persistent=False)
+        model.embed_tokens = emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        # embed_scale should remain NaN because there's no scalar_embed_scale to recover from
+        assert torch.isnan(emb.embed_scale)
+
+    def test_position_ids_reinitialized_from_num_positions(self):
+        """Vision embedding position_ids buffer is recomputed from num_positions."""
+        model = torch.nn.Module()
+        vis_emb = torch.nn.Module()
+        vis_emb.num_positions = 16
+        vis_emb.register_buffer("position_ids", torch.full((1, 16), 999999, dtype=torch.long), persistent=False)
+        model.vision_embeddings = vis_emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        expected = torch.arange(16).expand((1, -1))
+        assert torch.equal(vis_emb.position_ids, expected)
+
+    def test_position_ids_without_num_positions_is_skipped(self):
+        """Modules with position_ids but no num_positions are not touched."""
+        model = torch.nn.Module()
+        vis_emb = torch.nn.Module()
+        garbage = torch.full((1, 16), 999999, dtype=torch.long)
+        vis_emb.register_buffer("position_ids", garbage.clone(), persistent=False)
+        model.vision_embeddings = vis_emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        assert torch.equal(vis_emb.position_ids, garbage)
+
+
+# =============================================================================
+# Tests for _is_custom_model
+# =============================================================================
+
+
+class TestIsCustomModel:
+    """Test cases for _is_custom_model detection of nemo_automodel custom implementations."""
+
+    def test_plain_nn_module_is_not_custom(self):
+        """Standard nn.Module is not a custom model."""
+        model = torch.nn.Module()
+        assert _is_custom_model(model) is False
+
+    def test_hf_linear_is_not_custom(self):
+        """Standard PyTorch modules are not custom models."""
+        model = torch.nn.Linear(4, 4)
+        assert _is_custom_model(model) is False
+
+    def test_module_from_custom_namespace_is_custom(self):
+        """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
+        # Simulate a custom model by patching __module__ on the class's MRO
+        FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
+        FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
+        instance = FakeCustom()
+        assert _is_custom_model(instance) is True
+
+    def test_subclass_of_custom_model_is_custom(self):
+        """A subclass of a custom model class is also detected as custom."""
+        Base = type("Base", (torch.nn.Module,), {})
+        Base.__module__ = "nemo_automodel.components.models.kimivl.model"
+        Child = type("Child", (Base,), {})
+        Child.__module__ = "some_other_module"
+        instance = Child()
+        assert _is_custom_model(instance) is True
+
+    def test_none_module_attr_does_not_crash(self):
+        """Classes where __module__ is None don't cause an error."""
+        FakeClass = type("FakeClass", (torch.nn.Module,), {})
+        FakeClass.__module__ = None
+        instance = FakeClass()
+        # Should not raise; the (c.__module__ or "") guard handles None
+        assert _is_custom_model(instance) is False
+
+    def test_similar_but_wrong_namespace_is_not_custom(self):
+        """A class in a similar but different namespace is not custom."""
+        FakeClass = type("FakeClass", (torch.nn.Module,), {})
+        FakeClass.__module__ = "nemo_automodel.components.checkpoint.checkpointing"
+        instance = FakeClass()
+        assert _is_custom_model(instance) is False
+
+
+# =============================================================================
+# Tests for _model_has_dtensors
+# =============================================================================
+
+
+class TestModelHasDtensors:
+    """Test cases for _model_has_dtensors detection of DTensor parameters."""
+
+    def test_regular_model_has_no_dtensors(self):
+        """A standard model with regular parameters returns False."""
+        model = torch.nn.Linear(4, 4)
+        assert _model_has_dtensors(model) is False
+
+    def test_empty_model_has_no_dtensors(self):
+        """A model with no parameters returns False."""
+        model = torch.nn.Module()
+        assert _model_has_dtensors(model) is False
+
+    def test_model_with_dtensor_parameter_returns_true(self):
+        """A model with a DTensor parameter returns True."""
+        model = torch.nn.Module()
+        # Create a mock DTensor-like object whose type name is "DTensor"
+        DTensorLike = type("DTensor", (), {})
+        mock_param = DTensorLike()
+        with patch.object(model, "parameters", return_value=iter([mock_param])):
+            assert _model_has_dtensors(model) is True
+
+    def test_mixed_params_with_one_dtensor_returns_true(self):
+        """If at least one parameter is DTensor, returns True."""
+        model = torch.nn.Linear(4, 4)
+        DTensorLike = type("DTensor", (), {})
+        mock_dtensor = DTensorLike()
+        regular_param = torch.nn.Parameter(torch.randn(4))
+        with patch.object(model, "parameters", return_value=iter([regular_param, mock_dtensor])):
+            assert _model_has_dtensors(model) is True
+
+    def test_all_regular_params_returns_false(self):
+        """If all parameters are regular tensors, returns False."""
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+        assert _model_has_dtensors(model) is False
+
+
+def test_load_hf_bin_checkpoint_loads_tensor_state_dict(tmp_path):
+    """Hugging Face bin checkpoints load when they contain tensor state."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    expected = {"weight": torch.arange(4)}
+    torch.save(expected, checkpoint_path)
+
+    actual = _load_hf_bin_checkpoint(str(checkpoint_path))
+
+    assert actual is not None
+    torch.testing.assert_close(actual["weight"], expected["weight"])
+
+
+def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
+    """Hugging Face bin loading rejects arbitrary pickled Python objects."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    torch.save(torch.nn.Linear(2, 2), checkpoint_path)
+
+    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
+        _load_hf_bin_checkpoint(str(checkpoint_path))
+
+
+# =============================================================================
+# Tests for load_model: DDP-wrapped state dict adapters
+# =============================================================================
+
+
+def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
+    """A DDP-wrapped encoder restores HF-format checkpoint keys through its adapter."""
+    from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(2, 2, bias=False)
+            self.state_dict_adapter = EncoderStateDictAdapter()
+
+    encoder = Encoder()
+    # DDP's checkpoint traversal only depends on the registered ``module`` child;
+    # bypass process-group setup so this key-conversion regression stays a CPU unit test.
+    ddp_model = object.__new__(DistributedDataParallel)
+    torch.nn.Module.__init__(ddp_model)
+    ddp_model.module = encoder
+
+    model_path = tmp_path / "model"
+    checkpoint_weight = torch.full_like(encoder.model.weight, 7.0)
+    dcp.save({"weight": checkpoint_weight}, checkpoint_id=str(model_path))
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    checkpointer.load_model(ddp_model, model_path=str(model_path))
+
+    torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_weight_key", "key_mapping"),
+    [
+        pytest.param("weight", None, id="matching-keys"),
+        pytest.param("checkpoint.weight", {r"^checkpoint\.weight$": "weight"}, id="mapped-key"),
+    ],
+)
+def test_single_device_standard_hf_safetensors_loads_with_dcp(tmp_path, checkpoint_weight_key, key_mapping):
+    """A real HF reader loads matching or mapped keys without materializing the full CPU checkpoint."""
+    model = torch.nn.Linear(3, 2)
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    checkpoint_bias = torch.tensor([7.0, 8.0])
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    save_file(
+        {
+            checkpoint_weight_key: checkpoint_weight,
+            "bias": checkpoint_bias,
+        },
+        model_path / "model.safetensors",
+    )
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/standard-hf",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+    ) as full_cpu_load:
+        checkpointer.load_model(model, model_path=str(model_path), is_init_step=True, key_mapping=key_mapping)
+
+    full_cpu_load.assert_not_called()
+    torch.testing.assert_close(model.weight, checkpoint_weight)
+    torch.testing.assert_close(model.bias, checkpoint_bias)
+
+
+def test_single_device_native_model_without_adapter_loads_with_dcp(tmp_path):
+    """Native models without conversion adapters load directly into model storage."""
+
+    class NativeModel(torch.nn.Linear):
+        __module__ = "nemo_automodel.components.models.test.model"
+
+    model = NativeModel(3, 2)
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    checkpoint_bias = torch.tensor([7.0, 8.0])
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    save_file({"weight": checkpoint_weight, "bias": checkpoint_bias}, model_path / "model.safetensors")
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/native",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+    ) as full_cpu_load:
+        checkpointer.load_model(model, model_path=str(model_path), is_init_step=True)
+
+    full_cpu_load.assert_not_called()
+    torch.testing.assert_close(model.weight, checkpoint_weight)
+    torch.testing.assert_close(model.bias, checkpoint_bias)
+
+
+def test_single_device_gemma4_loads_into_model_weights_without_full_copy(tmp_path):
+    """A real HF storage reader loads and scales Gemma4 experts without a materialized fallback."""
+
+    class Experts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_and_up_projs = torch.nn.Parameter(torch.zeros(2, 3, 8))
+            self.down_projs = torch.nn.Parameter(torch.zeros(2, 4, 3))
+
+    class Moe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = Experts()
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe = Moe()
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleDict({"0": Layer()})
+
+    class InnerModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = LanguageModel()
+
+    class Gemma4Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InnerModel()
+            self.state_dict_adapter = Gemma4MoEStateDictAdapter(
+                config=SimpleNamespace(),
+                moe_config=SimpleNamespace(n_routed_experts=2),
+                backend=SimpleNamespace(),
+                dtype=torch.float32,
+            )
+
+    Gemma4Model.__module__ = "nemo_automodel.components.models.gemma4_moe.model"
+    model = Gemma4Model()
+    checkpoint_gate = torch.arange(48, dtype=torch.float32).reshape(2, 8, 3)
+    checkpoint_down = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    checkpoint_scale = torch.tensor([2.0, 3.0])
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    save_file(
+        {
+            "model.language_model.layers.0.experts.gate_up_proj": checkpoint_gate,
+            "model.language_model.layers.0.experts.down_proj": checkpoint_down,
+            "model.language_model.layers.0.router.per_expert_scale": checkpoint_scale,
+        },
+        model_path / "model.safetensors",
+    )
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/gemma4",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    checkpointer.load_model(model, model_path=str(model_path), is_init_step=True)
+
+    torch.testing.assert_close(
+        model.model.language_model.layers["0"].moe.experts.gate_and_up_projs,
+        checkpoint_gate.transpose(-2, -1),
+    )
+    torch.testing.assert_close(
+        model.model.language_model.layers["0"].moe.experts.down_projs,
+        checkpoint_down.transpose(-2, -1) * checkpoint_scale[:, None, None],
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_init_step", "quantization_config", "expected_quantization"),
+    [
+        (True, {"quant_method": "fp8"}, True),
+        (True, None, False),
+        (False, {"quant_method": "fp8"}, False),
+    ],
+)
+def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
+    tmp_path, is_init_step, quantization_config, expected_quantization
+):
+    """FP8 source metadata is requested for base initialization, not training resume."""
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.config = SimpleNamespace(quantization_config=quantization_config)
+    adapter = MagicMock()
+    model_state_dict = model.state_dict()
+    adapter.to_hf.return_value = model_state_dict
+    adapter.from_hf.return_value = model_state_dict
+    model.state_dict_adapter = adapter
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=False),
+        patch.object(checkpointer, "_get_storage_reader", return_value=None),
+        patch.object(checkpointer, "_do_load", return_value=model_state_dict),
+    ):
+        checkpointer.load_model(model, model_path=str(tmp_path / "model"), is_init_step=is_init_step)
+
+    assert adapter.to_hf.call_args.kwargs["quantization"] is expected_quantization
+    assert adapter.to_hf.call_args.kwargs["for_checkpoint_load"] is True
+
+
+def test_training_checkpoint_resume_ignores_base_fp8_metadata(tmp_path):
+    """A dequantized training checkpoint resumes without source-only FP8 scale keys."""
+
+    class QuantizedSourceAdapter:
+        def to_hf(self, state_dict: dict[str, torch.Tensor], **kwargs: object) -> dict[str, torch.Tensor]:
+            """Convert model state while optionally requesting source FP8 metadata.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                **kwargs: Adapter options, including whether source quantization metadata is required.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes,
+                plus a scalar source-only activation scale when quantization is requested.
+            """
+            converted = dict(state_dict)
+            if kwargs.get("quantization", False):
+                converted["weight_activation_scale"] = torch.ones(())
+            return converted
+
+        def from_hf(
+            self,
+            state_dict: dict[str, torch.Tensor],
+            device_mesh: object | None = None,
+        ) -> dict[str, torch.Tensor]:
+            """Convert loaded state back to the native model mapping.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                device_mesh: Optional mesh describing the tensors' distributed placements.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes.
+            """
+            return {key: value for key, value in state_dict.items() if key != "weight_activation_scale"}
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.state_dict_adapter = QuantizedSourceAdapter()
+    expected_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    with torch.no_grad():
+        model.weight.copy_(expected_weight)
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_save_format="torch_save",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    checkpoint_path = tmp_path / "step_1"
+    checkpointer.save_model(model, str(checkpoint_path))
+    with torch.no_grad():
+        model.weight.zero_()
+
+    checkpointer.load_model(model, str(checkpoint_path / "model"))
+
+    torch.testing.assert_close(model.weight, expected_weight)
+
+
+# =============================================================================
+# Tests for load_model: custom model uses DCP path, not the fast safetensors path
+# =============================================================================
+
+
+class TestLoadModelCustomModelGuard:
+    """Verify base-checkpoint routing across standard and custom models.
+
+    Standard HF safetensors use DCP without adapter conversion. Under multi-rank loading,
+    custom models also use DCP so each rank slices its local DTensor shard. On one device,
+    custom adapters use DCP only when they need zero or small temporary tensors.
+    """
+
+    def _make_checkpointer(self):
+        """Create a minimally configured Checkpointer for testing."""
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    @pytest.mark.parametrize("world_size", [1, 2])
+    @pytest.mark.parametrize("dequantize_base_checkpoint", [None, True])
+    def test_standard_hf_safetensors_use_dcp(
+        self, mock_load_full, mock_load_hf, mock_is_st, world_size, dequantize_base_checkpoint
+    ):
+        """Unquantized standard HF weights load with DCP even when dequantization is permitted."""
+        checkpointer = self._make_checkpointer()
+        checkpointer.config.dequantize_base_checkpoint = dequantize_base_checkpoint
+        model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config=None)
+
+        loaded_state = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": str(world_size)}),
+            patch.object(checkpointer, "_get_storage_reader", return_value=MagicMock()),
+            patch.object(checkpointer, "_do_load", return_value=loaded_state) as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        mock_load_full.assert_not_called()
+        mock_load_hf.assert_not_called()
+        mock_dcp_load.assert_called_once()
+        torch.testing.assert_close(model.weight, loaded_state["weight"])
+        torch.testing.assert_close(model.bias, loaded_state["bias"])
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_quantized_standard_hf_model_keeps_full_state_path(self, mock_load_full, mock_load_hf, mock_is_st):
+        """A standard HF model keeps the CPU path when checkpoint dequantization is required."""
+        checkpointer = self._make_checkpointer()
+        checkpointer.config.dequantize_base_checkpoint = True
+        model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config={"quant_method": "fp8"})
+        mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        mock_load_full.assert_called_once()
+        mock_load_hf.assert_called_once()
+        mock_dcp_load.assert_not_called()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_bin_checkpoint_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_bin, mock_is_st):
+        """Non-custom (HF) models with .bin checkpoints use the fast loading path."""
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Linear(4, 4)
+
+        mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        mock_load_full.assert_called_once()
+        mock_dcp_load.assert_not_called()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_custom_model_skips_fast_path_uses_dcp(self, mock_load_full, mock_load_hf, mock_is_st):
+        """Under sharded loading, a custom model uses DCP to load its local shard."""
+        checkpointer = self._make_checkpointer()
+
+        # Create a model class in the custom namespace
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.kimivl.model"
+        model = CustomModel()
+        model.layer = torch.nn.Linear(4, 4)
+
+        # Sanity check: model is detected as custom
+        assert _is_custom_model(model) is True
+
+        mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            # Simulate multi-rank (sharded) load so the single-device fast path is not taken.
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "2"}),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda m, sd, **kw: sd,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda m, sd, **kw: sd,
+            ),
+            patch.object(checkpointer, "_do_load", return_value=mock_state_dict) as mock_dcp_load,
+            patch.object(checkpointer, "_get_storage_reader", return_value=None),
+        ):
+            mock_model_state = MockModelState.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = mock_state_dict
+
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        # Fast path should NOT be used
+        mock_load_full.assert_not_called()
+        # DCP path should be used
+        mock_dcp_load.assert_called_once()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_single_device_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st, caplog):
+        """A custom model without low-memory DCP support uses the full-state path.
+
+        The fast path applies the state_dict_adapter from_hf conversion on CPU (via
+        _maybe_adapt_state_dict_from_hf) and copies into the model, keeping device memory at
+        ~model size. Using DCP with allocating destinations could silently load into temporary
+        tensors instead of the model or transiently materialize a second on-device copy.
+        """
+        checkpointer = self._make_checkpointer()
+
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
+        model = CustomModel()
+        model.layer = torch.nn.Linear(4, 4)
+        model.state_dict_adapter = SimpleNamespace(
+            from_hf=lambda state_dict, **kwargs: state_dict,
+        )
+        assert _is_custom_model(model) is True
+
+        mock_load_hf.return_value = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
+        caplog.set_level(logging.INFO)
+
+        with (
+            patch("os.path.exists", return_value=True),
+            # Single-device (non-sharded) load.
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        # Single-device custom model takes the frugal fast path, not DCP.
+        mock_load_full.assert_called_once()
+        mock_dcp_load.assert_not_called()
+        assert "disk read" in caplog.text
+        assert "adapt" in caplog.text
+        assert "install" in caplog.text
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    @pytest.mark.parametrize(
+        ("dequantize_base_checkpoint", "quantization_config", "expect_full_cpu"),
+        [
+            (False, {"quant_method": "fp8"}, False),
+            (True, None, False),
+            (True, {"quant_method": "fp8"}, True),
+            (None, {"quant_method": "fp8"}, True),
+        ],
+    )
+    def test_single_device_low_memory_dcp_routes_by_required_dequantization(
+        self,
+        mock_load_full,
+        mock_load_hf,
+        mock_is_st,
+        caplog,
+        dequantize_base_checkpoint,
+        quantization_config,
+        expect_full_cpu,
+    ):
+        """Only an enabled conversion of quantized source weights keeps the full CPU fallback."""
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
+        model = CustomModel()
+        model.layer = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config=quantization_config)
+        model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
+        model.state_dict_adapter.supports_low_memory_dcp_load = True
+        mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
+        mock_load_hf.return_value = mock_state_dict
+
+        checkpointer = self._make_checkpointer()
+        checkpointer.config.dequantize_base_checkpoint = dequantize_base_checkpoint
+        caplog.set_level(logging.INFO)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda model_part, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda model_part, state_dict, **kwargs: state_dict,
+            ),
+            patch.object(checkpointer, "_get_storage_reader", return_value=MagicMock()),
+            patch.object(checkpointer, "_do_load", return_value=mock_state_dict) as mock_dcp_load,
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = mock_state_dict
+
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        if expect_full_cpu:
+            mock_load_full.assert_called_once()
+            mock_load_hf.assert_called_once()
+            mock_dcp_load.assert_not_called()
+        else:
+            mock_load_full.assert_not_called()
+            mock_load_hf.assert_not_called()
+            mock_dcp_load.assert_called_once()
+            assert "load_model:" in caplog.text
+
+
+class TestLoadModelCheckpointKeySubset:
+    """Test allow_checkpoint_key_subset support for torch_save exports."""
+
+    def _make_checkpointer(self):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_allow_checkpoint_key_subset_drops_missing_destination_keys(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "model.embed_vision.embedding_projection.weight": torch.zeros(2, 2),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: torch.ones_like(value) for key, value in state_dict.items()}
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(
+                model,
+                model_path="/fake/path",
+                allow_checkpoint_key_subset=True,
+            )
+
+        assert captured["requested_keys"] == {"layer.weight"}
+        assert "allow_checkpoint_key_subset=True" in caplog.text
+        assert "model.embed_vision.embedding_projection.weight" in caplog.text
+        mock_model_state.load_state_dict.assert_called_once()
+        assert set(mock_model_state.load_state_dict.call_args.args[0]) == {"layer.weight"}
+        assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is False
+
+    def test_allow_checkpoint_key_subset_raises_when_no_keys_match(self):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "other.weight": torch.zeros(2, 2),
+        }
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"unrelated.weight"})),
+            ),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            with pytest.raises(RuntimeError, match="contains none of the .* requested model keys"):
+                checkpointer.load_model(
+                    model,
+                    model_path="/fake/path",
+                    allow_checkpoint_key_subset=True,
+                )
+
+    def test_allow_checkpoint_key_subset_raises_on_keys_absent_from_model(self):
+        """A checkpoint carrying keys the built model lacks (e.g. a VLM checkpoint
+        loaded into an LLM model) must raise instead of silently dropping them."""
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {"language_model.layer.weight": torch.zeros(2, 2)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(
+                    state_dict_metadata=dict.fromkeys({"language_model.layer.weight", "vision_tower.block.weight"})
+                ),
+            ),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            with pytest.raises(RuntimeError, match="keys absent from the built model"):
+                checkpointer.load_model(
+                    model,
+                    model_path="/fake/path",
+                    allow_checkpoint_key_subset=True,
+                )
+
+    def test_allow_checkpoint_key_subset_still_warns_on_unexpected_keys(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "model.embed_vision.embedding_projection.weight": torch.zeros(2, 2),
+        }
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: {**state_dict, "stray.weight": torch.ones(1)},
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=lambda state_dict, *args, **kwargs: state_dict),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(
+                model,
+                model_path="/fake/path",
+                allow_checkpoint_key_subset=True,
+            )
+
+        assert "Checkpoint key mismatch" in caplog.text
+        assert "unexpected=1" in caplog.text
+        assert "missing=0" in caplog.text
+
+
+class TestLoadModelExtraState:
+    """Test checkpoint load compatibility for module extra-state keys."""
+
+    @pytest.mark.parametrize("model_save_format", ["safetensors", "torch_save"])
+    @pytest.mark.parametrize("tensor_metadata, initial_metadata_size", [(False, 0), (True, 0), (True, 1), (True, 2)])
+    def test_module_metadata_save_and_resume(self, tmp_path, model_save_format, tensor_metadata, initial_metadata_size):
+        """HF exports omit module metadata; native DCP preserves it, and both resume strictly."""
+
+        class ExtraStateLinear(torch.nn.Linear):
+            def __init__(self, version):
+                super().__init__(2, 2)
+                self.metadata = torch.tensor([version], dtype=torch.uint8) if tensor_metadata else {"version": version}
+
+            def get_extra_state(self):
+                return self.metadata
+
+            def set_extra_state(self, state):
+                self.metadata = state
+
+        model = ExtraStateLinear(9)
+        checkpointer = Checkpointer(
+            CheckpointingConfig(
+                enabled=True,
+                checkpoint_dir=str(tmp_path),
+                model_cache_dir=str(tmp_path / "cache"),
+                model_repo_id="test/model",
+                model_save_format=model_save_format,
+                save_consolidated=False,
+            ),
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=None,
+        )
+        checkpointer.save_model(model, str(tmp_path / "saved"))
+        resumed = ExtraStateLinear(3)
+        if tensor_metadata:
+            resumed.metadata = torch.full((initial_metadata_size,), 3, dtype=torch.uint8)
+        checkpointer.load_model(resumed, str(tmp_path / "saved/model"))
+        torch.testing.assert_close(resumed.weight, model.weight, rtol=0, atol=0)
+        torch.testing.assert_close(resumed.bias, model.bias, rtol=0, atol=0)
+        expected_version = 3 if model_save_format == "safetensors" else 9
+        if tensor_metadata:
+            expected_size = initial_metadata_size if model_save_format == "safetensors" else 1
+            torch.testing.assert_close(
+                resumed.metadata, torch.full((expected_size,), expected_version, dtype=torch.uint8), rtol=0, atol=0
+            )
+        else:
+            assert resumed.metadata == {"version": expected_version}
+
+    def _make_checkpointer(self):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_missing_extra_state_keys_are_dropped_before_dcp_load(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "layer._extra_state": torch.empty(0),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: value.clone() for key, value in state_dict.items()}
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(model, model_path="/fake/path")
+
+        assert captured["requested_keys"] == {"layer.weight"}
+        assert "module _extra_state keys" in caplog.text
+        mock_model_state.load_state_dict.assert_called_once()
+
+
+# =============================================================================
+# Tests for Checkpointer.initialize_model_weights
+# =============================================================================
+
+
+class TestInitializeModelWeights:
+    """Test cases for Checkpointer.initialize_model_weights static method."""
+
+    def _make_meta_model(self):
+        """Create a simple model on meta device with an _is_hf_initialized flag."""
+        with torch.device("meta"):
+            model = torch.nn.Linear(4, 4)
+        model._is_hf_initialized = True
+        model.config = SimpleNamespace(architectures=["TestModel"])
+        return model
+
+    def test_materializes_parameters_to_device(self):
+        """Parameters should move from meta device to the target device."""
+        model = self._make_meta_model()
+        assert model.weight.device.type == "meta"
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.weight.device.type == "cpu"
+        assert model.bias.device.type == "cpu"
+
+    def test_materializes_meta_buffers(self):
+        """Meta-device buffers should be materialized to the target device."""
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(architectures=["TestModel"])
+        model.register_buffer("buf", torch.empty(3, device="meta"))
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.buf.device.type == "cpu"
+
+    def test_resets_is_hf_initialized(self):
+        """_is_hf_initialized should be set to False on all submodules."""
+        model = self._make_meta_model()
+        assert model._is_hf_initialized is True
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        for _, module in model.named_modules():
+            if hasattr(module, "_is_hf_initialized"):
+                assert module._is_hf_initialized is False
+
+    def test_calls_initialize_weights(self):
+        """model.initialize_weights() should be called when available."""
+        model = self._make_meta_model()
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_retie_weights_after_meta_initialization(self):
+        """Tied embeddings should be re-applied after materializing and initializing meta params."""
+
+        class FakeTiedModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                with torch.device("meta"):
+                    self.model = torch.nn.Module()
+                    self.model.embed_tokens = torch.nn.Embedding(4, 4)
+                    self.lm_head = torch.nn.Linear(4, 4, bias=False)
+                self.config = SimpleNamespace(architectures=["FakeTiedModel"], tie_word_embeddings=True)
+                self.tie_weights_called = False
+
+            def get_input_embeddings(self):
+                return self.model.embed_tokens
+
+            def tie_weights(self):
+                self.lm_head.weight = self.model.embed_tokens.weight
+                self.tie_weights_called = True
+
+            def initialize_weights(self):
+                with torch.no_grad():
+                    self.model.embed_tokens.weight.fill_(1.0)
+                    self.lm_head.weight.fill_(2.0)
+
+        model = FakeTiedModel()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.tie_weights_called is True
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+        assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+        assert torch.all(model.lm_head.weight == 1.0)
+
+    def test_warns_when_no_initialize_weights_method(self):
+        """Should log a warning when model lacks initialize_weights."""
+        model = self._make_meta_model()
+        assert not hasattr(model, "initialize_weights")
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.logging") as mock_logging:
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+            mock_logging.warning.assert_called_once()
+
+    def test_skips_for_nemotron_v2_hf_remote_code(self):
+        """HF remote-code dense NemotronH (has .backbone, no n_routed_experts) skips init.
+
+        Its _init_weights uses DTensor-unsafe ops, so the loaded weights are left as-is.
+        """
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+        model.backbone = torch.nn.Module()  # marks the HF remote-code path
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
+
+    def test_does_not_skip_for_custom_dense_nemotron(self):
+        """Custom dense NemotronH (no .backbone, no n_routed_experts) runs its own init.
+
+        Regression guard for #2004: the custom dense path uses model.model with its own
+        initialize_weights, so unlike the HF remote-code path it must NOT be skipped.
+        """
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_does_not_skip_for_nemotron_v3_moe(self):
+        """NemotronHForCausalLM v3 (with n_routed_experts) should NOT be skipped."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"], n_routed_experts=8)
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "architecture",
+        ["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"],
+        ids=["causal_lm", "conditional_generation"],
+    )
+    def test_skips_for_gemma3(self, architecture):
+        """Gemma3 models should skip init — _init_weights zeros embedding padding_idx which fails with DTensors."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=[architecture])
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
+
+    def test_handles_missing_config_gracefully(self):
+        """Model without config.architectures should not raise."""
+        with torch.device("meta"):
+            model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace()
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_peft_init_method_calls_init_peft_adapters(self):
+        """When peft_init_method is provided, _init_peft_adapters should be called."""
+        model = self._make_meta_model()
+        model.initialize_weights = MagicMock()
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing._init_peft_adapters") as mock_init_peft:
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"), peft_init_method="xavier")
+
+        mock_init_peft.assert_called_once_with(model, "xavier")
+
+    def test_peft_init_method_none_skips_init_peft_adapters(self):
+        """When peft_init_method is None (default), _init_peft_adapters should NOT be called."""
+        model = self._make_meta_model()
+        model.initialize_weights = MagicMock()
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing._init_peft_adapters") as mock_init_peft:
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        mock_init_peft.assert_not_called()
+
+    def test_load_base_model_does_not_accept_peft_init_method(self):
+        """load_base_model should not accept peft_init_method as a parameter."""
+        import inspect
+
+        sig = inspect.signature(Checkpointer.load_base_model)
+        assert "peft_init_method" not in sig.parameters
+
+
+class TestLmHeadWeightTying:
+    """Tests that load_base_model calls tie_weights for tied models."""
+
+    def test_tie_weights_called_when_tied(self):
+        """load_base_model should call model.tie_weights() when tie_word_embeddings=True."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=True)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.lm_head.weight = self.embed_tokens.weight
+                self.tie_weights_called = True
+
+        model = FakeModel()
+        assert model.lm_head.weight.data_ptr() != model.embed_tokens.weight.data_ptr()
+
+        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert model.tie_weights_called
+        assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
+
+    def test_tie_weights_skipped_when_not_tied(self):
+        """load_base_model should skip tie_weights when tie_word_embeddings=False."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=False)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.tie_weights_called = True
+
+        model = FakeModel()
+
+        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert not model.tie_weights_called
+
+
+# =============================================================================
+# Tests for Checkpointer.save_model — diffusers_compatible rename (all-ranks path)
+# =============================================================================
+
+
+class TestCheckpointerSaveModelDiffusersRename:
+    """Tests that save_model() renames the index on the all-ranks consolidation path."""
+
+    def _make_checkpointer(self, tmp_path, diffusers_compatible):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=True,
+            is_peft=False,
+            diffusers_compatible=diffusers_compatible,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+        # Mock internals to isolate the consolidation + rename logic
+        checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"w": 1})
+        checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
+        checkpointer._do_save = MagicMock(return_value=None)
+        checkpointer._addons = []
+        return checkpointer
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch(
+        "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+        side_effect=lambda *a, **kw: a[1],
+    )
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_renames_index_on_all_ranks_path(self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=True)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        mock_consolidate.assert_called_once()
+        assert not (consolidated_dir / "model.safetensors.index.json").exists()
+        assert (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch(
+        "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+        side_effect=lambda *a, **kw: a[1],
+    )
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_preserves_index_when_not_diffusers_compatible(
+        self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
+    ):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=False)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        assert (consolidated_dir / "model.safetensors.index.json").exists()
+        assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+
+class TestOfflineConsolidationScriptAndWarnings:
+    """Focused tests for offline consolidation helper generation and warnings."""
+
+    def _make_checkpointer(
+        self,
+        tmp_path,
+        save_consolidated=False,
+        diffusers_compatible=False,
+        model_save_format="safetensors",
+    ):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format=model_save_format,
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=save_consolidated,
+            diffusers_compatible=diffusers_compatible,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_writes_conservative_consolidate_script(self, tmp_path, caplog):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+        caplog.set_level(logging.DEBUG)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        script_path = model_dir / "consolidate.sh"
+        script = script_path.read_text()
+        assert script_path.exists()
+        assert os.access(script_path, os.X_OK)
+        assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-1}"' in script
+        assert 'NUM_THREADS="${NUM_THREADS:-5}"' in script
+        assert 'CAST_DTYPE="${CAST_DTYPE:-}"' in script
+        assert 'PYTHON="${PYTHON:-python3}"' in script
+        assert 'CONSOLIDATION_TOOL="${CONSOLIDATION_TOOL:-tools/offline_hf_consolidation.py}"' in script
+        assert "PYTHON_MODULE" not in script
+        assert 'NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"' in script
+        assert "NPROC_PER_NODE * NUM_THREADS within your CPU allocation" in script
+        assert "sbatch --cpus-per-task=80" in script
+        assert "CAST_DTYPE=bf16" in script
+        assert 'CAST_DTYPE_ARGS=(--cast-dtype "${CAST_DTYPE}")' in script
+        assert '"${TORCHRUN}" --nproc-per-node="${NPROC_PER_NODE}" "${CONSOLIDATION_TOOL}" \\' in script
+        assert '"${PYTHON}" "${CONSOLIDATION_TOOL}" \\' in script
+        assert "Run from the AutoModel repo root or set CONSOLIDATION_TOOL=" in script
+        assert "--backend gloo \\" in script
+        assert '--model-name "test/model" \\' in script
+        assert f'--input-dir "{model_dir}" \\' in script
+        assert f'--output-dir "{model_dir / "consolidated"}"' in script
+        assert "--diffusers-compatible" not in script
+        assert f"Wrote offline HF safetensors consolidation helper script to {script_path}." in caplog.text
+
+    def test_writes_diffusers_compatible_consolidate_script(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False, diffusers_compatible=True)
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        script = (model_dir / "consolidate.sh").read_text()
+        assert f'--output-dir "{model_dir / "consolidated"}" \\' in script
+        assert "--diffusers-compatible" in script
+
+    def test_writes_script_when_inline_consolidation_is_enabled(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        assert (model_dir / "consolidate.sh").exists()
+
+    def test_final_consolidation_mode_writes_script_for_non_final_checkpoints(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        assert (model_dir / "consolidate.sh").exists()
+
+    def test_final_consolidation_mode_writes_script_for_final_checkpoint(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
+        model_dir = tmp_path / "epoch_0_step_9" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        assert (model_dir / "consolidate.sh").exists()
+
+    def test_final_checkpoint_logs_helper_hint_for_sharded_only_export(self, tmp_path, caplog):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)
+        model_dir = tmp_path / "epoch_0_step_9" / "model"
+        model_dir.mkdir(parents=True)
+        caplog.set_level(logging.INFO)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+        checkpointer._maybe_log_final_offline_consolidation_hint(str(model_dir), is_final_checkpoint=True)
+
+        assert "Final checkpoint was saved with checkpoint.save_consolidated=false" in caplog.text
+        assert f"run bash {model_dir / 'consolidate.sh'}" in caplog.text
+
+    def test_inline_consolidation_preserves_hf_metadata_for_offline_helper(self, tmp_path):
+        hf_metadata_dir = tmp_path / "model" / ".hf_metadata"
+        consolidated_dir = tmp_path / "model" / "consolidated"
+        tokenizer_dir = hf_metadata_dir / "tokenizer"
+        hf_metadata_dir.mkdir(parents=True)
+        consolidated_dir.mkdir(parents=True)
+        tokenizer_dir.mkdir()
+        (hf_metadata_dir / "config.json").write_text("{}")
+        (hf_metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME).write_text('{"w": 1}')
+        (hf_metadata_dir / FQN_TO_DTYPE_MAPPING_FILENAME).write_text('{"w": "BF16"}')
+        (tokenizer_dir / "tokenizer.json").write_text("{}")
+
+        with patch("torch.distributed.is_initialized", return_value=False):
+            ConsolidatedHFAddon().post_save(
+                consolidated_path=str(consolidated_dir),
+                hf_metadata_path=str(hf_metadata_dir),
+            )
+
+        assert (hf_metadata_dir / "config.json").exists()
+        assert (hf_metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME).exists()
+        assert (hf_metadata_dir / FQN_TO_DTYPE_MAPPING_FILENAME).exists()
+        assert (tokenizer_dir / "tokenizer.json").exists()
+        assert (consolidated_dir / "config.json").exists()
+        assert (consolidated_dir / "tokenizer" / "tokenizer.json").exists()
+        assert not (consolidated_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME).exists()
+        assert not (consolidated_dir / FQN_TO_DTYPE_MAPPING_FILENAME).exists()
+
+    def test_consolidated_metadata_hooks_use_process_group(self):
+        process_group = MagicMock()
+        model_state = SimpleNamespace(model=[MagicMock()])
+        addon = ConsolidatedHFAddon()
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1) as get_rank,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            addon.pre_save(
+                model_state=model_state,
+                hf_metadata_dir="unused",
+                fqn_to_file_index_mapping={},
+                original_model_path="unused",
+                process_group=process_group,
+            )
+            addon.post_save(
+                consolidated_path="unused",
+                hf_metadata_path="unused",
+                process_group=process_group,
+            )
+
+        assert get_rank.call_args_list == [call(group=process_group), call(group=process_group)]
+        assert barrier.call_args_list == [call(group=process_group), call(group=process_group)]
+
+    def test_save_consolidated_normalizes_legacy_bools(self, tmp_path):
+        assert self._make_checkpointer(tmp_path, save_consolidated=True).config.save_consolidated is (
+            SaveConsolidatedMode.EVERY
+        )
+        assert self._make_checkpointer(tmp_path, save_consolidated=False).config.save_consolidated is (
+            SaveConsolidatedMode.FALSE
+        )
+
+    def test_final_consolidation_only_exports_on_final_checkpoint(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
+
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=False) is False
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=True) is True
+
+    def test_torch_save_warns_that_save_consolidated_is_ignored(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING)
+
+        self._make_checkpointer(tmp_path, save_consolidated="final", model_save_format="torch_save")
+
+        assert "checkpoint.save_consolidated=final is ignored when checkpoint.model_save_format=torch_save" in (
+            caplog.text
+        )
+        assert "scripts/export_llm_dcp_to_hf.py" in caplog.text
+        # The v4_compatible advice concerns consolidated output, which was just
+        # declared ignored; it must not fire for non-safetensors formats.
+        assert "v4_compatible" not in caplog.text
+
+    def test_torch_save_never_writes_consolidated_safetensors(self, tmp_path):
+        checkpointer = self._make_checkpointer(
+            tmp_path,
+            save_consolidated="final",
+            model_save_format="torch_save",
+        )
+
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=False) is False
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=True) is False
+
+    def test_setup_warns_for_inline_consolidation(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        caplog.set_level(logging.WARNING)
+
+        self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        assert "checkpoint.save_consolidated=every exports HuggingFace safetensors during every checkpoint save" in (
+            caplog.text
+        )
+        assert "world_size" not in caplog.text
+        assert "can leave GPUs idle during consolidation and filesystem writes" in caplog.text
+        assert "Recommended: checkpoint.save_consolidated=final" in caplog.text
+        assert "bash <checkpoint>/model/consolidate.sh" in caplog.text
+
+    def test_save_time_warns_for_large_inline_consolidation(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+        caplog.clear()
+        caplog.set_level(logging.WARNING)
+
+        class FakeLargeTensor:
+            def numel(self):
+                return 50 * 1024**3 // 2
+
+            def element_size(self):
+                return 2
+
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": FakeLargeTensor()}, {"w": 1})
+
+        assert "may be exporting a large HF checkpoint" in caplog.text
+        assert "this rank's local estimate is ~50.0 GiB" in caplog.text
+        assert "full size may differ under distributed parallelism" in caplog.text
+        assert "1 output file, world_size=256" in caplog.text
+        assert "~50.0 GiB" in caplog.text
+        assert "save_consolidated=final" in caplog.text
+        assert "bash <checkpoint>/model/consolidate.sh" in caplog.text
+
+    def test_save_time_uses_hf_index_size_before_distributed_fallback(self, tmp_path, caplog):
+        cache_dir = tmp_path / "cache"
+        model_dir = cache_dir / "models--test--model" / "snapshots" / "abc123"
+        model_dir.mkdir(parents=True)
+        with open(model_dir / "model.safetensors.index.json", "w") as f:
+            json.dump({"metadata": {"total_size": 64 * 1024**3}, "weight_map": {}}, f)
+
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+        checkpointer.config.model_cache_dir = str(cache_dir)
+        checkpointer.config.model_repo_id = "test/model"
+        caplog.clear()
+        caplog.set_level(logging.WARNING)
+
+        class FakeSmallLocalTensor:
+            def numel(self):
+                return 1024
+
+            def element_size(self):
+                return 2
+
+        with (
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_world_size", return_value=64),
+            patch("torch.distributed.all_reduce") as mock_all_reduce,
+        ):
+            _warn_if_large_inline_consolidation(checkpointer.config, {"w": FakeSmallLocalTensor()}, {"w": 1})
+
+        mock_all_reduce.assert_not_called()
+        assert "checkpoint.save_consolidated=every is exporting ~64.0 GiB of HF safetensors" in caplog.text
+        assert "size from HF index" in caplog.text
+        assert "1 output file, world_size=64" in caplog.text
+        assert "~64.0 GiB" in caplog.text
+
+    def test_non_rank_0_skips_size_estimation_entirely(self, tmp_path, monkeypatch):
+        """Only rank 0 logs, so no other rank should pay for the estimate.
+
+        Both helpers are local (a file read and a state-dict walk), so every
+        rank was opening the same HF index on shared storage and walking its
+        state dict on every save, only for all but one to discard the result.
+        """
+        import nemo_automodel.components.checkpoint.checkpointing as ckpt_mod
+
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        calls = {"index": 0, "walk": 0}
+
+        def _count_index(_config):
+            calls["index"] += 1
+            return None
+
+        def _count_walk(_state_dict):
+            calls["walk"] += 1
+            return 0
+
+        monkeypatch.setattr(ckpt_mod, "is_rank_0", lambda: False)
+        monkeypatch.setattr(ckpt_mod, "_get_original_hf_index_total_size", _count_index)
+        monkeypatch.setattr(ckpt_mod, "estimate_state_dict_bytes", _count_walk)
+
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": object()}, {"w": 1})
+
+        assert calls == {"index": 0, "walk": 0}
+
+    def test_rank_0_still_estimates(self, tmp_path, monkeypatch):
+        """The guard must not silence the warning on the rank that emits it."""
+        import nemo_automodel.components.checkpoint.checkpointing as ckpt_mod
+
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        calls = {"index": 0}
+
+        def _count_index(_config):
+            calls["index"] += 1
+            return 64 * 1024**3
+
+        monkeypatch.setattr(ckpt_mod, "is_rank_0", lambda: True)
+        monkeypatch.setattr(ckpt_mod, "_get_original_hf_index_total_size", _count_index)
+
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": object()}, {"w": 1})
+
+        assert calls["index"] == 1
+
+
+class TestOfflineHFConsolidationTool:
+    """Focused tests for the root offline consolidation tool."""
+
+    def test_main_renames_index_when_diffusers_compatible(self, tmp_path, monkeypatch, caplog):
+        from tools import offline_hf_consolidation as tool
+
+        input_dir = tmp_path / "model"
+        metadata_dir = input_dir / ".hf_metadata"
+        output_dir = input_dir / "consolidated"
+        metadata_dir.mkdir(parents=True)
+        with open(metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME, "w") as f:
+            json.dump({"w": 1}, f)
+        with open(metadata_dir / FQN_TO_DTYPE_MAPPING_FILENAME, "w") as f:
+            json.dump({"w": "BF16"}, f)
+        metadata_file = metadata_dir / "config.json"
+        metadata_file.write_text("{}")
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "offline_hf_consolidation",
+                "--backend",
+                "gloo",
+                "--model-name",
+                "test/model",
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--diffusers-compatible",
+            ],
+        )
+        caplog.set_level(logging.INFO)
+
+        with (
+            patch.object(tool, "initialize_distributed"),
+            patch.object(tool, "get_world_size_safe", return_value=1),
+            patch.object(tool, "get_rank_safe", return_value=0),
+            patch.object(tool, "consolidate_safetensors_files_on_every_rank") as mock_consolidate,
+            patch.object(tool, "_maybe_rename_index_for_diffusers") as mock_rename,
+        ):
+            tool.main()
+
+        mock_consolidate.assert_called_once_with(
+            str(input_dir),
+            str(output_dir),
+            {"w": 1},
+            num_threads=5,
+            cast_dtype=None,
+            fqn_to_dtype_mapping={"w": "BF16"},
+        )
+        mock_rename.assert_called_once_with(str(output_dir))
+        assert metadata_dir.exists()
+        assert metadata_file.exists()
+        assert (output_dir / "config.json").exists()
+        assert not (output_dir / FQN_TO_DTYPE_MAPPING_FILENAME).exists()
+        assert f"Consolidating sharded HF safetensors from {input_dir} to {output_dir}." not in caplog.text
+        assert f"Successfully exported consolidated HF safetensors to {output_dir}." in caplog.text
+
+    def test_main_skips_when_output_exists_and_metadata_was_consumed(self, tmp_path, monkeypatch, caplog):
+        from tools import offline_hf_consolidation as tool
+
+        input_dir = tmp_path / "model"
+        output_dir = input_dir / "consolidated"
+        input_dir.mkdir(parents=True)
+        output_dir.mkdir()
+        (output_dir / "model-00001-of-00001.safetensors").write_bytes(b"")
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "offline_hf_consolidation",
+                "--backend",
+                "gloo",
+                "--model-name",
+                "test/model",
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+        caplog.set_level(logging.INFO)
+
+        with (
+            patch.object(tool, "initialize_distributed"),
+            patch.object(tool, "get_world_size_safe", return_value=1),
+            patch.object(tool, "get_rank_safe", return_value=0),
+            patch.object(tool, "consolidate_safetensors_files_on_every_rank") as mock_consolidate,
+        ):
+            tool.main()
+
+        mock_consolidate.assert_not_called()
+        assert f"Consolidated HF safetensors already exist at {output_dir}" in caplog.text
+
+    def test_main_passes_cast_dtype_and_updates_config(self, tmp_path, monkeypatch, caplog):
+        from tools import offline_hf_consolidation as tool
+
+        input_dir = tmp_path / "model"
+        metadata_dir = input_dir / ".hf_metadata"
+        output_dir = input_dir / "consolidated"
+        metadata_dir.mkdir(parents=True)
+        with open(metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME, "w") as f:
+            json.dump({"w": 1}, f)
+        with open(metadata_dir / "config.json", "w") as f:
+            json.dump({"torch_dtype": "float32"}, f)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "offline_hf_consolidation",
+                "--backend",
+                "gloo",
+                "--model-name",
+                "test/model",
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--cast-dtype",
+                "bf16",
+            ],
+        )
+        caplog.set_level(logging.INFO)
+
+        with (
+            patch.object(tool, "initialize_distributed"),
+            patch.object(tool, "get_world_size_safe", return_value=1),
+            patch.object(tool, "get_rank_safe", return_value=0),
+            patch.object(tool, "consolidate_safetensors_files_on_every_rank") as mock_consolidate,
+        ):
+            tool.main()
+
+        mock_consolidate.assert_called_once_with(
+            str(input_dir),
+            str(output_dir),
+            {"w": 1},
+            num_threads=5,
+            cast_dtype=torch.bfloat16,
+            fqn_to_dtype_mapping=None,
+        )
+        with open(output_dir / "config.json", "r") as f:
+            assert json.load(f)["torch_dtype"] == "bfloat16"
+        assert "Casting floating-point tensors" not in caplog.text
+
+
+# =============================================================================
+# Tests for _get_storage_reader: is_init_step uses backport, not upstream HF reader
+# =============================================================================
+
+
+class TestGetStorageReaderInitStep:
+    """``_get_storage_reader`` must prefer the in-tree backport when ``is_init_step=True``.
+
+    The upstream ``HuggingFaceStorageReader`` (in ``torch.distributed.checkpoint.hf_storage``)
+    delegates dtype decoding to ``safetensors.torch._TYPES``, which does not
+    yet recognise the FP8 scale dtypes (``F8_E5M2``/``F8_E8M0``) emitted by
+    quantised HF checkpoints such as DSV4.  For base-model HF loads
+    (``is_init_step=True``) we must therefore use the in-tree backport whose
+    ``DTYPE_MAP`` was extended for those dtypes.  Mid-training DCP loads
+    (``is_init_step=False`` and no key remap) may still use the faster upstream
+    reader.
+    """
+
+    def _make_checkpointer(self):
+        from nemo_automodel.components.checkpoint.checkpointing import (
+            Checkpointer,
+            CheckpointingConfig,
+        )
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_init_step_returns_backport_reader_not_upstream(self):
+        """is_init_step=True with no key_mapping should still go through the in-tree backport."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=True)
+
+        # Upstream reader must NOT be constructed for init-step base-model loads
+        upstream_marker.assert_not_called()
+        # Backport reader must be constructed instead
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=None)
+        assert reader is backport_marker.return_value
+
+    def test_non_init_step_no_keymap_uses_upstream(self):
+        """For mid-training safetensors loads (is_init_step=False, no key_mapping),
+        the faster upstream reader is preferred."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint",
+                return_value=True,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=False)
+
+        upstream_marker.assert_called_once_with(path="/fake/path")
+        backport_marker.assert_not_called()
+        assert reader is upstream_marker.return_value
+
+    def test_non_init_step_non_safetensors_dir_returns_none(self):
+        """A safetensors-configured checkpointer pointed at a torch_save DCP directory
+        must fall back to the default DCP FileSystemReader (None), not the HF reader,
+        which would return empty metadata for such a directory."""
+        checkpointer = self._make_checkpointer()
+
+        with patch(
+            "nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint",
+            return_value=False,
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=False)
+
+        assert reader is None
+
+    def test_keymap_always_uses_backport(self):
+        """When a key_mapping is supplied, the backport reader is always used (regardless of is_init_step)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint",
+                return_value=True,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=False)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value
+
+    def test_init_step_with_keymap_uses_backport(self):
+        """is_init_step=True + key_mapping must also use the backport (only one path remains)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=True)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value
+
+
+# Tests for the _skip_init_weights_on_load gate (Mistral3 FP8 VLM PR)
+# =============================================================================
+
+
+class TestSkipInitWeightsOnLoadGate:
+    """The Checkpointer.initialize_model_weights gate that lets a model opt
+    out of HF's initialize_weights() via a class attribute.
+
+    Without this gate, Mistral3FP8VLMForConditionalGeneration's PP load
+    deadlocks on stage-divergent DTensor collectives inside HF's init.
+    """
+
+    def _make_meta_model(self):
+        with torch.device("meta"):
+            model = torch.nn.Linear(4, 4)
+        model._is_hf_initialized = True
+        model.config = SimpleNamespace(architectures=["TestModel"])
+        return model
+
+    def test_skip_when_attr_true(self):
+        """A model with _skip_init_weights_on_load=True takes the skip branch."""
+        model = self._make_meta_model()
+        model._skip_init_weights_on_load = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        # And the _is_hf_initialized flag is left alone (not reset to False).
+        assert model._is_hf_initialized is True
+
+    def test_does_not_skip_when_attr_false(self):
+        """attr=False (or attr-missing default) does NOT take the skip branch."""
+        model = self._make_meta_model()
+        model._skip_init_weights_on_load = False
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_does_not_skip_when_attr_missing(self):
+        """No attr at all → default behavior (initialize_weights runs)."""
+        model = self._make_meta_model()
+        assert not hasattr(model, "_skip_init_weights_on_load")
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+
+class TestConsolidatedIndexUnderPP:
+    """Global consolidated-index construction under pipeline parallelism."""
+
+    def _make_checkpointer(self, tmp_path):
+        # empty_cache is created but contains no HF snapshot directory, so
+        # _get_hf_safetensors_reference_path returns None.
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "empty_cache"),
+            model_repo_id="fake/repo-without-index",
+            save_consolidated=True,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+        return checkpointer
+
+    @staticmethod
+    def _fake_model_state(pre_shard_hf_state_dict_keys=None):
+        """ModelState-like stub used by _maybe_build_consolidated_index."""
+        if pre_shard_hf_state_dict_keys is None:
+            model = SimpleNamespace(config=SimpleNamespace(model_type="nemotron_h"))
+        else:
+            model = MagicMock(spec=torch.nn.Module)
+            model.config = SimpleNamespace(model_type="nemotron_h")
+            model._pre_shard_hf_state_dict_keys = list(pre_shard_hf_state_dict_keys)
+        return SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+
+    @pytest.mark.run_only_on("CPU")
+    def test_falls_back_to_local_state_dict_when_pre_shard_keys_missing(self, tmp_path):
+        """No HF index AND no _pre_shard_hf_state_dict_keys → legacy local-keys fallback."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        os.makedirs(checkpointer.config.model_cache_dir, exist_ok=True)
+
+        rank_state_dict = {
+            "backbone.embeddings.weight": torch.empty(0),
+            "backbone.layers.0.mixer.qkv_proj.weight": torch.empty(0),
+        }
+        model_state = self._fake_model_state(pre_shard_hf_state_dict_keys=None)
+
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, rank_state_dict)
+
+        assert mapping == {k: 1 for k in rank_state_dict.keys()}
+
+    @pytest.mark.run_only_on("CPU")
+    def test_global_pre_shard_keys_yield_consistent_mapping_across_pp_ranks(self, tmp_path):
+        """Disjoint per-rank PP state dicts but the same global pre-shard key set →
+        every rank produces the identical mapping covering every FQN.
+        """
+        checkpointer = self._make_checkpointer(tmp_path)
+        os.makedirs(checkpointer.config.model_cache_dir, exist_ok=True)
+
+        global_pre_shard_keys = sorted(
+            [
+                "backbone.embeddings.weight",
+                *[f"backbone.layers.{i}.mixer.qkv_proj.weight" for i in range(52)],
+                "backbone.norm_f.weight",
+                "lm_head.weight",
+            ]
+        )
+
+        # Per-rank disjoint state_dicts (PP slicing).
+        world_size = 8
+        layer_chunks = [list(range(i * 7, (i + 1) * 7)) for i in range(world_size - 1)]
+        layer_chunks.append(list(range(7 * (world_size - 1), 52)))
+        per_rank_state_dicts: list[dict[str, torch.Tensor]] = []
+        for r in range(world_size):
+            sd: dict[str, torch.Tensor] = {}
+            if r == 0:
+                sd["backbone.embeddings.weight"] = torch.empty(0)
+            for layer_idx in layer_chunks[r]:
+                sd[f"backbone.layers.{layer_idx}.mixer.qkv_proj.weight"] = torch.empty(0)
+            if r == world_size - 1:
+                sd["backbone.norm_f.weight"] = torch.empty(0)
+                sd["lm_head.weight"] = torch.empty(0)
+            per_rank_state_dicts.append(sd)
+
+        # Every rank produces the SAME mapping (and it covers every global FQN).
+        per_rank_mappings = []
+        for sd in per_rank_state_dicts:
+            mapping = checkpointer._maybe_build_consolidated_index(self._fake_model_state(global_pre_shard_keys), sd)
+            per_rank_mappings.append(mapping)
+
+        first = per_rank_mappings[0]
+        assert sorted(first.keys()) == global_pre_shard_keys
+        assert set(first.values()) == {1}
+        assert "backbone.norm_f.weight" in first  # every rank sees rank-7's norm_f
+        for r, m in enumerate(per_rank_mappings[1:], start=1):
+            assert sorted(m.keys()) == global_pre_shard_keys, f"rank {r} mapping diverges"
+            assert set(m.values()) == {1}
+
+        # Round-robin: any rank consolidating idx 1 covers every global FQN.
+        consolidated_keys: set[str] = set()
+        for r, mapping in enumerate(per_rank_mappings):
+            indices_for_this_rank = {idx for idx in set(mapping.values()) if idx % world_size == r}
+            for fqn, idx in mapping.items():
+                if idx in indices_for_this_rank:
+                    consolidated_keys.add(fqn)
+        assert consolidated_keys == set(global_pre_shard_keys)
+
+    @pytest.mark.run_only_on("CPU")
+    def test_source_index_adds_adapter_created_keys_from_global_pre_shard_state(self, tmp_path):
+        """Every PP rank maps adapter-created keys that are absent from the source index."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {
+            "language_model.model.embed_tokens.weight": 1,
+            "language_model.model.layers.15.mlp.gate.weight": 2,
+        }
+        injected_bias = "language_model.model.layers.15.mlp.gate.e_score_correction_bias"
+        global_pre_shard_keys = [*source_mapping, injected_bias]
+        per_rank_state_dicts = [
+            {"language_model.model.embed_tokens.weight": torch.empty(0)},
+            {
+                "language_model.model.layers.15.mlp.gate.weight": torch.empty(0),
+                injected_bias: torch.empty(0),
+            },
+        ]
+        model_state = self._fake_model_state(global_pre_shard_keys)
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                side_effect=lambda *_args, **_kwargs: dict(source_mapping),
+            ),
+        ):
+            per_rank_mappings = [
+                checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+                for state_dict in per_rank_state_dicts
+            ]
+
+        expected_mapping = {**source_mapping, injected_bias: 2}
+        assert per_rank_mappings == [expected_mapping, expected_mapping]
+
+    @pytest.mark.run_only_on("CPU")
+    def test_source_index_preserves_key_registered_after_parallelization(self, tmp_path):
+        """The live state dict supplements global keys for parameters registered after setup."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {"model.embed_tokens.weight": 1}
+        model_state = self._fake_model_state(list(source_mapping))
+        state_dict = {
+            "model.embed_tokens.weight": torch.empty(0),
+            "model.scalar_weight": torch.tensor(3.14159),
+        }
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=dict(source_mapping),
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+        assert mapping == {**source_mapping, "model.scalar_weight": 1}
+
+    @pytest.mark.run_only_on("CPU")
+    def test_global_pre_shard_state_does_not_readd_excluded_tied_lm_head(self, tmp_path):
+        """A global key list must not undo the local tied-weight alias exclusion."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {
+            "model.embed_tokens.weight": 1,
+            "lm_head.weight": 1,
+        }
+        model_state = self._fake_model_state(list(source_mapping))
+        model_state.has_local_tied_lm_head = True
+        model_state.lm_head_param_name = "lm_head.weight"
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=dict(source_mapping),
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(
+                model_state,
+                {"model.embed_tokens.weight": torch.empty(0)},
+            )
+
+        assert mapping == {"model.embed_tokens.weight": 1}
+
+
+# Tests for cloud storage path support (MSC integration)
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("msc://my-bucket/checkpoints", True),
+        ("msc://", True),
+        ("/local/path/checkpoints", False),
+        ("", False),
+        ("s3://my-bucket/checkpoints", False),
+        ("msc:/missing-slash", False),
+        ("/msc://tricky", False),
+    ],
+)
+def test_is_cloud_path(path, expected):
+    """Returns True if path starts with 'msc://', False for all other paths. Only msc:// is supported."""
+    assert is_cloud_path(path) is expected
+
+
+def _make_ckptr(is_peft=False, is_async=False):
+    """Returns a minimal mock Checkpointer for testing _do_save and _do_load without a real config or distributed setup."""
+    config = MagicMock()
+    config.is_peft = is_peft
+    config.is_async = is_async
+    ckptr = MagicMock(spec=Checkpointer)
+    ckptr.config = config
+    ckptr._model_ctx = MagicMock(staging_active=False)
+    ckptr._optim_ctx = MagicMock(staging_active=False)
+    ckptr.process_group = None
+    ckptr._planner_cache_namespace = "test"
+    return ckptr
+
+
+def _cloud_patches(extra_patches=()):
+    """Returns an ExitStack that patches MSC_AVAILABLE=True and stubs AsyncCheckpointerType for cloud path tests."""
+    stack = ExitStack()
+    stack.enter_context(patch("nemo_automodel.components.checkpoint.checkpointing.MSC_AVAILABLE", True))
+    stack.enter_context(
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.AsyncCheckpointerType",
+            MagicMock(),
+            create=True,
+        )
+    )
+    for i in extra_patches:
+        stack.enter_context(i)
+    return stack
+
+
+class TestEnsureDirs:
+    """Ensures that _ensure_dirs creates local directories and skips cloud path creation."""
+
+    def test_creates_nested_local_dirs(self, tmp_path):
+        """Calling _ensure_dirs called on a non-existing path creates it will all intermediate directories."""
+        target = str(tmp_path / "a" / "b" / "c")
+        assert not os.path.exists(target)
+        _ensure_dirs(target)
+        assert os.path.isdir(target)
+
+    def test_existing_dir_does_not_raise(self, tmp_path):
+        """Calling _ensure_dirs on a pre-existing directory does not raise error."""
+        _ensure_dirs(str(tmp_path))
+
+    def test_cloud_path_never_touches_filesystem(self):
+        """For a msc:// path, os.makedirs is never called."""
+        with patch("os.makedirs") as mock_makedirs:
+            _ensure_dirs("msc://bucket/some/deep/path")
+        mock_makedirs.assert_not_called()
+
+    def test_local_path_passes_exist_ok_true(self, tmp_path):
+        """os.makedirs is called exactly, use exist_ok=True to avoid errors on existing directories."""
+        target = str(tmp_path / "new")
+        with patch("os.makedirs") as mock_makedirs:
+            _ensure_dirs(target)
+        mock_makedirs.assert_called_once_with(target, exist_ok=True)
+
+    def test_distributed_barrier_uses_process_group(self, tmp_path):
+        group = object()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_dirs(str(tmp_path), process_group=group)
+        barrier.assert_called_once_with(group=group)
+
+    def test_each_rank_creates_node_local_directories(self, tmp_path):
+        """Every rank creates directories that may live on node-local filesystems."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_dirs(target, process_group=group)
+        makedirs.assert_called_once_with(target, exist_ok=True)
+        barrier.assert_called_once_with(group=group)
+
+    def test_only_group_rank_zero_creates_shared_directories(self, tmp_path):
+        """Nonzero group ranks avoid redundant metadata operations on shared filesystems."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_shared_dirs(target, process_group=group)
+        makedirs.assert_not_called()
+        barrier.assert_called_once_with(group=group)
+
+
+def test_save_on_dp_ranks_creates_node_local_directory_on_each_writer_rank():
+    """A nonzero DP writer rank must create its local directory before writing dataloader state."""
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.process_group = object()
+    checkpointer.tp_rank = 0
+    checkpointer.pp_rank = 0
+    checkpointer.dp_rank = 1
+    state = SimpleNamespace(state_dict=lambda: {"state": torch.ones(1)})
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("os.makedirs") as makedirs,
+        patch("torch.distributed.barrier") as barrier,
+        patch("torch.save") as save,
+    ):
+        checkpointer.save_on_dp_ranks(state, "dataloader", "/tmp/checkpoint")
+
+    makedirs.assert_called_once_with("/tmp/checkpoint/dataloader", exist_ok=True)
+    barrier.assert_called_once_with(group=checkpointer.process_group)
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/dataloader/dataloader_dp_rank_1.pt")
+
+
+def test_save_on_global_ranks_writes_one_file_per_process_rank():
+    """Rank-local state uses the global process rank even when DP rank is shared."""
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.process_group = object()
+    checkpointer.dp_rank = 0
+    state = SimpleNamespace(state_dict=lambda: {"state": torch.ones(1)})
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=3),
+        patch("os.makedirs") as makedirs,
+        patch("torch.distributed.barrier") as barrier,
+        patch("torch.save") as save,
+    ):
+        checkpointer.save_on_global_ranks(state, "rng", "/tmp/checkpoint")
+
+    makedirs.assert_called_once_with("/tmp/checkpoint/rng", exist_ok=True)
+    barrier.assert_called_once_with(group=checkpointer.process_group)
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/rng/rng_global_rank_3.pt")
+
+
+def test_model_and_optimizer_saves_use_separate_plan_caches():
+    """Alternating model and optimizer saves must not evict each other's cached DCP plans."""
+    ckptr = _make_ckptr(is_peft=False, is_async=False)
+    with patch("nemo_automodel.components.checkpoint.checkpointing.dcp.save") as save:
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/opt/models/qwen/step_100/model")
+        Checkpointer._do_save(ckptr, {"state": torch.ones(1)}, "/opt/models/qwen/step_100/optim")
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/opt/models/qwen/step_200/model")
+
+    model_planner = save.call_args_list[0].kwargs["planner"]
+    optimizer_planner = save.call_args_list[1].kwargs["planner"]
+    next_model_planner = save.call_args_list[2].kwargs["planner"]
+    assert type(model_planner) is not type(optimizer_planner)
+    assert model_planner._cached_plans_key != optimizer_planner._cached_plans_key
+    assert model_planner._cached_plans_key == next_model_planner._cached_plans_key
+    assert model_planner._cached_plans_key.encode() in pickle.dumps(model_planner)
+
+
+def test_cross_checkpointer_torch_plan_is_not_reused_for_safetensors(tmp_path):
+    """A torch-save plan from one checkpointer must not leak into a safetensors save from another."""
+    torch_ckpt = CheckpointingConfig(
+        checkpoint_dir=tmp_path / "run_a",
+        model_save_format="torch_save",
+        save_consolidated=False,
+    ).build(0, 0, 0)
+    safe_ckpt = CheckpointingConfig(
+        checkpoint_dir=tmp_path / "run_b",
+        model_save_format="safetensors",
+        save_consolidated=False,
+    ).build(0, 0, 0)
+    model_state = {"weight": torch.ones(4)}
+    torch_model_path = tmp_path / "run_a" / "step_100" / "model"
+    torch_optim_path = tmp_path / "run_a" / "step_100" / "optim"
+    safe_model_path = tmp_path / "run_b" / "step_100" / "model"
+
+    torch_ckpt._do_save(model_state, str(torch_model_path))
+    torch_ckpt._do_save({"state": torch.ones(2)}, str(torch_optim_path))
+    writer = safe_ckpt._get_storage_writer(None, None, None, str(safe_model_path))
+    safe_ckpt._do_save(model_state, str(safe_model_path), writer)
+
+    assert list(safe_model_path.glob("*.safetensors"))
+
+
+class TestSaveConfig:
+    """Ensures that save_config writes valid YAML to local paths and uses msc.open for cloud paths."""
+
+    def test_local_path_writes_valid_yaml(self, tmp_path):
+        """Writes a config dict to a local path and verifies the file exist and contains the correct values when loaded back."""
+        config = {"model": "llama3", "lr": 3e-4, "steps": 1000}
+        save_config(config, str(tmp_path))
+        cfg_file = tmp_path / "config.yaml"
+        assert cfg_file.exists()
+        loaded = yaml.safe_load(cfg_file.read_text())
+        assert loaded["lr"] == pytest.approx(3e-4)
+        assert loaded["steps"] == 1000
+
+    def test_cloud_path_uses_msc_open_not_builtin(self):
+        """Verifies that for an msc:// path, msc.open is used instead of python's open."""
+        config = {"model": "llama3", "lr": 3e-4}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(
+            __enter__=MagicMock(return_value=mock_file),
+            __exit__=MagicMock(return_value=False),
+        )
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.MSC_AVAILABLE", True),
+            patch("builtins.open") as mock_builtin_open,
+        ):
+            mock_msc.open.return_value = mock_ctx
+            save_config(config, "msc://bucket/checkpoints")
+
+        mock_msc.open.assert_called_once()
+        mock_builtin_open.assert_not_called()
+
+    def test_config_written_inside_checkpoint_dir(self):
+        """Confirms the config file lands inside the checkpoint directory"""
+        config = {"x": 1}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(
+            __enter__=MagicMock(return_value=mock_file),
+            __exit__=MagicMock(return_value=False),
+        )
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.MSC_AVAILABLE", True),
+        ):
+            mock_msc.open.return_value = mock_ctx
+            save_config(config, "msc://bucket/run42")
+
+        opened_path = mock_msc.open.call_args[0][0]
+        assert opened_path.startswith("msc://bucket/run42")
+
+
+class TestDoLoad:
+    """Tests that _do_load routes to the correct storage writer based on path and format."""
+
+    def _make_checkpointer(self, is_peft=False):
+        config = MagicMock()
+        config.is_peft = is_peft
+        ckptr = MagicMock(spec=Checkpointer)
+        ckptr.config = config
+        return ckptr
+
+    def test_cloud_path_uses_msc_reader(self):
+        """Cloud path: MSC writer is injected and used for saving."""
+        ckptr = self._make_checkpointer()
+        state_dict = {"weight": torch.zeros(4)}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.MSC_AVAILABLE", True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp"),
+        ):
+            Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100")
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_called_once_with("msc://bucket/step-100")
+
+    def test_local_path_does_not_use_msc_reader(self, tmp_path):
+        """Local path: MSC writer is never used."""
+        ckptr = self._make_checkpointer()
+        state_dict = {"weight": torch.zeros(4)}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp"),
+        ):
+            Checkpointer._do_load(ckptr, state_dict, str(tmp_path / "step-100"))
+
+        mock_msc.open.assert_not_called()
+
+    def test_peft_cloud_load_still_routes_through_msc_reader(self):
+        """MSC writer is called with the exact checkpoint path, not a modified subpath."""
+        ckptr = self._make_checkpointer(is_peft=True)
+        state_dict = {"weight": torch.zeros(4)}
+        mock_file = MagicMock()
+        mock_file.read.return_value = b"fake bytes"
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.MSC_AVAILABLE", True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp"),
+            patch("nemo_automodel.components.checkpoint.checkpointing.safetensors_load") as mock_load,
+        ):
+            mock_msc.open.return_value.__enter__ = MagicMock(return_value=mock_file)
+            mock_msc.open.return_value.__exit__ = MagicMock(return_value=False)
+            mock_load.return_value = state_dict
+            Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100/model")
+
+        mock_msc.open.assert_called_once()
+
+    def test_save_and_load_use_same_path(self):
+        """Async mode: MSC writer is still injected for cloud paths."""
+        config = MagicMock()
+        config.is_peft = False
+        config.is_async = False
+        ckptr = MagicMock(spec=Checkpointer)
+        ckptr.config = config
+        ckptr._planner_cache_namespace = "test"
+        state_dict = {"weight": torch.ones(4)}
+        path = "msc://bucket/step-300"
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.MSC_AVAILABLE", True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp"),
+        ):
+            Checkpointer._do_save(ckptr, state_dict, path)
+            Checkpointer._do_load(ckptr, state_dict, path)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with(path)
+        mock_msc.torch.MultiStorageFileSystemReader.assert_called_once_with(path)
+
+
+class TestDoSaveFullSFT:
+    """Tests that _do_save correctly routes full-SFT saves for DCP and safetensors formats on cloud and local paths."""
+
+    def test_dcp_cloud_sync_uses_msc_writer(self):
+        """DCP + cloud + sync: MSC writer injected, and dcp.save is called"""
+        ckptr = _make_ckptr(is_peft=False, is_async=False)
+        sd = {"w": torch.ones(4)}
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, CLOUD_PATH_OPTIM, storage_writer=None)
+
+            mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with(CLOUD_PATH_OPTIM)
+            mock_dcp.save.assert_called_once()
+
+    def test_safetensors_cloud_sync_does_not_override_hf_writer(self):
+        """Safetensors + cloud + sync: existing HF writer NOT replaced by MSC writer."""
+        ckptr = _make_ckptr(is_peft=False, is_async=False)
+        sd = {"w": torch.ones(4)}
+        hf_writer = MagicMock(name="HFStorageWriter")
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, CLOUD_PATH_MODEL, storage_writer=hf_writer)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+        mock_dcp.save.assert_called_once()
+        _, kwargs = mock_dcp.save.call_args
+        assert kwargs["storage_writer"] is hf_writer
+
+    def test_safetensors_cloud_async_does_not_override_hf_writer(self):
+        """Safetensors + cloud + async: existing HF writer NOT replaced by MSC writer."""
+        ckptr = _make_ckptr(is_peft=False, is_async=True)
+        sd = {"w": torch.ones(4)}
+        hf_writer = MagicMock(name="HFStorageWriter")
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, CLOUD_PATH_MODEL, storage_writer=hf_writer)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+        mock_dcp.async_save.assert_called_once()
+        _, kwargs = mock_dcp.async_save.call_args
+        assert kwargs["storage_writer"] is hf_writer
+
+    def test_local_dcp_sync_no_msc(self):
+        """Local + DCP + sync: MSC writer never used."""
+
+        ckptr = _make_ckptr(is_peft=False, is_async=False)
+        sd = {"w": torch.ones(4)}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp"),
+        ):
+            Checkpointer._do_save(ckptr, sd, LOCAL_PATH_MODEL, storage_writer=None)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+
+
+class TestDoSavePEFT:
+    """Tests that _do_save correctly handles PEFT adapter saves using msc.open for cloud paths and save_file for local paths."""
+
+    def test_peft_cloud_sync_uses_msc_open(self):
+        """PEFT + cloud + sync: msc.open used for adapter file, dcp never called."""
+        ckptr = _make_ckptr(is_peft=True, is_async=False)
+        sd = {"lora.weight": torch.ones(4)}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_file), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+                patch("nemo_automodel.components.checkpoint.checkpointing.save_file"),
+                patch("torch.distributed.is_initialized", return_value=False),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_save(ckptr, sd, CLOUD_PATH_MODEL)
+
+        mock_msc.open.assert_called_once()
+        mock_dcp.save.assert_not_called()
+        mock_dcp.async_save.assert_not_called()
+
+    def test_peft_cloud_async_still_uses_msc_open_not_dcp(self):
+        """PEFT + cloud + async: adapter written sync via msc.open, dcp never called."""
+        ckptr = _make_ckptr(is_peft=True, is_async=True)
+        sd = {"lora.weight": torch.ones(4)}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_file), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+                patch("nemo_automodel.components.checkpoint.checkpointing.save_file"),
+                patch("torch.distributed.is_initialized", return_value=False),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_save(ckptr, sd, CLOUD_PATH_MODEL)
+
+        mock_msc.open.assert_called_once()
+        mock_dcp.async_save.assert_not_called()
+        mock_dcp.save.assert_not_called()
+
+    def test_peft_local_sync_uses_save_file_not_msc(self):
+        """PEFT + local + sync: save_file called, msc.open NOT called."""
+        ckptr = _make_ckptr(is_peft=True, is_async=False)
+        sd = {"lora.weight": torch.ones(4)}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.save_file") as mock_sf,
+            patch("torch.distributed.is_initialized", return_value=False),
+        ):
+            Checkpointer._do_save(ckptr, sd, LOCAL_PATH_MODEL)
+
+        mock_msc.open.assert_not_called()
+        mock_sf.assert_called_once()
+
+    def test_peft_adapter_path_appended_correctly(self):
+        """PEFT cloud save opens exactly '<path>/adapter_model.safetensors'."""
+        ckptr = _make_ckptr(is_peft=True)
+        sd = {"lora.weight": torch.ones(4)}
+        path = "msc://mybucket/run7/step-500/model"
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_file), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.save_file"),
+                patch("torch.distributed.is_initialized", return_value=False),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_save(ckptr, sd, path)
+
+        opened_path = mock_msc.open.call_args[0][0]
+        assert opened_path == "msc://mybucket/run7/step-500/model/adapter_model.safetensors"
+
+    def test_peft_cloud_sync_writes_valid_safetensors(self):
+        """PEFT + cloud + sync: bytes written to the msc.open handle must round-trip via safetensors.
+
+        Regression test: ``save_file`` only accepts a filesystem path, so the cloud branch must
+        serialize to bytes and write them to the handle. ``save_file`` is intentionally NOT patched
+        here so the real serializer runs against a real in-memory buffer; this would raise a
+        TypeError on the previous ``save_file(state_dict, f)`` implementation.
+        """
+        ckptr = _make_ckptr(is_peft=True, is_async=False)
+        sd = {"lora.weight": torch.arange(4, dtype=torch.float32)}
+
+        buf = io.BytesIO()
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=buf), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+                patch("torch.distributed.is_initialized", return_value=False),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_save(ckptr, sd, CLOUD_PATH_MODEL)
+
+        mock_msc.open.assert_called_once()
+        mock_dcp.save.assert_not_called()
+        mock_dcp.async_save.assert_not_called()
+
+        from safetensors.torch import load as _st_load
+
+        restored = _st_load(buf.getvalue())
+        assert torch.equal(restored["lora.weight"], sd["lora.weight"])
+
+
+class TestDoLoadFullSFT:
+    """Tests that _do_load correctly routes full-SFT loads for DCP and safetensors formats on cloud and local paths."""
+
+    def test_dcp_cloud_uses_msc_reader(self):
+        """DCP + cloud: MSC reader injected when no reader provided."""
+        ckptr = _make_ckptr(is_peft=False)
+        sd = {"w": torch.zeros(4)}
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_load(ckptr, sd, CLOUD_PATH_OPTIM, storage_reader=None)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_called_once_with(CLOUD_PATH_OPTIM)
+        mock_dcp.load.assert_called_once()
+
+    def test_safetensors_cloud_does_not_override_hf_reader(self):
+        """Safetensors + cloud: existing HF reader NOT replaced by MSC reader."""
+        ckptr = _make_ckptr(is_peft=False)
+        sd = {"w": torch.zeros(4)}
+        hf_reader = MagicMock(name="HFStorageReader")
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_load(ckptr, sd, CLOUD_PATH_MODEL, storage_reader=hf_reader)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_not_called()
+        mock_dcp.load.assert_called_once()
+        _, kwargs = mock_dcp.load.call_args
+        assert kwargs["storage_reader"] is hf_reader
+
+    def test_local_dcp_no_msc(self):
+        """Local + DCP: MSC reader never used."""
+        ckptr = _make_ckptr(is_peft=False)
+        sd = {"w": torch.zeros(4)}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp"),
+        ):
+            Checkpointer._do_load(ckptr, sd, LOCAL_PATH_MODEL, storage_reader=None)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_not_called()
+
+    def test_safetensors_local_does_not_use_msc(self):
+        """Safetensors + local: MSC reader never used."""
+        ckptr = _make_ckptr(is_peft=False)
+        sd = {"w": torch.zeros(4)}
+        hf_reader = MagicMock(name="HFStorageReader")
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp"),
+        ):
+            Checkpointer._do_load(ckptr, sd, LOCAL_PATH_MODEL, storage_reader=hf_reader)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_not_called()
+
+
+class TestDoLoadPEFT:
+    """Tests that _do_load correctly handles PEFT adapter loads using msc.open for cloud paths and load_file for local paths."""
+
+    def test_peft_cloud_uses_msc_open_not_dcp(self):
+        """PEFT + cloud: msc.open used for adapter, dcp.load NOT called."""
+        ckptr = _make_ckptr(is_peft=True)
+        sd = {"lora.weight": torch.zeros(4)}
+        mock_file = MagicMock()
+        mock_file.read.return_value = b"fake_safetensors_bytes"
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_file), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+                patch("nemo_automodel.components.checkpoint.checkpointing.safetensors_load", return_value=sd),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_load(ckptr, sd, CLOUD_PATH_MODEL)
+
+        mock_msc.open.assert_called_once()
+        mock_dcp.load.assert_not_called()
+
+    def test_peft_cloud_adapter_path_correct(self):
+        """PEFT + cloud: opens exactly '<path>/adapter_model.safetensors'."""
+        ckptr = _make_ckptr(is_peft=True)
+        sd = {}
+        path = "msc://bucket/run3/step-200/model"
+        mock_file = MagicMock()
+        mock_file.read.return_value = b"bytes"
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_file), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.safetensors_load", return_value=sd),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_load(ckptr, sd, path)
+
+        opened_path = mock_msc.open.call_args[0][0]
+        assert opened_path == "msc://bucket/run3/step-200/model/adapter_model.safetensors"
+
+    def test_peft_local_uses_load_file_not_msc(self):
+        """PEFT + local: load_file called, msc.open NOT called."""
+        ckptr = _make_ckptr(is_peft=True)
+        sd = {}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.load_file", return_value=sd) as mock_lf,
+        ):
+            Checkpointer._do_load(ckptr, sd, LOCAL_PATH_MODEL)
+
+        mock_msc.open.assert_not_called()
+        mock_lf.assert_called_once()
+
+    def test_peft_load_at_init_step_skips_peft_branch_uses_dcp(self):
+        """PEFT + cloud + is_init_step=True: DCP path used, not PEFT adapter path."""
+        ckptr = _make_ckptr(is_peft=True)
+        sd = {"w": torch.zeros(4)}
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_load(ckptr, sd, CLOUD_PATH_MODEL, is_init_step=True)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_called_once_with(CLOUD_PATH_MODEL)
+        mock_dcp.load.assert_called_once()
+        mock_msc.open.assert_not_called()
+
+
+class TestFormatSave:
+    """Tests that _get_storage_writer returns the correct writer for each format, and that _do_save routes correctly based on whether a writer is provided."""
+
+    def _make_checkpointer(self, model_save_format, is_peft=False):
+        with patch("torch.distributed.is_initialized", return_value=False):
+            config = CheckpointingConfig(
+                enabled=True,
+                checkpoint_dir="/tmp/test",
+                model_save_format=model_save_format,
+                model_cache_dir="/tmp/cache",
+                model_repo_id="test/model",
+                save_consolidated=False,
+                is_peft=is_peft,
+            )
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    def test_safetensors_format_produces_hf_writer(self):
+        """safetensors format: _get_storage_writer returns _HuggingFaceStorageWriter."""
+        ckptr = self._make_checkpointer("safetensors")
+        writer = ckptr._get_storage_writer(
+            consolidated_output_path=None,
+            fqn_to_index_mapping={"w": 1},
+            fqn_to_dtype_mapping=None,
+            model_path="/tmp/model",
+        )
+        from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageWriter
+
+        assert isinstance(writer, _HuggingFaceStorageWriter)
+
+    def test_dcp_format_produces_no_writer(self):
+        """torch_save (DCP) format: _get_storage_writer returns None."""
+        ckptr = self._make_checkpointer("torch_save")
+        writer = ckptr._get_storage_writer(
+            consolidated_output_path=None,
+            fqn_to_index_mapping=None,
+            fqn_to_dtype_mapping=None,
+            model_path="/tmp/model",
+        )
+        assert writer is None
+
+    def test_safetensors_cloud_save_uses_hf_writer_not_msc(self):
+        """safetensors + cloud: HF writer passed to dcp.save, MSC writer never created."""
+        ckptr = self._make_checkpointer("safetensors")
+        sd = {"w": torch.ones(4)}
+        hf_writer = MagicMock(name="HFStorageWriter")
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                ckptr._do_save(sd, "msc://bucket/step-100/model", storage_writer=hf_writer)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+        mock_dcp.save.assert_called_once()
+        _, kwargs = mock_dcp.save.call_args
+        assert kwargs["storage_writer"] is hf_writer
+
+    def test_dcp_cloud_save_uses_msc_writer(self):
+        """torch_save (DCP) + cloud: no HF writer provided, so MSC writer injected."""
+        ckptr = self._make_checkpointer("torch_save")
+        sd = {"w": torch.ones(4)}
+        writer = ckptr._get_storage_writer(
+            consolidated_output_path=None,
+            fqn_to_index_mapping=None,
+            fqn_to_dtype_mapping=None,
+            model_path="msc://bucket/step-100/optim",
+        )
+        assert writer is None
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                ckptr._do_save(sd, "msc://bucket/step-100/optim", storage_writer=writer)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with("msc://bucket/step-100/optim")
+        mock_dcp.save.assert_called_once()
+
+    def test_safetensors_local_save_uses_hf_writer(self):
+        """safetensors + local: HF writer used, MSC never involved."""
+        ckptr = self._make_checkpointer("safetensors")
+        sd = {"w": torch.ones(4)}
+        hf_writer = ckptr._get_storage_writer(
+            consolidated_output_path=None,
+            fqn_to_index_mapping={"w": 1},
+            fqn_to_dtype_mapping=None,
+            model_path="/tmp/step-100/model",
+        )
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+        ):
+            ckptr._do_save(sd, "/tmp/step-100/model", storage_writer=hf_writer)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+        mock_dcp.save.assert_called_once()
+
+    def test_dcp_local_save_no_writer_no_msc(self):
+        """torch_save (DCP) + local: no writer, no MSC, plain dcp.save."""
+        ckptr = self._make_checkpointer("torch_save")
+        sd = {"w": torch.ones(4)}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+        ):
+            ckptr._do_save(sd, "/tmp/step-100/optim", storage_writer=None)
+
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+        mock_dcp.save.assert_called_once()
+
+
+class TestFormatLoad:
+    """Tests that _get_storage_reader returns the correct reader for each format, and that _do_load routes correctly based on whether a reader is provided."""
+
+    def _make_checkpointer(self, model_save_format, is_peft=False):
+        with patch("torch.distributed.is_initialized", return_value=False):
+            config = CheckpointingConfig(
+                enabled=True,
+                checkpoint_dir="/tmp/test",
+                model_save_format=model_save_format,
+                model_cache_dir="/tmp/cache",
+                model_repo_id="test/model",
+                save_consolidated=False,
+                is_peft=is_peft,
+            )
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    def test_safetensors_format_produces_hf_reader(self):
+        """safetensors checkpoint: _get_storage_reader returns an HF reader.
+
+        Reader selection is driven by whether the checkpoint is safetensors
+        (``is_safetensors``), which the production caller passes explicitly, so the
+        path need not exist on disk.
+        """
+        ckptr = self._make_checkpointer("safetensors")
+        reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None, is_safetensors=True)
+        assert reader is not None
+
+    def test_get_storage_reader_infers_safetensors_from_directory(self, tmp_path):
+        """When ``is_safetensors`` is not supplied, reader choice follows the on-disk
+        contents (regression for #2487): a safetensors directory yields a reader, a
+        non-safetensors directory yields None for a non-init load."""
+        ckptr = self._make_checkpointer("safetensors")
+        st_dir = tmp_path / "st"
+        st_dir.mkdir()
+        (st_dir / "model.safetensors.index.json").write_text("{}")
+        assert ckptr._get_storage_reader(str(st_dir), key_mapping=None) is not None
+        other = tmp_path / "dcp"
+        other.mkdir()
+        assert ckptr._get_storage_reader(str(other), key_mapping=None) is None
+
+    def test_dcp_format_produces_no_reader(self):
+        """torch_save (DCP) format: _get_storage_reader returns None."""
+        ckptr = self._make_checkpointer("torch_save")
+        reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None)
+        assert reader is None
+
+    def test_safetensors_cloud_load_uses_hf_reader_not_msc(self):
+        """safetensors + cloud: HF reader passed to dcp.load, MSC reader never created."""
+        ckptr = self._make_checkpointer("safetensors")
+        sd = {"w": torch.zeros(4)}
+        hf_reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None, is_safetensors=True)
+        assert hf_reader is not None
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                ckptr._do_load(sd, "msc://bucket/step-100/model", storage_reader=hf_reader)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_not_called()
+        mock_dcp.load.assert_called_once()
+        _, kwargs = mock_dcp.load.call_args
+        assert kwargs["storage_reader"] is hf_reader
+
+    def test_dcp_cloud_load_uses_msc_reader(self):
+        """torch_save (DCP) + cloud: no HF reader, so MSC reader injected."""
+        ckptr = self._make_checkpointer("torch_save")
+        sd = {"w": torch.zeros(4)}
+        reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None)
+        assert reader is None
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                ckptr._do_load(sd, "msc://bucket/step-100/optim", storage_reader=reader)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_called_once_with("msc://bucket/step-100/optim")
+        mock_dcp.load.assert_called_once()
+
+    def test_safetensors_local_load_uses_hf_reader(self):
+        """safetensors + local: HF reader used, MSC never involved."""
+        ckptr = self._make_checkpointer("safetensors")
+        sd = {"w": torch.zeros(4)}
+        hf_reader = ckptr._get_storage_reader("/tmp/model", key_mapping=None, is_safetensors=True)
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+        ):
+            ckptr._do_load(sd, "/tmp/step-100/model", storage_reader=hf_reader)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_not_called()
+        mock_dcp.load.assert_called_once()
+
+    def test_dcp_local_load_no_reader_no_msc(self):
+        """torch_save (DCP) + local: no reader, no MSC, plain dcp.load."""
+        ckptr = self._make_checkpointer("torch_save")
+        sd = {"w": torch.zeros(4)}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+        ):
+            ckptr._do_load(sd, "/tmp/step-100/optim", storage_reader=None)
+
+        mock_msc.torch.MultiStorageFileSystemReader.assert_not_called()
+        mock_dcp.load.assert_called_once()
+
+
+class TestSyncAsyncSave:
+    """Tests that _do_save calls dcp.save for sync and dcp.async_save for async, across DCP, safetensors, and PEFT formats on both cloud and local paths."""
+
+    def _make_ckptr(self, is_async, is_peft=False):
+        config = MagicMock()
+        config.is_peft = is_peft
+        config.is_async = is_async
+        ckptr = MagicMock(spec=Checkpointer)
+        ckptr.config = config
+        ckptr._model_ctx = MagicMock(staging_active=False)
+        ckptr._optim_ctx = MagicMock(staging_active=False)
+        ckptr.process_group = None
+        ckptr._planner_cache_namespace = "test"
+        return ckptr
+
+    def test_dcp_cloud_sync_calls_dcp_save(self):
+        """DCP + cloud + sync: dcp.save called, dcp.async_save NOT called."""
+        ckptr = self._make_ckptr(is_async=False)
+        sd = {"w": torch.ones(4)}
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc"),
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/optim")
+
+        mock_dcp.save.assert_called_once()
+        mock_dcp.async_save.assert_not_called()
+
+    def test_dcp_cloud_async_calls_dcp_async_save(self):
+        """DCP + cloud + async: dcp.async_save called, dcp.save NOT called."""
+        ckptr = self._make_ckptr(is_async=True)
+        sd = {"w": torch.ones(4)}
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc"),
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/optim")
+
+        mock_dcp.async_save.assert_called_once()
+        mock_dcp.save.assert_not_called()
+
+    def test_dcp_cloud_async_msc_writer_passed_to_async_save(self):
+        """DCP + cloud + async: MSC writer is passed as storage_writer to dcp.async_save."""
+        ckptr = self._make_ckptr(is_async=True)
+        sd = {"w": torch.ones(4)}
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/optim")
+
+        msc_writer = mock_msc.torch.MultiStorageFileSystemWriter.return_value
+        _, kwargs = mock_dcp.async_save.call_args
+        assert kwargs["storage_writer"] is msc_writer
+
+    def test_dcp_cloud_sync_msc_writer_passed_to_save(self):
+        """DCP + cloud + sync: MSC writer is passed as storage_writer to dcp.save."""
+        ckptr = self._make_ckptr(is_async=False)
+        sd = {"w": torch.ones(4)}
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/optim")
+
+        msc_writer = mock_msc.torch.MultiStorageFileSystemWriter.return_value
+        _, kwargs = mock_dcp.save.call_args
+        assert kwargs["storage_writer"] is msc_writer
+
+    def test_safetensors_cloud_sync_calls_dcp_save(self):
+        """safetensors + cloud + sync: dcp.save called with HF writer, dcp.async_save NOT called."""
+        ckptr = self._make_ckptr(is_async=False)
+        sd = {"w": torch.ones(4)}
+        hf_writer = MagicMock(name="HFStorageWriter")
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/model", storage_writer=hf_writer)
+
+        mock_dcp.save.assert_called_once()
+        mock_dcp.async_save.assert_not_called()
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+
+    def test_safetensors_cloud_async_calls_dcp_async_save(self):
+        """safetensors + cloud + async: dcp.async_save called with HF writer, dcp.save NOT called."""
+        ckptr = self._make_ckptr(is_async=True)
+        sd = {"w": torch.ones(4)}
+        hf_writer = MagicMock(name="HFStorageWriter")
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            ):
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/model", storage_writer=hf_writer)
+
+        mock_dcp.async_save.assert_called_once()
+        mock_dcp.save.assert_not_called()
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
+        _, kwargs = mock_dcp.async_save.call_args
+        assert kwargs["storage_writer"] is hf_writer
+
+    def test_peft_cloud_sync_uses_msc_open_not_dcp(self):
+        """PEFT + cloud + sync: adapter written via msc.open, dcp never called."""
+        ckptr = self._make_ckptr(is_async=False, is_peft=True)
+        sd = {"lora.weight": torch.ones(4)}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_file), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+                patch("nemo_automodel.components.checkpoint.checkpointing.save_file"),
+                patch("torch.distributed.is_initialized", return_value=False),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/model")
+
+        mock_msc.open.assert_called_once()
+        mock_dcp.save.assert_not_called()
+        mock_dcp.async_save.assert_not_called()
+
+    def test_peft_cloud_async_still_uses_msc_open_not_dcp(self):
+        """PEFT + cloud + async: adapter still written sync via msc.open, dcp never called."""
+        ckptr = self._make_ckptr(is_async=True, is_peft=True)
+        sd = {"lora.weight": torch.ones(4)}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_file), __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with (
+                patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc,
+                patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+                patch("nemo_automodel.components.checkpoint.checkpointing.save_file"),
+                patch("torch.distributed.is_initialized", return_value=False),
+            ):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_save(ckptr, sd, "msc://bucket/step-100/model")
+
+        mock_msc.open.assert_called_once()
+        mock_dcp.async_save.assert_not_called()
+        mock_dcp.save.assert_not_called()
+
+    def test_local_sync_calls_dcp_save(self):
+        """Local + sync: dcp.save called, dcp.async_save NOT called."""
+        ckptr = self._make_ckptr(is_async=False)
+        sd = {"w": torch.ones(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp:
+            Checkpointer._do_save(ckptr, sd, "/tmp/step-100/optim")
+
+        mock_dcp.save.assert_called_once()
+        mock_dcp.async_save.assert_not_called()
+
+    def test_local_sync_passes_model_process_group(self):
+        ckptr = self._make_ckptr(is_async=False)
+        ckptr.process_group = object()
+        sd = {"w": torch.ones(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp:
+            Checkpointer._do_save(ckptr, sd, "/tmp/step-100/optim")
+
+        assert mock_dcp.save.call_args.kwargs["process_group"] is ckptr.process_group
+
+    def test_peft_sync_barrier_uses_model_process_group(self):
+        ckptr = self._make_ckptr(is_async=False, is_peft=True)
+        ckptr.process_group = object()
+        sd = {"w": torch.ones(4)}
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier") as barrier,
+            patch("nemo_automodel.components.checkpoint.checkpointing._save_safetensors"),
+        ):
+            Checkpointer._do_save(ckptr, sd, "/tmp/step-100/model")
+
+        barrier.assert_called_once_with(group=ckptr.process_group)
+
+    def test_local_async_calls_dcp_async_save(self):
+        """Local + async: dcp.async_save called, dcp.save NOT called."""
+        ckptr = self._make_ckptr(is_async=True)
+        sd = {"w": torch.ones(4)}
+
+        with _cloud_patches():
+            with patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp:
+                Checkpointer._do_save(ckptr, sd, "/tmp/step-100/optim")
+
+        mock_dcp.async_save.assert_called_once()
+        mock_dcp.save.assert_not_called()

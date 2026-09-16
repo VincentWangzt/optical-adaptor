@@ -1,0 +1,424 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import logging
+import signal
+from dataclasses import asdict, dataclass
+from math import ceil
+from typing import TYPE_CHECKING
+
+from torch.distributed.checkpoint.stateful import Stateful
+
+from nemo_automodel.components.training.signal_handler import DistributedSignalHandler, SignalLike
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+    from torch.utils.data import DataLoader
+
+logger = logging.getLogger(__name__)
+
+
+def _calculate_max_steps(
+    num_epochs: int,
+    epoch_len: int | None,
+    default_max_steps: int = 9223372036854775807,
+) -> int:
+    """
+    Calculate the maximum number of steps.
+    """
+    if epoch_len is None:
+        return default_max_steps
+    return num_epochs * epoch_len
+
+
+def _calculate_num_epochs(max_steps: int | None, epoch_len: int | None, default_num_epochs: int = 10) -> int:
+    """
+    Calculate the number of epochs out of maximum number of steps.
+    """
+    if epoch_len is None or max_steps is None:
+        return default_num_epochs
+    return ceil(max_steps / epoch_len)
+
+
+class StepScheduler(Stateful):
+    """
+    Scheduler for managing gradient accumulation and checkpointing steps.
+    """
+
+    def __init__(
+        self,
+        global_batch_size: int,
+        local_batch_size: int,
+        dp_size: int,
+        dataloader: DataLoader | None,
+        ckpt_every_steps: int | None = None,
+        save_checkpoint_every_epoch: bool = True,
+        validate_on_checkpoint: bool = True,
+        val_every_steps: int | None = None,
+        log_remote_every_steps: int = 1,
+        loss_average_window_steps: int = 50,
+        gc_every_steps: int | None = None,
+        start_step: int = 0,
+        start_epoch: int = 0,
+        num_epochs: int | None = None,
+        max_steps: int | None = None,
+        preemption_signal: SignalLike | list[SignalLike] | None = signal.SIGTERM,
+        process_group: ProcessGroup | None = None,
+    ):
+        """
+        Initialize the StepScheduler.
+
+        Args:
+            global_batch_size (int): Total number of samples processed per optimizer step across all GPUs. This is the effective batch size for the entire training step.
+            local_batch_size (int): Number of samples per micro-batch per GPU. This is the batch size for a single forward/backward pass on one GPU.
+            dp_size (int): Number of GPUs for data parallelism.
+            dataloader: The training dataloader.
+            ckpt_every_steps (int | None): Frequency of checkpoint steps.
+            save_checkpoint_every_epoch (bool): Whether to save checkpoints at epoch boundaries.
+                When True, checkpoints are saved at the end of each epoch (is_last_batch).
+                When False, only periodic, last-step, and SIGTERM checkpoints are saved.
+                Default: True.
+            validate_on_checkpoint (bool): Whether checkpoint steps should also run validation. Keeping this enabled
+                preserves historical best-checkpoint behavior; memory-constrained recipes can disable it and still save.
+            val_every_steps (int | None): Number of training steps between validation.
+            log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
+            loss_average_window_steps (int): Rolling window size for averaged training loss metrics.
+            gc_every_steps (int | None): Frequency of manual garbage collection steps.
+            start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
+            start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
+            num_epochs (int | None): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
+            max_steps (int | None): Maximum number of steps to run. If None, calculated from num_epochs.
+            preemption_signal (SignalLike | list[SignalLike] | None): Signal(s) that trigger a graceful
+                preemption checkpoint, each given as a signal number, name (e.g. "SIGTERM"), or
+                ``signal.Signals`` member. When ``None``, no signal handler is installed and preemption
+                checkpointing is disabled. Default: ``signal.SIGTERM``.
+            process_group: Process group whose ranks participate in distributed signal handling.
+        """
+        if global_batch_size <= 0:
+            raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
+        if local_batch_size <= 0:
+            raise ValueError(f"local_batch_size must be greater than 0, got {local_batch_size}")
+        if dp_size <= 0:
+            raise ValueError(f"dp_size must be greater than 0, got {dp_size}")
+        local_global_batch_size = local_batch_size * dp_size
+        if global_batch_size % local_global_batch_size != 0:
+            raise ValueError(
+                f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size "
+                f"({local_batch_size} * {dp_size})"
+            )
+        self.grad_acc_steps = global_batch_size // (local_batch_size * dp_size)
+        if self.grad_acc_steps < 1:
+            raise ValueError(
+                f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. "
+                "Please ensure that global_batch_size >= (local_batch_size * dp_size)"
+            )
+        self.dataloader = dataloader
+        self.step = start_step
+        if start_step < 0:
+            raise ValueError(f"start_step must be greater than or equal to 0, got {start_step}")
+        self.epoch = start_epoch
+        if start_epoch < 0:
+            raise ValueError(f"start_epoch must be greater than or equal to 0, got {start_epoch}")
+
+        # Throws with IterableDataset.
+        try:
+            self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
+        except (NotImplementedError, TypeError, RuntimeError):
+            self.epoch_len = None
+
+        # This is for backward compatibility in the sense that num_epochs's default value was 10
+        if num_epochs is None:
+            num_epochs = _calculate_num_epochs(
+                max_steps,
+                self.epoch_len,
+            )
+
+        self.num_epochs = num_epochs
+        if num_epochs is not None and num_epochs <= 0:
+            raise ValueError(f"num_epochs must be greater than 0 or None if max_steps is provided, got {num_epochs}")
+
+        self.val_every_steps = val_every_steps
+        if val_every_steps is not None and val_every_steps <= 0:
+            raise ValueError(f"val_every_steps must be greater than 0 if not None, got {val_every_steps}")
+        self.log_remote_every_steps = log_remote_every_steps
+        if log_remote_every_steps <= 0:
+            raise ValueError(f"log_remote_every_steps must be greater than 0, got {log_remote_every_steps}")
+        self.loss_average_window_steps = loss_average_window_steps
+        if loss_average_window_steps <= 0:
+            raise ValueError(f"loss_average_window_steps must be greater than 0, got {loss_average_window_steps}")
+        self.gc_every_steps = gc_every_steps
+        if gc_every_steps is not None and gc_every_steps <= 0:
+            raise ValueError(f"gc_every_steps must be greater than 0 if not None, got {gc_every_steps}")
+        if max_steps is None:
+            if self.epoch_len is None:
+                raise ValueError("epoch_len must be provided if max_steps is not provided")
+            max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
+            logger.info("max_steps not provided; will run for up to {} steps".format(max_steps))
+        self.max_steps = max_steps
+        if max_steps <= 0:
+            raise ValueError(f"max_steps must be greater than 0, got {max_steps}")
+
+        if ckpt_every_steps is None:
+            if self.epoch_len is None:
+                ckpt_every_steps = max(1, self.max_steps // 2)
+            else:
+                ckpt_every_steps = self.epoch_len
+            logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
+        if ckpt_every_steps <= 0:
+            raise ValueError(f"ckpt_every_steps must be greater than 0, got {ckpt_every_steps}")
+        self.ckpt_every_steps = ckpt_every_steps
+        self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
+        self.validate_on_checkpoint = validate_on_checkpoint
+        if preemption_signal is None:
+            self.sig_handler = None
+        else:
+            self.sig_handler = DistributedSignalHandler(sig=preemption_signal, group=process_group).__enter__()
+        self.sigterm_flag = False
+        self._sig_polled_step: int | None = None
+
+    def __iter__(self):
+        """
+        Iterates over dataloader while keeping track of counters.
+
+        Raises:
+            StopIteration: If the dataloader was exhausted or max_steps was reached.
+
+        Yields:
+            dict: batch
+        """
+        if self.step >= self.max_steps:
+            return
+        batch_buffer = []
+        for batch in self.dataloader:
+            batch_buffer.append(batch)
+            if len(batch_buffer) == self.grad_acc_steps:
+                yield batch_buffer
+                self.step += 1
+                batch_buffer = []
+                if self.step >= self.max_steps or self.sigterm_flag:
+                    return
+        if batch_buffer:
+            yield batch_buffer
+            self.step += 1
+        self.epoch += 1
+
+    def set_epoch(self, epoch: int):
+        """
+        Set the epoch for the sampler.
+        """
+        self.epoch = epoch
+        if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
+            self.dataloader.sampler.set_epoch(epoch)
+
+    @property
+    def is_remote_logging_step(self):
+        """
+        Returns whether this step should log to remote services (WandB, MLflow, etc.).
+        """
+        return self.step % self.log_remote_every_steps == 0
+
+    @property
+    def is_val_step(self):
+        """
+        Returns whether this step needs to call the validation.
+        """
+        is_val = False
+        if self.val_every_steps and self.val_every_steps > 0:
+            is_val = self.step % self.val_every_steps == self.val_every_steps - 1
+        # Historically, checkpoint steps also validated so best-checkpoint
+        # metrics were available. Tiny-UMA recipes can opt out and still save.
+        is_checkpoint_validation = self.validate_on_checkpoint and self.is_ckpt_step
+        return (is_val or is_checkpoint_validation) and not self.sigterm_flag
+
+    @property
+    def is_ckpt_step(self):
+        """
+        Returns whether this step needs to call the checkpoint saving.
+
+        Returns:
+            bool: if true, the checkpoint should run.
+        """
+        is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
+        is_epoch_boundary = self.save_checkpoint_every_epoch and self.is_last_batch
+        return is_ckpt_step or is_epoch_boundary or self.is_last_step or self.sigterm_received
+
+    @property
+    def is_gc_step(self):
+        """
+        Returns whether this step needs to run manual garbage collection.
+        """
+        return self.gc_every_steps is not None and self.step % self.gc_every_steps == 0
+
+    @property
+    def is_last_step(self):
+        """
+        Returns whether the current step is the final training step.
+
+        Training stops at whichever comes first: reaching ``max_steps`` or
+        exhausting the configured number of epochs (see ``__iter__`` and
+        ``epochs``). ``max_steps`` alone is therefore not enough to detect the
+        end -- a small dataset can run out of epochs long before ``max_steps``
+        is hit (e.g. ``max_steps=100`` with only 60 steps' worth of data). In
+        that case the last batch of the last epoch is the final step. Detect it
+        so the final checkpoint and consolidated export -- which key off this
+        flag (see ``is_ckpt_step`` and the recipes' ``is_final_checkpoint``) --
+        are still written.
+        """
+        # we +1 here because the step is incremented after
+        # the batch is yielded in the tail handling of __iter__
+        if self.step + 1 >= self.max_steps:
+            return True
+        # Last batch of the last epoch when epochs are exhausted before max_steps.
+        if self.num_epochs is not None and self.epoch + 1 >= self.num_epochs:
+            return self.is_last_batch
+        return False
+
+    @property
+    def is_last_batch(self):
+        """
+        Returns whether this is the last batch for this epoch.
+        """
+        if self.epoch_len is None:
+            return False
+        return (self.step % self.epoch_len) == self.epoch_len - 1
+
+    @property
+    def sigterm_received(self):
+        """
+        Returns whether SIGTERM was received.
+        """
+        if self.sigterm_flag:
+            return True
+        if self.sig_handler is None:
+            return False
+        if self._sig_polled_step == self.step:
+            return False
+        self._sig_polled_step = self.step
+        self.sigterm_flag = any(self.sig_handler.signals_received())
+        return self.sigterm_flag
+
+    @property
+    def epochs(self):
+        """
+        Epoch iterator.
+
+        Yields:
+            iterator: over epochs
+        """
+        epoch = self.epoch
+        for e in range(epoch, self.num_epochs):
+            if self.step >= self.max_steps or self.sigterm_received:
+                return
+            yield e
+
+    def state_dict(self):
+        """
+        Get the current state of the scheduler.
+
+        Returns:
+            dict: Current state with 'step' and 'epoch' keys.
+        """
+        # At checkpoint time, we need to save step + 1 because we yield before incrementing the step
+        # and the checkpointing happens after the yield but before the increment.
+        # Added min(self.max_steps, self.step + 1) to ensure that the step is not greater than max_steps.
+        # for example, if state_dict is called outside the for loop that increments step scheduler.
+        return {"step": min(self.max_steps, self.step + 1), "epoch": self.epoch}
+
+    def load_state_dict(self, s):
+        """
+        Load the scheduler state from a dictionary.
+
+        Args:
+            s (dict): Dictionary containing 'step' and 'epoch'.
+        """
+        self.step, self.epoch = s["step"], s["epoch"]
+
+
+# ---------------------------------------------------------------------------
+# Typed config + builder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StepSchedulerConfig:
+    """User-facing step scheduler configuration.
+
+    These fields correspond to the YAML-configurable parameters of the
+    training loop.  Runtime-only values (``dataloader``, ``dp_size``,
+    ``local_batch_size``) are passed separately to ``build_step_scheduler``.
+
+    Attributes:
+        global_batch_size: Total samples per optimizer step across all GPUs.
+        num_epochs: Number of training epochs.  When ``None`` the builder
+            derives it from ``max_steps``.  Default: 10.
+        max_steps: Hard cap on optimizer steps.  ``None`` means derive from
+            ``num_epochs * epoch_len``.
+        ckpt_every_steps: Save a checkpoint every N optimizer steps.
+            ``None`` defaults to once per epoch.
+        save_checkpoint_every_epoch: Also checkpoint at every epoch boundary.
+        validate_on_checkpoint: Also run validation on checkpoint steps.
+        val_every_steps: Run validation every N optimizer steps.
+            ``None`` disables periodic validation.
+        log_remote_every_steps: Log to WandB / MLflow every N steps.
+        loss_average_window_steps: Rolling window size for averaged training loss
+            metrics.
+        gc_every_steps: Force ``gc.collect()`` every N steps.
+            ``None`` disables manual GC.
+        start_step: Initial global step (for checkpoint resume).
+        start_epoch: Initial epoch (for checkpoint resume).
+        preemption_signal: Signal(s) that trigger a graceful preemption checkpoint, each given as
+            a signal number, name (e.g. ``"SIGTERM"``), or a list thereof.  ``None`` disables
+            preemption checkpointing.  Default: ``"SIGTERM"``.
+    """
+
+    global_batch_size: int = 32
+    num_epochs: int | None = 10
+    max_steps: int | None = None
+    ckpt_every_steps: int | None = 100
+    save_checkpoint_every_epoch: bool = True
+    validate_on_checkpoint: bool = True
+    val_every_steps: int | None = None
+    log_remote_every_steps: int = 1
+    loss_average_window_steps: int = 50
+    gc_every_steps: int | None = None
+    start_step: int = 0
+    start_epoch: int = 0
+    preemption_signal: int | str | list[int | str] | None = "SIGTERM"
+
+    def build(
+        self,
+        dataloader: DataLoader,
+        dp_group_size: int,
+        local_batch_size: int,
+        process_group: ProcessGroup | None = None,
+    ) -> StepScheduler:
+        """Build the step scheduler.
+
+        Args:
+            dataloader: The training dataloader.
+            dp_group_size: The size of the data parallel group.
+            local_batch_size: The size of the local batch.
+            process_group: Process group whose ranks participate in distributed signal handling.
+
+        Returns:
+            Configured StepScheduler.
+        """
+        kwargs = asdict(self)
+        kwargs["local_batch_size"] = local_batch_size
+        kwargs["dp_size"] = dp_group_size
+        kwargs["dataloader"] = dataloader
+        kwargs["process_group"] = process_group
+        return StepScheduler(**kwargs)

@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from importlib.metadata import version
 from pathlib import Path
 
+from optical_adaptor.artifacts import file_sha256, load_credentials, write_json
 from optical_adaptor.benchmark.config import load_benchmark
 from optical_adaptor.edit_distance import evaluate_edit_distance
 from optical_adaptor.inference.backend import (
@@ -17,29 +18,12 @@ from optical_adaptor.inference.backend import (
     build_backend,
 )
 from optical_adaptor.inference.messages import text_message
-from optical_adaptor.training.config import file_sha256, load_credentials, write_json
-
-
-def reconstruction_decoding(pipeline) -> DecodingConfig:
-    sampling = pipeline.config.evaluation.sampling
-    if not sampling.do_sample:
-        raise ValueError("training reconstruction decoding must use sampling")
-    return DecodingConfig(
-        temperature=sampling.temperature,
-        top_p=sampling.top_p,
-        top_k=sampling.top_k,
-        presence_penalty=sampling.presence_penalty,
-        frequency_penalty=0.0,
-        repetition_penalty=sampling.repetition_penalty,
-    )
 
 
 def task_decoding(task: str, pipeline) -> DecodingConfig:
-    if task == "qa":
-        return GREEDY_DECODING
-    if task == "reconstruction":
-        return reconstruction_decoding(pipeline)
-    raise ValueError(f"unknown benchmark task: {task}")
+    if task not in {"qa", "reconstruction"}:
+        raise ValueError(f"unknown benchmark task: {task}")
+    return GREEDY_DECODING
 
 
 def case_messages(case: dict, mode: str, directory: Path) -> list[dict]:
@@ -171,7 +155,7 @@ def main():
     load_credentials(pipeline, wandb=False)
     decoding = {
         "qa": GREEDY_DECODING.to_vllm_kwargs(),
-        "reconstruction": reconstruction_decoding(pipeline).to_vllm_kwargs(),
+        "reconstruction": task_decoding("reconstruction", pipeline).to_vllm_kwargs(),
     }
     identity = {
         "manifest_sha256": file_sha256(manifest_path),

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from optical_adaptor.training.config import (
+from optical_adaptor.artifacts import (
     PositiveInt,
     Revision,
     StrictConfig,

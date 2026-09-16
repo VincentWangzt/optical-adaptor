@@ -1,0 +1,242 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, Dict, List
+
+from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
+from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
+from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token, format_chat_template
+
+logger = logging.getLogger(__name__)
+
+# Map lightweight xLAM types to JSON schema / OpenAI tool types
+_TYPE_MAP = {
+    "str": "string",
+    "string": "string",
+    "int": "integer",
+    "integer": "integer",
+    "float": "number",
+    "double": "number",
+    "number": "number",
+    "bool": "boolean",
+    "boolean": "boolean",
+    "list": "array",
+    "array": "array",
+    "object": "object",
+}
+
+
+def _json_load_if_str(value):
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _convert_tools(raw_tools: List[Dict]) -> List[Dict]:
+    """
+    Convert xLAM tool definitions into OpenAI tool schema.
+    """
+    converted = []
+    for tool in raw_tools or []:
+        name = tool.get("name")
+        if not name:
+            logger.warning("Skipping tool without name: %s", tool)
+            continue
+        description = tool.get("description", "")
+        params_raw: Dict = tool.get("parameters") or {}
+
+        properties: Dict[str, Dict] = {}
+        required: List[str] = []
+        for param_name, param_def in params_raw.items():
+            if param_def is None:
+                continue
+            param_type = str(param_def.get("type", "string")).lower()
+            mapped_type = _TYPE_MAP.get(param_type, "string")
+            prop = {"type": mapped_type, "description": param_def.get("description", "")}
+            if "enum" in param_def:
+                prop["enum"] = param_def["enum"]
+            if "default" in param_def:
+                prop["default"] = param_def["default"]
+            else:
+                required.append(param_name)
+            properties[param_name] = prop
+
+        parameters_schema: Dict = {"type": "object", "properties": properties}
+        if required:
+            parameters_schema["required"] = required
+
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters_schema,
+                },
+            }
+        )
+    return converted
+
+
+def _convert_tool_calls(raw_calls: List[Dict], example_id: int | None = None) -> List[Dict]:
+    """
+    Convert xLAM answers field into OpenAI tool_calls messages.
+    """
+    tool_calls = []
+    for idx, call in enumerate(raw_calls or []):
+        name = call.get("name")
+        if not name:
+            logger.warning("Skipping call without name: %s", call)
+            continue
+        arguments = call.get("arguments", "")
+        if not isinstance(arguments, str):
+            # OpenAI tool calling format requires `function.arguments` to be a
+            # JSON-encoded string. Upstream xLAM uses string arguments, but
+            # derivative datasets may store them as dicts; serialize so the
+            # rendered chat template emits a consistent, valid JSON payload.
+            arguments = json.dumps(arguments, ensure_ascii=False)
+
+        call_id = f"call_{example_id}_{idx}" if example_id is not None else f"call_{idx}"
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }
+        )
+    return tool_calls
+
+
+def _format_example(
+    example,
+    tokenizer,
+    eos_token_id,
+    pad_token_id,
+    seq_length=None,
+    padding=None,
+    truncation=None,
+):
+    tools = _convert_tools(_json_load_if_str(example["tools"]))
+    tool_calls = _convert_tool_calls(_json_load_if_str(example["answers"]), example_id=example.get("id"))
+
+    formatted_text = [
+        {"role": "user", "content": example["query"]},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": tool_calls,
+        },
+    ]
+
+    return format_chat_template(
+        tokenizer=tokenizer,
+        formatted_text=formatted_text,
+        tools=tools,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        seq_length=seq_length,
+        padding=padding,
+        truncation=truncation,
+        answer_only_loss_mask=True,
+    )
+
+
+def make_xlam_dataset(
+    tokenizer,
+    seq_length=None,
+    limit_dataset_samples=None,
+    fp8=False,
+    split="train",
+    dataset_name="Salesforce/xlam-function-calling-60k",
+    padding=False,
+    truncation=False,
+):
+    """
+    Load and preprocess the xLAM function-calling dataset to OpenAI messages
+    compatible with the bulbasaur chat template (tool-calling aware).
+
+    Each example is formatted as:
+      - user: the natural language query
+      - assistant: emits tool_calls with serialized arguments
+      - tools: OpenAI function schema derived from the dataset tool specs
+    """
+    if limit_dataset_samples is not None:
+        assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
+        if "[" not in split:
+            split = f"{split}[:{limit_dataset_samples}]"
+        else:
+            logger.warning("Dataset split %s already contains slice, skipping limit_dataset_samples", split)
+
+    dataset = load_dataset(dataset_name, split=split)
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", 0)
+    pad_token_id = _add_pad_token(tokenizer) or eos_token_id
+
+    fmt_fn = lambda x: _format_example(  # noqa: E731
+        x,
+        tokenizer,
+        eos_token_id,
+        pad_token_id,
+        seq_length,
+        padding,
+        truncation,
+    )
+
+    return LazyMappedDataset(dataset, fmt_fn)
+
+
+@dataclass
+class XlamConfig:
+    """Construction-time configuration for the xLAM function-calling dataset (tokenizer is a build arg)."""
+
+    accepts_tokenizer: ClassVar[bool] = True
+
+    seq_length: int | None = None
+    """If set, pad/truncate each example to this length."""
+    limit_dataset_samples: int | None = None
+    """If set, limit the number of examples loaded from the split."""
+    fp8: bool = False
+    """Flag reserved for future mixed-precision use (currently unused)."""
+    split: str = "train"
+    """Which split of the dataset to load (e.g. ``train``, ``validation``)."""
+    dataset_name: str = "Salesforce/xlam-function-calling-60k"
+    """Identifier for the HuggingFace dataset to load."""
+    padding: bool | str = False
+    """Optional padding strategy."""
+    truncation: bool | str = False
+    """Optional truncation strategy."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
+        """Build the xLAM :class:`LazyMappedDataset` from this :class:`XlamConfig` and a runtime tokenizer."""
+        return make_xlam_dataset(
+            tokenizer=tokenizer,
+            seq_length=self.seq_length,
+            limit_dataset_samples=self.limit_dataset_samples,
+            fp8=self.fp8,
+            split=self.split,
+            dataset_name=self.dataset_name,
+            padding=self.padding,
+            truncation=self.truncation,
+        )

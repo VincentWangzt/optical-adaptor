@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import multiprocessing
 import os
@@ -11,15 +10,17 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
+from optical_adaptor.artifacts import file_sha256, fingerprint, load_credentials, write_json
+from optical_adaptor.automodel.config import FilterConfig
+from optical_adaptor.automodel.conversations import parse_visual_areas
+from optical_adaptor.automodel.data import ConversationDataset
 from optical_adaptor.benchmark.config import BenchmarkConfig, load_benchmark
 from optical_adaptor.inference.messages import chat_ids, text_message
 from optical_adaptor.renderer import FontChain, font_codepoints, render_pages
 from optical_adaptor.text import canonicalize
 from optical_adaptor.token_utils import load_tokenizer
-from optical_adaptor.training.config import file_sha256, fingerprint, load_credentials, write_json
-from optical_adaptor.training.data import load_manifest
 
 
 def source_lines(text: str) -> list[str]:
@@ -57,98 +58,69 @@ def save_image(text: str, directory: Path, pipeline) -> dict:
     return metadata
 
 
+def benchmark_records(pipeline):
+    filters = FilterConfig(
+        sources=None, tasks=None, image_bins=None, turn_bins=None, min_images=1, max_images=None
+    )
+    result = []
+    for split in ("train", "eval"):
+        dataset = ConversationDataset(str(pipeline.manifest.parent), split, filters)
+        for index, row in enumerate(dataset.rows):
+            record = dataset[index]
+            messages, areas = parse_visual_areas(record["messages"])
+            visuals = [messages[a["message"]]["content"][a["start"] : a["end"]] for a in areas]
+            result.append({**row, "visuals": visuals})
+    return result
+
+
 def reconstruction_sets(records, config, pipeline, directory):
     heldout = sorted(
-        (r for r in records if r["split"] == "reconstruction"),
-        key=lambda r: fingerprint([config.seed, "multi-image", r["record_id"]]),
+        (r for r in records if r["split"] == "eval" and r["task"] == "reconstruction"),
+        key=lambda r: fingerprint([config.seed, r["sample_id"]]),
     )
-    # Nested disjoint groups: the 4/8-image cases combine neighboring 2-image cases.
-    cases, audit = [], {}
+    training_texts = {text for r in records if r["split"] == "train" for text in r["visuals"]}
+    heldout = [r for r in heldout if not training_texts.intersection(r["visuals"])]
+    pages = [(r, text) for r in heldout for text in r["visuals"]]
+    cases, audit = [], {"validation_scope": "sample-level", "eligible_samples": len(heldout)}
     for count in config.multi_image_counts:
-        usable = len(heldout) // count * count
+        usable = len(pages) // count * count
         for offset in range(0, usable, count):
-            group = heldout[offset : offset + count]
-            ids = [r["record_id"] for r in group]
+            group = pages[offset : offset + count]
+            ids = [r["sample_id"] for r, _ in group]
+            visuals = [text for _, text in group]
             cases.append(
                 {
-                    "id": fingerprint(["multi", ids]),
+                    "id": fingerprint(["multi", ids, visuals]),
                     "suite": f"reconstruction-{count}-images",
                     "task": "reconstruction",
                     "source_record_ids": ids,
-                    "repositories": [r["repository"] for r in group],
-                    "images": [save_image(r["visual"], directory, pipeline) for r in group],
-                    "reference": "\n".join(r["visual"] for r in group),
+                    "repositories": [r["group_id"] for r, _ in group],
+                    "images": [save_image(text, directory, pipeline) for text in visuals],
+                    "reference": "\n".join(visuals),
                     "instruction": config.reconstruction_instruction,
                 }
             )
-        audit[f"multi_{count}"] = {
-            "cases": usable // count,
-            "unused_records": len(heldout) - usable,
-        }
-
-    wanted = {r["record_id"]: r for r in heldout}
-    cache = Path(
-        snapshot_download(
-            pipeline.config.data.dataset_id,
-            revision=pipeline.config.data.revision,
-            repo_type="dataset",
-            local_files_only=True,
+        audit[f"multi_{count}"] = {"cases": usable // count, "unused_pages": len(pages) - usable}
+    long_count = 0
+    for row in heldout:
+        lines = source_lines("\n".join(row["visuals"]))
+        if len(lines) < config.long_source_lines:
+            continue
+        reference = join_lines(lines[: config.long_source_lines])
+        cases.append(
+            {
+                "id": fingerprint(["long", row["sample_id"], config.long_source_lines]),
+                "suite": f"reconstruction-{config.long_source_lines}-lines",
+                "task": "reconstruction",
+                "source_record_ids": [row["sample_id"]],
+                "repositories": [row["group_id"]],
+                "images": [save_image(reference, directory, pipeline)],
+                "reference": reference,
+                "instruction": config.reconstruction_instruction,
+            }
         )
-    )
-    files = sorted(cache.glob("data/*/data.json"))
-    if len(files) != 30:
-        raise ValueError(f"expected the existing 30-language source cache, got {len(files)} files")
-    coverage = frozenset().union(
-        *(
-            font_codepoints(p)
-            for p in (pipeline.render.text.font, *pipeline.render.text.fallback_fonts)
-        )
-    )
-    found, long_cases, excluded = set(), [], Counter()
-    train_hashes = {r["canonical_sha256"] for r in records if r["split"] == "train"}
-    for path in files:
-        with path.open("rb") as stream:
-            for line in stream:
-                row = json.loads(line)
-                key = fingerprint([row["repository_name"].casefold(), row["path"]])
-                if key not in wanted or key in found:
-                    continue
-                found.add(key)
-                old = wanted[key]
-                raw_hash = hashlib.sha256(row["content"].encode()).hexdigest()
-                if raw_hash != old["source_sha256"]:
-                    raise ValueError(f"source cache hash mismatch: {key}")
-                text = canonicalize(row["content"], coverage, pipeline.render.text.tab_width).text
-                if hashlib.sha256(text.encode()).hexdigest() in train_hashes:
-                    excluded["training_content_duplicate"] += 1
-                    continue
-                lines = source_lines(text)
-                if len(lines) < config.long_source_lines:
-                    excluded["fewer_than_80_source_lines"] += 1
-                    continue
-                reference = join_lines(lines[: config.long_source_lines])
-                long_cases.append(
-                    {
-                        "id": fingerprint(["long", key, config.long_source_lines]),
-                        "suite": f"reconstruction-{config.long_source_lines}-lines",
-                        "task": "reconstruction",
-                        "source_record_ids": [key],
-                        "repositories": [old["repository"]],
-                        "images": [save_image(reference, directory, pipeline)],
-                        "reference": reference,
-                        "instruction": pipeline.config.evaluation.instruction,
-                    }
-                )
-        print(
-            f"source cache: {path.parent.name}; found={len(found)} long={len(long_cases)}",
-            flush=True,
-        )
-    if found != set(wanted):
-        raise ValueError(
-            f"missing {len(set(wanted) - found)} held-out sources in the existing cache"
-        )
-    cases.extend(sorted(long_cases, key=lambda r: r["id"]))
-    audit["long"] = {"cases": len(long_cases), "excluded": dict(excluded)}
+        long_count += 1
+    audit["long"] = {"cases": long_count}
     return cases, audit
 
 
@@ -272,27 +244,11 @@ def main():
         cases, reconstruction_audit = saved["cases"], saved["audit"]
     else:
         cases, reconstruction_audit = reconstruction_sets(
-            load_manifest(pipeline), config, pipeline, directory
+            benchmark_records(pipeline), config, pipeline, directory
         )
         write_json(reconstruction_path, {"cases": cases, "audit": reconstruction_audit})
-    # Repository splitting cannot catch copied headers/code in different repositories.
-    records = load_manifest(pipeline)
-    training_hashes = {r["visual_sha256"] for r in records if r["split"] == "train"}
-    overlapping_ids = {
-        r["record_id"]
-        for r in records
-        if r["split"] == "reconstruction" and r["visual_sha256"] in training_hashes
-    }
-    excluded_cases = [
-        r["id"] for r in cases if overlapping_ids.intersection(r["source_record_ids"])
-    ]
-    cases = [r for r in cases if r["id"] not in excluded_cases]
-    reconstruction_audit["training_visual_overlap"] = {
-        "source_record_ids": sorted(overlapping_ids),
-        "excluded_case_ids": excluded_cases,
-    }
     tokenizer = load_tokenizer(
-        pipeline.config.models.qwen_id, revision=pipeline.config.models.qwen_revision
+        pipeline.optical.llm["model_id"], revision=pipeline.optical.llm["revision"]
     )
     qa_path = directory / "longcodeqa.json"
     if qa_path.exists():

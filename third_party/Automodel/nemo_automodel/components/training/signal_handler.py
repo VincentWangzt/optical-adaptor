@@ -1,0 +1,239 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import signal
+import types
+from collections.abc import Sequence
+from typing import Any
+
+import torch
+import torch.distributed
+
+SignalLike = int | str | signal.Signals
+
+
+def get_device(local_rank: int | None = None) -> torch.device:
+    """
+    Get the appropriate torch device based on the distributed backend.
+
+    Args:
+        local_rank: The local rank, used to specify the CUDA device index for NCCL.
+                    If None, uses the default CUDA device.
+
+    Returns:
+        The torch.device ('cuda' for NCCL, 'cpu' for Gloo).
+
+    Raises:
+        RuntimeError: If the distributed backend is neither 'nccl' nor 'gloo'.
+    """
+    backend = torch.distributed.get_backend()
+    if backend == "nccl":
+        if local_rank is None:
+            device = torch.device("cuda")
+        else:
+            device = torch.device(f"cuda:{local_rank}")
+    elif backend == "gloo":
+        device = torch.device("cpu")
+    else:
+        raise RuntimeError
+    return device
+
+
+def all_gather_item(
+    item: Any,
+    dtype: torch.dtype,
+    group: torch.distributed.ProcessGroup | None = None,
+    async_op: bool = False,
+    local_rank: int | None = None,
+) -> list[Any]:
+    """Perform an all_gather operation on a single Python object.
+
+    Converts the item to a tensor, performs all_gather, and converts back to a list
+    of Python objects from all ranks.
+
+    Args:
+        item (Any): The Python object to gather.
+        dtype (torch.dtype): The torch dtype to use for the intermediate tensor.
+        group (Optional[torch.distributed.ProcessGroup]): The process group to gather within
+            (defaults to the global group).
+        async_op (bool): Whether the operation should be asynchronous.
+        local_rank (Optional[int]): The local rank to determine the device.
+
+    Returns:
+        list[Any]: A list containing the gathered items (of type Any) from all ranks in the group.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return [item]
+
+    device = get_device(local_rank)
+
+    if group is not None:
+        group_size = group.size()
+    else:
+        group_size = torch.distributed.get_world_size()
+
+    tensor = torch.tensor([item], device=device, dtype=dtype)
+    output_tensors = [torch.zeros(1, dtype=tensor.dtype, device=tensor.device) for _ in range(group_size)]
+    torch.distributed.all_gather(output_tensors, tensor, group, async_op)
+    output = [elem.item() for elem in output_tensors]
+    return output
+
+
+class DistributedSignalHandler:
+    """
+    Context manager to handle signals gracefully in a distributed setting.
+
+    Installs a signal handler upon entering the context that sets a flag
+    when the specified signal is received. The `signals_received` method
+    can be used to check if any rank received the signal (using all_gather).
+    The original signal handler is restored upon exiting the context.
+
+    Args:
+        sig: One or more signals to handle, each given as a signal number,
+            name (e.g. "SIGTERM"), or ``signal.Signals`` member. Accepts a
+            single value or a sequence. Defaults to signal.SIGTERM.
+        group: Process group whose ranks participate in signal propagation.
+            Defaults to the global process group.
+    """
+
+    def __init__(
+        self,
+        sig: SignalLike | Sequence[SignalLike] = signal.SIGTERM,
+        group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
+        """
+        Constructor for the DistributedSignalHandler.
+
+        Args:
+            sig (SignalLike | Sequence[SignalLike], optional): One or more signals to handle,
+                each given as a signal number, name (e.g. "SIGTERM"), or ``signal.Signals``
+                member. Defaults to signal.SIGTERM.
+            group: Process group whose ranks participate in signal propagation.
+                Defaults to the global process group.
+        """
+        specs = sig if isinstance(sig, (list, tuple)) else [sig]
+        sigs = [resolve_signal(s) for s in specs]
+        if len(sigs) == 0:
+            raise ValueError("At least one signal must be provided")
+        if len(set(sigs)) != len(sigs):
+            raise ValueError(f"Duplicate signals provided: {[s.name for s in sigs]}")
+        self.sigs = sigs
+        self.group = group
+        self._signal_received = False
+        self.released = False
+        self.original_handlers = {}
+
+    @property
+    def sig(self) -> signal.Signals:
+        """Backward-compatible accessor for the first configured signal."""
+        return self.sigs[0]
+
+    def signals_received(self) -> list[bool]:
+        """
+        Check if any rank in the configured group received the signal.
+
+        Uses all_gather to collect the signal status from all ranks.
+
+        Returns:
+            A list of booleans, where each element indicates if the
+            corresponding rank received the signal.
+        """
+        all_received = all_gather_item(self._signal_received, dtype=torch.int32, group=self.group)
+        return all_received
+
+    def __enter__(self) -> "DistributedSignalHandler":
+        """
+        Enters the signal-managed area.
+
+        Returns:
+            DistributedSignalHandler: returns self.
+        """
+        self._signal_received = False
+        self.released = False
+
+        def handler(signum: int, frame: Any | None) -> None:
+            logging.info("Received signal {}, initiating graceful stop".format(signum))
+            self._signal_received = True
+
+        for s in self.sigs:
+            self.original_handlers[s] = signal.getsignal(s)
+            signal.signal(s, handler)
+            logging.info("Signal handler installed for {}".format(s.name))
+
+        return self
+
+    def __exit__(
+        self, exc_type: type | None, exc_val: BaseException | None, exc_tb: types.TracebackType | None
+    ) -> None:  # noqa: E501
+        """
+        Release the signal handler and restore the original handler.
+        """
+        self.release()
+
+    def release(self) -> bool:
+        """
+        Restore the original signal handler.
+
+        Returns:
+            True if the handler was released, False if it was already released.
+        """
+        if self.released:
+            return False
+
+        for s, original in self.original_handlers.items():
+            signal.signal(s, original)
+        self.released = True
+        return True
+
+
+def resolve_signal(sig: SignalLike) -> signal.Signals:
+    """
+    Resolve a user-provided signal specification to "signal.Signals" member.
+
+    Accepts integers (e.g. "15"), "signal.Signals" members (e.g. "signal.SIGTERM")
+    and case-insensitive string names with or without the "SIG" prefix (e.g. "SIGTERM",
+    "sigusr1", "USR2"). String support allows the pre-emption signal to be configured from YAML.
+
+    Args:
+        sig: The signal specification to resolve.
+
+    Returns:
+        The corresponding "signal.Signals" member.
+
+    Raises:
+        ValueError: If the specification does not name a valid signal.
+        TypeError: If sig is not an int, str, or "signal.Signals".
+    """
+
+    if isinstance(sig, signal.Signals):
+        return sig
+    if isinstance(sig, bool):
+        # bool is a subclass of int; reject it before the int branch so
+        # True/False don't silently resolve to SIGHUP / an invalid number.
+        raise TypeError(f"Signal must be an int, str or signal.Signals, got bool: {sig!r}")
+    if isinstance(sig, int):
+        try:
+            return signal.Signals(sig)
+        except ValueError as e:
+            raise ValueError(f"Invalid signal number: {sig}") from e
+    if isinstance(sig, str):
+        name = sig.strip().upper()
+        if not name.startswith("SIG"):
+            name = "SIG" + name
+        try:
+            return signal.Signals[name]
+        except KeyError as e:
+            raise ValueError(f"Unknown signal name: {sig!r}") from e
+    raise TypeError(f"Signal must be an int, str or signal.Signals, got {type(sig).__name__}")

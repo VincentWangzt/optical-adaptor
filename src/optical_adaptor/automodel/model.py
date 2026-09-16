@@ -1,151 +1,221 @@
+"""Unified optical VLM with selected-position logits and adapter-only checkpoints."""
+
 from __future__ import annotations
+
+from contextlib import nullcontext
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.ddp import DDPManager
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoTokenizer
 
-from optical_adaptor.automodel.processing import PairedTokens
+from optical_adaptor.adapters import MLPAdapter
+from optical_adaptor.automodel.vision import DeepSeekOCRVision
 
 
-class FrozenBackbone:
-    """One frozen text model serves both serial passes on each data-parallel rank."""
+@dataclass
+class FrozenResources:
+    """Pinned, reconstructible resources excluded from adapter checkpoint state.
 
-    def __init__(self, config: dict, device: torch.device, output_dim: int):
-        model_id, revision = config["model_id"], config["revision"]
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
-        full_config = AutoConfig.from_pretrained(model_id, revision=revision)
-        key = config["text_config_key"]
-        text_config = getattr(full_config, key) if key else full_config
-        self.model = NeMoAutoModelForCausalLM.from_pretrained(
-            model_id,
-            revision=revision,
-            config=text_config,
+    These modules are explicitly placed on this rank's device at construction.
+    They remain frozen but the student backbone permits input gradients.
+    """
+
+    language: nn.Module
+    vision: nn.Module | None
+
+
+class OpticalModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        pretrained_model_name_or_path,
+        llm,
+        vision,
+        adapter,
+        role,
+        image_microbatch_size,
+        device,
+    ):
+        super().__init__()
+        if role not in {"teacher", "student"}:
+            raise ValueError(f"Invalid optical model role: {role}")
+        full_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, revision=llm["revision"]
+        )
+        config = (
+            getattr(full_config, llm["text_config_key"]) if llm["text_config_key"] else full_config
+        )
+        language = NeMoAutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path,
+            revision=llm["revision"],
+            config=config,
             dtype=torch.bfloat16,
-            attn_implementation=config["attn_implementation"],
+            attn_implementation=llm["attn_implementation"],
             force_hf=True,
             use_liger_kernel=False,
             use_sdpa_patching=False,
         ).to(device)
-        self.model.requires_grad_(False).eval()
-        self.model.config.use_cache = False
-        self.device = device
-        if config["gradient_checkpointing"]:
-            self.model.gradient_checkpointing_enable(
+        language.requires_grad_(False).eval()
+        language.config.use_cache = False
+        if role == "student" and llm["gradient_checkpointing"]:
+            language.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-        if self.model.get_input_embeddings().weight.shape[1] != output_dim:
-            raise ValueError("Language-model embedding width does not match the adapter output")
+        encoder = None
+        if role == "student":
+            encoder = DeepSeekOCRVision(**{k: v for k, v in vision.items() if k != "_target_"})
+            encoder.to(device=device, dtype=torch.bfloat16)
+            self.adapter = MLPAdapter(**{k: v for k, v in adapter.items() if k != "_target_"}).to(
+                device
+            )
+        self.resources = FrozenResources(language, encoder)
+        self.config = language.config
+        self.role = role
+        self.image_microbatch_size = image_microbatch_size
+        self.stage_timer = lambda name: nullcontext()
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, revision=llm["revision"]
+        )
+        if language.get_input_embeddings().weight.shape[1] != adapter["output_dim"]:
+            raise ValueError("Backbone and adapter embedding dimensions differ")
 
-    def mode(self, training: bool):
-        # HF checks .training to activate checkpointing, even for frozen weights.
-        self.model.train(training)
-        for module in self.model.modules():
+    @classmethod
+    def from_pretrained(
+        cls,
+        *,
+        pretrained_model_name_or_path,
+        llm,
+        vision,
+        adapter,
+        role,
+        image_microbatch_size,
+        distributed_setup,
+        peft_config,
+        freeze_config,
+    ):
+        if peft_config is not None or freeze_config is not None:
+            raise ValueError("Optical trainability is fixed: only the adapter is trainable")
+        if not isinstance(distributed_setup.strategy_config, DDPConfig):
+            raise ValueError(
+                "The optical Qwen wrapper currently supports DDP; TP/CP/PP are unvalidated"
+            )
+        if distributed_setup.activation_checkpointing:
+            raise ValueError("Configure language activation checkpointing under optical.llm")
+        model = cls(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            llm=llm,
+            vision=vision,
+            adapter=adapter,
+            role=role,
+            image_microbatch_size=image_microbatch_size,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        if role == "teacher":
+            return model
+        group = distributed_setup.mesh_context.process_group
+        model = DDPManager(distributed_setup.strategy_config, process_group=group).parallelize(
+            model
+        )
+        # The framework single-rank DDP path casts parameters; retain FP32 master weights.
+        unwrapped = (
+            model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+        )
+        unwrapped.adapter.float()
+        return model
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.resources.language.train(mode and self.role == "student")
+        for module in self.resources.language.modules():
             if isinstance(module, nn.Dropout):
                 module.eval()
+        if self.resources.vision is not None:
+            self.resources.vision.eval()
+        return self
 
-    def inputs(self, pair: PairedTokens, adapted: torch.Tensor) -> torch.Tensor:
-        ids = torch.tensor(pair.student_ids, device=self.device)
-        embeddings = self.model.get_input_embeddings()(ids)
-        positions = torch.tensor(pair.image_positions, device=self.device).flatten()
-        return embeddings.index_copy(0, positions, adapted.flatten(0, 1).to(embeddings.dtype))
+    def embed(self, input_ids, pixel_values=None, image_positions=None):
+        embeddings = self.resources.language.get_input_embeddings()(input_ids)
+        if pixel_values is not None:
+            if self.role != "student" or image_positions is None:
+                raise ValueError("Only the student accepts pixels, with explicit image positions")
+            with self.stage_timer("vision_adapter"):
+                features = torch.cat(
+                    [
+                        self.resources.vision(pixels)
+                        for pixels in pixel_values.split(self.image_microbatch_size)
+                    ]
+                )
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    adapted = self.adapter(features).to(embeddings.dtype)
+                # [image, token, (batch, position)] preserves original image/target ordering.
+                positions = image_positions.flatten(0, 1)
+                flat_indices = positions[:, 0] * input_ids.shape[1] + positions[:, 1]
+                embeddings = (
+                    embeddings.flatten(0, 1)
+                    .index_copy(0, flat_indices, adapted.flatten(0, 1))
+                    .view(*input_ids.shape, -1)
+                )
+        return embeddings
 
-    def hidden(self, inputs: list[torch.Tensor], positions: list[list[int]]) -> torch.Tensor:
-        lengths = torch.tensor([len(item) for item in inputs], device=self.device)
-        padded = nn.utils.rnn.pad_sequence(inputs, batch_first=True)
-        attention = torch.arange(padded.shape[1], device=self.device)[None] < lengths[:, None]
-        position_ids = (attention.long().cumsum(-1) - 1).clamp_min(0)
-        hidden = self.model.base_model(
-            inputs_embeds=padded,
-            attention_mask=attention,
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        loss_positions,
+        pixel_values=None,
+        image_positions=None,
+    ):
+        inputs = self.embed(input_ids, pixel_values, image_positions)
+        hidden = self.resources.language.base_model(
+            inputs_embeds=inputs,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
         ).last_hidden_state
-        return torch.cat(
-            [
-                hidden[index, torch.tensor(selected, device=self.device)]
-                for index, selected in enumerate(positions)
-            ]
+        selected = hidden.gather(
+            1, loss_positions.clamp_min(0).unsqueeze(-1).expand(-1, -1, hidden.shape[-1])
         )
-
-    @torch.no_grad()
-    def teacher_hidden(self, pairs: list[PairedTokens]) -> torch.Tensor:
-        self.mode(False)
-        embed = self.model.get_input_embeddings()
-        inputs = [embed(torch.tensor(pair.teacher_ids, device=self.device)) for pair in pairs]
-        return self.hidden(inputs, [pair.teacher_positions for pair in pairs])
-
-    def student_hidden(self, pairs: list[PairedTokens], adapted: torch.Tensor) -> torch.Tensor:
-        self.mode(torch.is_grad_enabled())
-        inputs, offset = [], 0
-        for pair in pairs:
-            count = len(pair.image_positions)
-            inputs.append(self.inputs(pair, adapted[offset : offset + count]))
-            offset += count
-        if offset != len(adapted):
-            raise ValueError("Number of adapted images differs from the compiled visual slots")
-        return self.hidden(inputs, [pair.student_positions for pair in pairs])
+        # One full-vocabulary projection; no target-position chunk/checkpoint loop.
+        logits = self.resources.language.get_output_embeddings()(selected)
+        return SimpleNamespace(logits=logits)
 
     @torch.no_grad()
     def generate(
-        self, pair: PairedTokens, adapted: torch.Tensor, max_new_tokens: int
-    ) -> tuple[str, bool]:
-        self.mode(False)
-        inputs = self.inputs(pair, adapted)[: pair.generation_prefix_length].unsqueeze(0)
-        ids = self.model.generate(
-            inputs_embeds=inputs,
-            attention_mask=torch.ones(inputs.shape[:2], dtype=torch.long, device=self.device),
-            do_sample=False,
+        self, *, input_ids, attention_mask, pixel_values, image_positions, max_new_tokens, **kwargs
+    ):
+        self.eval()
+        embeddings = self.embed(input_ids, pixel_values, image_positions)
+        return self.resources.language.generate(
+            inputs_embeds=embeddings,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
+            do_sample=False,
             use_cache=True,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            **kwargs,
         )
-        ended = ids[0, -1].item() == self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        return self.tokenizer.decode(ids[0], skip_special_tokens=True), not ended
 
 
-def aligned_losses(
-    student: torch.Tensor,
-    teacher: torch.Tensor,
-    targets: torch.Tensor,
-    head: nn.Module,
-    kd_loss: nn.Module,
-    chunk_size: int,
-) -> torch.Tensor:
-    """Return sums [student CE, forward KL, teacher CE, agreement, correct, tokens].
-
-    Project only aligned hidden states. Checkpoint each vocabulary projection so
-    backward never retains a full [trajectory_length, vocabulary] probability array.
-    The KD primitive is AutoModel's exact full-vocabulary KDLoss.
-    """
-    if student.shape != teacher.shape or student.shape[0] != len(targets):
-        raise ValueError("Hidden states and supervised target identities must align")
-
-    def chunk_loss(student_chunk, teacher_chunk, labels):
-        s_logits = head(student_chunk).float()
-        with torch.no_grad():
-            t_logits = head(teacher_chunk).float()
-        ce = F.cross_entropy(s_logits, labels, reduction="sum")
-        kl = kd_loss(s_logits, t_logits, labels, num_batch_labels=1)
-        with torch.no_grad():
-            t_ce = F.cross_entropy(t_logits, labels, reduction="sum")
-            prediction = s_logits.argmax(-1)
-            agreement = (prediction == t_logits.argmax(-1)).sum()
-            correct = (prediction == labels).sum()
-        return torch.stack((ce, kl, t_ce, agreement, correct, labels.new_tensor(len(labels))))
-
-    losses = []
-    for start in range(0, len(targets), chunk_size):
-        args = (
-            student[start : start + chunk_size],
-            teacher[start : start + chunk_size],
-            targets[start : start + chunk_size],
+@torch.no_grad()
+def logit_statistics(student, teacher, labels, kd_loss):
+    """Unnormalized CE/KL/teacher CE/agreement/accuracy/target counts."""
+    valid = labels != -100
+    student, teacher, labels = student[valid].float(), teacher[valid].float(), labels[valid]
+    return torch.stack(
+        (
+            F.cross_entropy(student, labels, reduction="sum"),
+            kd_loss(student, teacher, labels, num_batch_labels=1),
+            F.cross_entropy(teacher, labels, reduction="sum"),
+            (student.argmax(-1) == teacher.argmax(-1)).sum(),
+            (student.argmax(-1) == labels).sum(),
+            labels.new_tensor(labels.numel()),
         )
-        if torch.is_grad_enabled():
-            losses.append(checkpoint(chunk_loss, *args, use_reentrant=False))
-        else:
-            losses.append(chunk_loss(*args))
-    return torch.stack(losses).sum(0)
+    )

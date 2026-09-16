@@ -37,7 +37,6 @@ class Source(StrictConfig):
     split: str
     thinking: bool
     max_records: int | None
-    weight: float = Field(gt=0)
 
 
 class PrepareConfig(StrictConfig):
@@ -62,7 +61,6 @@ class PrepareConfig(StrictConfig):
 class FilterConfig(StrictConfig):
     sources: list[str] | None
     tasks: list[str] | None
-    views: list[str] | None
     image_bins: list[str] | None
     turn_bins: list[str] | None
     min_images: int = Field(ge=1)
@@ -77,24 +75,22 @@ class ProcessingConfig(StrictConfig):
     vision_start: str
     vision_end: str
     preserve_all_reasoning: bool
-    loss_chunk_tokens: int = Field(gt=0)
     image_microbatch_size: int = Field(gt=0)
 
 
 class DataConfig(StrictConfig):
     train_filter: FilterConfig
     eval_filter: FilterConfig
-    balance_slices: bool
-    task_weights: dict[str, float]
+    weights: dict[str, float]
     samples_per_epoch: int | None
-    eval_samples_per_slice: int | None
+    eval_samples: dict[str, int]
     num_workers: int = Field(ge=0)
 
 
 class EvaluationConfig(StrictConfig):
     generation_every: int = Field(gt=0)
-    generation_samples_per_slice: int = Field(ge=0)
-    max_new_tokens: int = Field(gt=0)
+    generation_samples: dict[str, int]
+    max_new_tokens: dict[str, int]
     tasks: list[str]
 
 
@@ -135,11 +131,9 @@ def fingerprint(value) -> str:
 
 def preparation_fingerprint(optical: OpticalConfig, seed: int) -> str:
     prepare = optical.prepare.model_dump(exclude={"output_dir"})
-    for source in prepare["sources"]:
-        del source["weight"]  # Sampling weights do not change the stored examples.
     return fingerprint(
         {
-            "preparation_version": 2,
+            "preparation_version": 3,
             "seed": seed,
             "prepare": prepare,
             "render": Path(optical.render_config).read_text(encoding="utf-8"),
