@@ -6,7 +6,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.ddp import DDPManager
@@ -198,20 +197,3 @@ class OpticalModel(nn.Module):
             eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
             **kwargs,
         )
-
-
-@torch.no_grad()
-def logit_statistics(student, teacher, labels, kd_loss):
-    """Unnormalized CE/KL/teacher CE/agreement/accuracy/target counts."""
-    valid = labels != -100
-    student, teacher, labels = student[valid].float(), teacher[valid].float(), labels[valid]
-    return torch.stack(
-        (
-            F.cross_entropy(student, labels, reduction="sum"),
-            kd_loss(student, teacher, labels, num_batch_labels=1),
-            F.cross_entropy(teacher, labels, reduction="sum"),
-            (student.argmax(-1) == teacher.argmax(-1)).sum(),
-            (student.argmax(-1) == labels).sum(),
-            labels.new_tensor(labels.numel()),
-        )
-    )

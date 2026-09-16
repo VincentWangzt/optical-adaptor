@@ -715,7 +715,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
+                fetch_started = time.perf_counter()
                 for batch_idx, batches in enumerate(self.step_scheduler):
+                    self.batch_wait_seconds = time.perf_counter() - fetch_started
                     log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                     # log
                     self.log_train_metrics(log_data)
@@ -727,7 +729,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             logger.warning("Validation is not supported for pipeline parallelism")
                         else:
                             val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                            if "val_loss" in val_log_data.metrics:
+                                val_loss["val_loss"] = val_log_data.metrics["val_loss"]
                             self.log_val_metrics(val_log_data)
                         for mp in self.model_parts:
                             mp.train()
@@ -741,6 +744,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
+                    fetch_started = time.perf_counter()
         finally:
             if pbar is not None:
                 pbar.close()

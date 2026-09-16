@@ -2,6 +2,7 @@
 
 import json
 
+import polars as pl
 import pytest
 import torch
 from torch.utils.data import Dataset
@@ -9,6 +10,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from optical_adaptor.automodel.config import preparation_fingerprint, read_config
 from optical_adaptor.automodel.data import (
+    ConversationDataset,
     MixtureSampler,
     inherited_values,
     select_evaluation,
@@ -115,3 +117,33 @@ def test_preparation_identity_excludes_runtime_weights(tmp_path):
     )
     with pytest.raises(ValueError, match="Prepare a fresh DATA_DIR"):
         validate_preparation(limited, raw["seed"])
+
+
+def test_primary_bin_filters_do_not_create_a_cross_product(tmp_path):
+    _, optical = read_config("configs/automodel.yaml")
+    rows = [
+        dict(
+            sample_id="r",
+            slice="A/reconstruction/images-1",
+            source="A",
+            task="reconstruction",
+            image_bin="1",
+            turn_bin="3-4",
+            image_count=1,
+            split="eval",
+        ),
+        dict(
+            sample_id="n",
+            slice="A/next_action/turns-1",
+            source="A",
+            task="next_action",
+            image_bin="3-4",
+            turn_bin="1",
+            image_count=4,
+            split="eval",
+        ),
+    ]
+    pl.DataFrame(rows).write_parquet(tmp_path / "manifest.parquet")
+    filters = optical.data.eval_filter.model_copy(update={"image_bins": ["1"], "turn_bins": ["1"]})
+    dataset = ConversationDataset(str(tmp_path), "eval", filters)
+    assert {row["sample_id"] for row in dataset.rows} == {"r", "n"}

@@ -65,6 +65,19 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         super().__init__(cfg)
         self.raw = cfg.to_yaml_dict()
         self.optical = OpticalConfig.model_validate(self.raw["optical"])
+        for name, role in (("model", "student"), ("teacher_model", "teacher")):
+            model = self.raw[name]
+            expected = {
+                "llm": self.optical.llm,
+                "vision": self.optical.vision,
+                "adapter": self.optical.adapter,
+                "role": role,
+                "image_microbatch_size": self.optical.processing.image_microbatch_size,
+                "pretrained_model_name_or_path": self.optical.llm["model_id"],
+            }
+            for key, value in expected.items():
+                if model[key] != value:
+                    raise ValueError(f"{name}.{key} differs from the canonical optical config")
         if not 0 <= self.raw["kd_ratio"] <= 1 or self.raw["kd_loss_fn"]["chunk_size"] != 0:
             raise ValueError("KD ratio must be in [0,1] and position chunking must be disabled")
         self.events = {}
@@ -134,24 +147,11 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 num_workers=self.optical.data.num_workers,
             )
         leaves = self.eval_data.all_leaves
-        self.generation_counts = inherited_values(
-            self.optical.evaluation.generation_samples, leaves, integer=True
-        )
         self.generation_limits = inherited_values(
             self.optical.evaluation.max_new_tokens, leaves, integer=True
         )
         if any(value < 1 for value in self.generation_limits.values()):
             raise ValueError("Generation output caps must be positive")
-        generation_rows = [
-            row for row in self.eval_data.rows if row["task"] in self.optical.evaluation.tasks
-        ]
-        requested = {
-            key: self.generation_counts[key]
-            for key in self.eval_data.selected_leaves
-            if key.split("/")[1] in self.optical.evaluation.tasks
-        }
-        indices, generation_report = select_evaluation(generation_rows, requested, self.cfg.seed)
-        self.generation_ids = {generation_rows[i]["sample_id"] for i in indices}
         if self.dist_env.is_main:
             output = Path(self.cfg.checkpoint.checkpoint_dir)
             output.mkdir(parents=True, exist_ok=True)
@@ -160,12 +160,12 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                     {
                         "train": train_report,
                         "eval": eval_report,
-                        "generation": generation_report,
+                        "generation": eval_report["generation_quotas"],
                         "mixture": {
                             key: {"ratio": ratio, "eligible_rows": self.sampler.counts[key]}
                             for key, ratio in self.sampler.ratios.items()
                         },
-                        "eval_ids": [row["sample_id"] for row in self.eval_data.rows],
+                        "eval_ids": sorted(self.teacher_forced_ids),
                         "generation_ids": sorted(self.generation_ids),
                         "validation_scope": "sample-level",
                     },
@@ -204,7 +204,21 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             )
             requested = {key: all_requested[key] for key in dataset.selected_leaves}
             indices, report["quotas"] = select_evaluation(dataset.rows, requested, self.cfg.seed)
-            dataset.select(indices)
+            self.teacher_forced_ids = {dataset.rows[i]["sample_id"] for i in indices}
+            generation_counts = inherited_values(
+                self.optical.evaluation.generation_samples, dataset.all_leaves, integer=True
+            )
+            generation_requested = {
+                key: generation_counts[key]
+                if key.split("/")[1] in self.optical.evaluation.tasks
+                else 0
+                for key in dataset.selected_leaves
+            }
+            generation_indices, report["generation_quotas"] = select_evaluation(
+                dataset.rows, generation_requested, self.cfg.seed
+            )
+            self.generation_ids = {dataset.rows[i]["sample_id"] for i in generation_indices}
+            dataset.select(sorted(set(indices) | set(generation_indices)))
         report["selected_slices"] = dict(Counter(row["slice"] for row in dataset.rows))
         return dataset, report
 
@@ -237,6 +251,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         self.contract = RunContract(fingerprint(identity))
         output = Path(self.cfg.checkpoint.checkpoint_dir)
         restore = self.cfg.get("checkpoint.restore_from", None)
+        if restore is not None and not self.cfg.checkpoint.enabled:
+            raise ValueError("Checkpointing must be enabled to restore a run")
         occupied = any(output.glob("epoch_*_step_*"))
         if restore == "LATEST" and not occupied:
             raise FileNotFoundError(f"No checkpoint in {output}")
@@ -319,7 +335,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         result = super()._run_train_optim_step(batches, max_grad_norm)
         torch.cuda.synchronize()  # One collection boundary, never synchronize each substep.
         elapsed = self._dp_allreduce(
-            torch.tensor(time.perf_counter() - started), op=dist.ReduceOp.MAX
+            torch.tensor(time.perf_counter() - started + self.batch_wait_seconds),
+            op=dist.ReduceOp.MAX,
         ).item()
         local_counts = Counter(
             slice_key(record) for batch in batches for record in batch["records"]
@@ -327,7 +344,12 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         counts = self._dp_allreduce(
             torch.tensor([local_counts[key] for key in self.sampler.ratios])
         ).tolist()
-        metrics = {"timing/step": elapsed}
+        metrics = {
+            "timing/step": elapsed,
+            "timing/data_wait": self._dp_allreduce(
+                torch.tensor(self.batch_wait_seconds), op=dist.ReduceOp.MAX
+            ).item(),
+        }
         for key, count in zip(self.sampler.ratios, counts, strict=True):
             self.contract.consumed[key] += count
             metrics.update(
@@ -388,7 +410,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             )
             if not valid:
                 continue
-            totals[index] += self.last_stats.double()
+            if record["sample_id"] in self.teacher_forced_ids:
+                totals[index] += self.last_stats.double()
             if generate and record["sample_id"] in generation_ids:
                 if record["thinking"]:
                     raise ValueError(
@@ -455,7 +478,6 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                     f"{key}/teacher_ce": teacher_ce,
                     f"{key}/agreement": agreement,
                     f"{key}/token_accuracy": correct,
-                    f"{key}/tokens": count,
                     f"{key}/loss": (1 - self.kd_ratio) * ce + self.kd_ratio * kl,
                 }
             )
@@ -483,7 +505,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 encoding="utf-8",
             )
         # val_loss is the AutoModel loop's checkpoint metric.
-        metrics["val_loss"] = metrics["eval-core/loss"]
+        if "eval-core/loss" in metrics:
+            metrics["val_loss"] = metrics["eval-core/loss"]
         return MetricsSample(
             step=self.step_scheduler.step, epoch=self.step_scheduler.epoch, metrics=metrics
         )
@@ -494,9 +517,12 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             if wandb.run is not None:
                 wandb.log(log_data.metrics, step=log_data.step)
             logging.info(
-                "Evaluation CE=%.5f KL=%.5f",
-                log_data.metrics["eval-core/ce"],
-                log_data.metrics["eval-core/kl"],
+                "Evaluation aggregate metrics: %s",
+                {
+                    key: value
+                    for key, value in log_data.metrics.items()
+                    if key.startswith("eval-core/") and key.count("/") == 1
+                },
             )
 
 

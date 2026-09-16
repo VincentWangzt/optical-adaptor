@@ -127,7 +127,12 @@ class ConversationDataset(Dataset):
                 unknown = set(values) - set(manifest[column].unique().to_list())
                 if unknown:
                     raise ValueError(f"Unknown {key}: {sorted(unknown)}")
-                frame = frame.filter(pl.col(column).is_in(values))
+                selected = pl.col(column).is_in(values)
+                if key == "image_bins":
+                    selected = selected | (pl.col("task") == "next_action")
+                elif key == "turn_bins":
+                    selected = selected | (pl.col("task") != "next_action")
+                frame = frame.filter(selected)
         self.selected_leaves = sorted(
             key
             for key in self.all_leaves

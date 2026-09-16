@@ -388,28 +388,29 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             hidden_states = get_final_hidden_states(student_out)
             del student_out
 
-            # CE loss (skip when kd_ratio >= 1.0).
-            if self.kd_ratio >= 1.0:
-                ce_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
-            else:
-                ce_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=student_logits,
-                    labels=labels,
-                    model=model,
-                    hidden_states=hidden_states,
-                    num_label_tokens=num_label_tokens,
-                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
+            with self._stage_timer("loss"):
+                # CE loss (skip when kd_ratio >= 1.0).
+                if self.kd_ratio >= 1.0:
+                    ce_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
+                else:
+                    ce_loss = calculate_loss(
+                        self.loss_fn,
+                        logits=student_logits,
+                        labels=labels,
+                        model=model,
+                        hidden_states=hidden_states,
+                        num_label_tokens=num_label_tokens,
+                        grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
+                    )
+                del hidden_states
+                kd_loss = self.kd_loss_fn(
+                    student_logits,
+                    teacher_logits,
+                    labels,
+                    num_batch_labels=num_label_tokens,
                 )
-            del hidden_states
-
-            kd_loss = self.kd_loss_fn(
-                student_logits,
-                teacher_logits,
-                labels,
-                num_batch_labels=num_label_tokens,
-            )
-            self._record_kd_metrics(student_logits, teacher_logits, labels, ce_loss, kd_loss, num_label_tokens)
+                if not is_train:
+                    self._record_kd_metrics(student_logits, teacher_logits, labels, ce_loss, kd_loss, num_label_tokens)
             del teacher_logits
 
             local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
@@ -424,7 +425,11 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         return nullcontext()
 
     def _record_kd_metrics(self, student_logits, teacher_logits, labels, ce_loss, kd_loss, denominator):
-        """Optional addon metrics at the aligned full-vocabulary logit boundary."""
+        """Optional evaluation metrics for logits [B, T, V] and labels [B, T].
+
+        Both branches share the target axis T; labels use -100 for padding.
+        The scalar CE/KD losses are divided by the supplied valid-target denominator.
+        """
 
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with KD loss tracking."""

@@ -18,7 +18,7 @@ Install the locked Linux training environment on the GPU server:
 uv sync --locked --group dev
 ```
 
-AutoModel is pinned to a Git commit, with Transformers 5.15.1, PyTorch 2.13/CUDA 13,
+AutoModel is installed from the pinned editable checkout in `third_party/Automodel`, with Transformers 5.15.1, PyTorch 2.13/CUDA 13,
 and FLA 0.5.2. For the standalone OCR inference commands, install the optional
 `inference` extra with `uv sync --locked --extra inference` and retain that extra
 when running them (`uv run --extra inference ...`).
@@ -155,7 +155,7 @@ comes from vLLM's pinned PyTorch wheel and is independent of the system `nvcc`.
 ## Verify
 
 ```bash
-uv run --no-sync pytest tests/test_automodel_processing.py tests/test_automodel_losses.py tests/test_automodel_data.py tests/test_training_data.py
+uv run --no-sync pytest tests/test_automodel_processing.py tests/test_automodel_losses.py tests/test_automodel_data.py tests/test_automodel_mesh.py
 uvx ruff check src/optical_adaptor/automodel tests/test_automodel_*.py
 ```
 
