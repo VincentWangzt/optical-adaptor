@@ -538,8 +538,8 @@ class ConfigNode:
         elif isinstance(v, list):
             return [self._instantiate_value(i) for i in v]
         else:
-            # Resolve leaf env vars (strings) before attempting to cast.
-            return translate_value(resolve_yaml_env_vars(v))
+            # Scalar types were established by YAML/CLI parsing and _wrap.
+            return resolve_yaml_env_vars(v)
 
     def to_dict(self) -> dict[str, Any]:
         """

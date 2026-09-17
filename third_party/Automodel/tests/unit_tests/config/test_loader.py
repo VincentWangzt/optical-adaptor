@@ -127,16 +127,16 @@ def test_confignode_wrap_and_fn_resolution(tmp_module):
     }
     cfg = ConfigNode(cfg_dict)
 
-    assert cfg.int_val == 123
+    assert cfg.int_val == "123"
     assert callable(cfg.my_fn) and cfg.my_fn is mod.echo
-    assert isinstance(cfg.nested, ConfigNode) and cfg.nested.flag is True
-    assert cfg.listy == [1, 2, 3]
+    assert isinstance(cfg.nested, ConfigNode) and cfg.nested.flag == "True"
+    assert cfg.listy == ["1", "2", "3"]
 
 
 def test_dotted_get_set_contains():
     cfg = ConfigNode({})
     cfg.set_by_dotted("foo.bar.baz", "456")
-    assert cfg.get("foo.bar.baz") == 456
+    assert cfg.get("foo.bar.baz") == "456"
     assert "foo.bar.baz" in cfg
     # List indexing inside dotted path
     cfg.set_by_dotted("arr.values", ["a", "b", "c"])
@@ -146,8 +146,7 @@ def test_dotted_get_set_contains():
 
 def test_instantiate_simple(tmp_module):
     """
-    Instantiate a simple object with scalar arguments supplied as strings
-    that must be translated to int.
+    Instantiate a simple object with typed scalar arguments.
     """
     mod = tmp_module(
         "factory_mod",
@@ -159,7 +158,7 @@ def test_instantiate_simple(tmp_module):
         """,
     )
     cfg = ConfigNode(
-        {"_target_": "factory_mod.Point", "x": "1", "y": "2"},
+        {"_target_": "factory_mod.Point", "x": 1, "y": 2},
     )
     obj = cfg.instantiate()
     assert isinstance(obj, mod.Point)
@@ -174,8 +173,7 @@ def test_instantiate_simple(tmp_module):
 )
 def test_instantiate_path_simple(tmp_module, path, exists):
     """
-    Instantiate a simple object with scalar arguments supplied as strings
-    that must be translated to int.
+    Instantiate a simple object with typed scalar arguments.
     """
     mod = tmp_module(
         "factory_mod",
@@ -187,7 +185,7 @@ def test_instantiate_path_simple(tmp_module, path, exists):
         """,
     )
     cfg = ConfigNode(
-        {"factory_mod": {"_target_": "factory_mod.Point", "x": "1", "y": "2"}},
+        {"factory_mod": {"_target_": "factory_mod.Point", "x": 1, "y": 2}},
     )
     obj = cfg.instantiate_path(path)
     if exists:
@@ -235,7 +233,7 @@ def test_instantiate_nested(tmp_module):
     cfg = ConfigNode(
         {
             "_target_": "nested_mod.Box",
-            "width": "3",
+            "width": 3,
             "height": {
                 "_target_": "nested_mod.to_int",
                 "value": "7",
@@ -257,7 +255,7 @@ def test_instantiate_with_overrides(tmp_module):
                 self.b = b
         """,
     )
-    cfg = ConfigNode({"_target_": "override_mod.Pair", "a": "10", "b": "20"})
+    cfg = ConfigNode({"_target_": "override_mod.Pair", "a": 10, "b": 20})
     pair = cfg.instantiate(b=99)
     assert (pair.a, pair.b) == (10, 99)
 
@@ -272,8 +270,7 @@ def test_to_dict_roundtrip():
     src = {"alpha": "1", "beta": {"gamma": "True"}}
     cfg = ConfigNode(src)
     roundtrip = cfg.to_dict()
-    # translate_value means "1"->1 and "True"->True
-    assert roundtrip == {"alpha": 1, "beta": {"gamma": True}}
+    assert roundtrip == src
 
 
 def test_repr_contains_paths():
@@ -301,7 +298,7 @@ def test_str_does_not_include_internal_original_strings_mapping():
 
 
 def test_load_yaml_config(tmp_path):
-    """YAML helper must produce a ConfigNode with translated values."""
+    """YAML helper preserves quoted scalars instead of reinterpreting identifiers."""
     yml = tmp_path / "cfg.yaml"
     yml.write_text(
         """
@@ -313,9 +310,9 @@ def test_load_yaml_config(tmp_path):
     )
     cfg = load_yaml_config(str(yml))
     assert isinstance(cfg, ConfigNode)
-    assert cfg.learning_rate == 0.001
-    assert cfg.scheduler.step_size == 10
-    assert cfg.scheduler.gamma == 0.5
+    assert cfg.learning_rate == "0.001"
+    assert cfg.scheduler.step_size == "10"
+    assert cfg.scheduler.gamma == "0.5"
 
 
 def test_load_yaml_config_resolves_oc_env(monkeypatch, tmp_path: Path):
