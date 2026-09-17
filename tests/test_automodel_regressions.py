@@ -34,9 +34,10 @@ def test_native_text_checkpoint_destinations_preserve_storage_and_ties():
 
 
 def test_empty_targets_preserve_backward_graph():
-    student = torch.randn(1, 3, 7, requires_grad=True)
+    student = torch.randn(1, 3, 7, dtype=torch.bfloat16, requires_grad=True)
     loss = KDLoss(chunk_size=0)(student, torch.randn_like(student), torch.full((1, 3), -100))
     loss.backward()
+    assert loss.dtype == torch.float32
     assert torch.equal(student.grad, torch.zeros_like(student))
 
 

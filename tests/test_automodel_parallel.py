@@ -164,15 +164,26 @@ def run(axis, checkpointing):
         actual = captured["gradient"]
         relative = ((actual - expected).norm() / expected.norm()).item()
         assert torch.isfinite(actual).all()
-        assert relative < 0.08, (axis, step, relative, actual.norm().item(), expected.norm().item())
+        assert relative < 0.025, (
+            axis,
+            step,
+            relative,
+            actual.norm().item(),
+            expected.norm().item(),
+        )
         norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
+        torch.testing.assert_close(report.metrics["grad_norm"].float(), norm, rtol=0.025, atol=1e-7)
+        torch.testing.assert_close(
+            torch.tensor(report.metrics["loss"]),
+            torch.tensor(0.6 * report.metrics["ce_loss"] + 0.4 * report.metrics["kd_loss"]),
+        )
         reference_optimizer.step()
         reference_optimizer.zero_grad(set_to_none=True)
         delta = max(
             (full(a) - b).abs().max().item()
             for a, b in zip(plain.adapter.parameters(), reference.adapter.parameters(), strict=True)
         )
-        assert delta < 0.00081, (axis, step, delta)
+        assert delta < 0.00004, (axis, step, delta)
         assert all(p.dtype == torch.float32 for p in plain.adapter.parameters())
         assert all(p.grad is None for p in plain.adapter.parameters())
         results.append(

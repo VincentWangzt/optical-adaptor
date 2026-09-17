@@ -242,12 +242,19 @@ class KDLoss(nn.Module):
         Returns:
             Scalar tensor containing zero-based forward KL.
         """
+        # Resolve precision even for empty CP shards so metric collectives use
+        # the same scalar dtype on ranks with and without supervised targets.
+        tp_group = self.tp_group
+        if tp_group is None and _HAVE_DTENSOR and isinstance(student_logits, DTensor):
+            tp_group = _infer_tp_group_from_dtensor(student_logits)
         # Exclude padding / ignored tokens from the loss.
         valid_mask = (labels != self.ignore_index).view(-1)
         if valid_mask.sum() == 0:
             # CP ranks can own only padding. Keep their backward graph alive so
             # differentiable context collectives still run on every rank.
             local_logits = student_logits.to_local() if isinstance(student_logits, DTensor) else student_logits
+            if self.fp32_upcast or tp_group is None:
+                local_logits = local_logits.float()
             return local_logits.sum() * 0.0
 
         if student_logits.ndim > 2:
@@ -256,11 +263,6 @@ class KDLoss(nn.Module):
             teacher_logits = teacher_logits.view(-1, teacher_logits.shape[-1])
         if labels.ndim > 1:
             labels = labels.view(-1)
-
-        # Determine TP group: prefer explicit argument, then auto-detect from DTensor.
-        tp_group = self.tp_group
-        if tp_group is None and _HAVE_DTENSOR and isinstance(student_logits, DTensor):
-            tp_group = _infer_tp_group_from_dtensor(student_logits)
 
         if tp_group is not None:
             # TP path: keep local shards to avoid gathering the full vocabulary.
