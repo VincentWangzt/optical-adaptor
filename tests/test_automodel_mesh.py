@@ -1,6 +1,7 @@
 """Exercise the real KD bridge and accumulation against a serial CPU reference."""
 
 import socket
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.optim.optimizer import AdamWConfig
 from nemo_automodel.recipes.kd_utils import STOP_TEACHER
 from nemo_automodel.recipes.vlm.kd import KnowledgeDistillationRecipeForVLM
 
@@ -106,6 +108,50 @@ def worker(rank, world_size, student_size, port):
             model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         )
         torch.testing.assert_close(unwrapped.head.weight.grad, reference.head.weight.grad)
+        # Exercise the actual optimizer boundary, not just forward/backward:
+        # clipping, Adam moments, parameter references, and replica agreement.
+        optimizer_config = AdamWConfig(lr=0.002, betas=(0.9, 0.95), weight_decay=0.01)
+        recipe.optimizer = optimizer_config.build(model)
+        reference_optimizer = optimizer_config.build(reference)[0]
+        recipe.lr_scheduler = None
+        recipe.moe_mesh = None
+        recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+        recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+        recipe.timestamp = time.perf_counter()
+        recipe._ce_loss_buffer.clear()
+        recipe._kd_loss_buffer.clear()
+        recipe.optimizer[0].zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+        for step in range(2):
+            recipe.step_scheduler.step = step
+            recipe._run_train_optim_step(
+                [batch_for(rank, micro) for micro in range(2)], max_grad_norm=0.1
+            )
+            for r in range(student_size):
+                for micro in range(2):
+                    batch = batch_for(r, micro)
+                    logits = reference(**batch["student"]).logits
+                    truth = teacher(**batch["teacher"]).logits
+                    loss = 0.6 * recipe.loss_fn(
+                        logits, batch["labels"], num_label_tokens=denominator
+                    ) + 0.4 * recipe.kd_loss_fn(
+                        logits, truth, batch["labels"], num_batch_labels=denominator
+                    )
+                    loss.backward()
+            torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
+            reference_optimizer.step()
+            reference_optimizer.zero_grad(set_to_none=True)
+            torch.testing.assert_close(unwrapped.head.weight, reference.head.weight)
+            actual_state = recipe.optimizer[0].state[unwrapped.head.weight]
+            expected_state = reference_optimizer.state[reference.head.weight]
+            for key in expected_state:
+                torch.testing.assert_close(actual_state[key], expected_state[key])
+            replicas = [torch.empty_like(unwrapped.head.weight) for _ in range(student_size)]
+            dist.all_gather(
+                replicas, unwrapped.head.weight.detach(), group=recipe.kd_mesh_bridge.student_group
+            )
+            assert all(torch.equal(replicas[0], weight) for weight in replicas)
+            assert unwrapped.head.weight.grad is None
         recipe.kd_mesh_bridge.broadcast_command(STOP_TEACHER)
     dist.destroy_process_group()
 
