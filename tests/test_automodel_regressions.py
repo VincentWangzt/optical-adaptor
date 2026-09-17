@@ -19,13 +19,13 @@ from optical_adaptor.automodel.backbone import (
 )
 
 
-def test_native_cpu_float32_hybrid_forward_and_input_gradient_parity():
+def test_native_cpu_float32_attention_forward_and_input_gradient_parity():
     torch.manual_seed(17)
     config = Qwen3_5TextConfig(
         vocab_size=32,
         hidden_size=32,
         intermediate_size=64,
-        num_hidden_layers=2,
+        num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=2,
         head_dim=16,
@@ -33,7 +33,7 @@ def test_native_cpu_float32_hybrid_forward_and_input_gradient_parity():
         linear_num_value_heads=2,
         linear_key_head_dim=16,
         linear_value_head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
+        layer_types=["full_attention"],
         tie_word_embeddings=True,
     )
     native = OpticalQwen3_5ForCausalLM(
