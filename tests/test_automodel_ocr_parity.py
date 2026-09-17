@@ -264,6 +264,11 @@ def compare(config_path, output):
             official_encoder.quick_gelu = quick_gelu
             expected = reference_forward(ids, prepared)
             features = actual(pixels)
+            # The official infer method wraps generation (and thus the model
+            # prefill) in BF16 autocast. Check that execution contract too.
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                official_autocast = reference_forward(ids, prepared)
+                actual_autocast = actual(pixels)
         feature_diff = difference(features, expected)
         assert feature_diff["equal"], (name, feature_diff)
         side = math.isqrt(actual.tokens_per_image - 1)
@@ -275,6 +280,8 @@ def compare(config_path, output):
             "original_size": list(image.size),
             "pixels": pixel_diff,
             "features": feature_diff,
+            "official_autocast_vs_optical": difference(features, official_autocast),
+            "matched_autocast_paths": difference(actual_autocast, official_autocast),
             "official_image_tokens": int(prepared["images_seq_mask"].sum()),
         }
         prepared_images.append(pixels)
@@ -336,6 +343,7 @@ def compare(config_path, output):
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
     assert report["fp32_batch_vs_single"]["features"]["relative_l2"] < 1e-4
+    assert all(item["official_autocast_vs_optical"]["equal"] for item in report["images"].values())
 
 
 if __name__ == "__main__":
