@@ -10,9 +10,60 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
+from nemo_automodel.components.models.qwen3_5.state_dict_adapter import Qwen3_5DenseStateDictAdapter
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from optical_adaptor.automodel.parallel import select_context_targets
+
+
+class OpticalTextCheckpointAdapter(Qwen3_5DenseStateDictAdapter):
+    """Read the text tower of a Qwen VLM using native Qwen dtype/key conversion."""
+
+    def __init__(self, tied_embeddings: bool):
+        super().__init__()
+        self.tied_embeddings = tied_embeddings
+
+    def to_hf(self, state_dict: dict, **kwargs) -> dict:
+        """Expose native parameter destinations under the VLM checkpoint names.
+
+        Args:
+            state_dict: Native parameter tensors of arbitrary shape; axes are
+                unchanged and output values alias the original destinations.
+            **kwargs: Shared checkpoint conversion options.
+
+        Returns:
+            The same tensors with text-tower prefixes and a single tied embedding.
+        """
+        converted = super().to_hf(state_dict, **kwargs)
+        return {
+            ("model.language_model." + key.removeprefix("model."))
+            if key.startswith("model.")
+            else key: value
+            for key, value in converted.items()
+            if key != "lm_head.weight" or not self.tied_embeddings
+        }
+
+    def from_hf(self, hf_state_dict: dict, **kwargs) -> dict:
+        """Restore native text names; ignore the unused Qwen vision tower.
+
+        Args:
+            hf_state_dict: Checkpoint parameter tensors of arbitrary shape.
+                Only names change; the existing Qwen adapter handles FP32 SSMs.
+            **kwargs: Shared checkpoint conversion options.
+
+        Returns:
+            Native text parameters, with a shared alias for a tied output head.
+        """
+        text = {
+            "model." + key.removeprefix("model.language_model."): value
+            for key, value in hf_state_dict.items()
+            if key.startswith("model.language_model.")
+        }
+        if self.tied_embeddings and "model.embed_tokens.weight" in text:
+            text["lm_head.weight"] = text["model.embed_tokens.weight"]
+        elif "lm_head.weight" in hf_state_dict:
+            text["lm_head.weight"] = hf_state_dict["lm_head.weight"]
+        return super().from_hf(text, **kwargs)
 
 
 class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
@@ -34,6 +85,7 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
         # Reuse the HF Qwen TP plan consumed by AutoModel's Qwen strategy.
         self.model._tp_plan = Qwen3_5TextConfig.base_model_tp_plan
         self._tp_plan = {"lm_head": "colwise_rep"}
+        self.state_dict_adapter = OpticalTextCheckpointAdapter(config.tie_word_embeddings)
 
     def forward(
         self,

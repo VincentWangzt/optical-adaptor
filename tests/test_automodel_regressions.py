@@ -9,6 +9,29 @@ from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.vlm import kd
 
+from optical_adaptor.automodel.backbone import OpticalTextCheckpointAdapter
+
+
+def test_native_text_checkpoint_destinations_preserve_storage_and_ties():
+    adapter = OpticalTextCheckpointAdapter(tied_embeddings=True)
+    embedding = torch.zeros(11, 7, dtype=torch.bfloat16)
+    gate = torch.zeros(3, dtype=torch.float32)
+    state = {
+        "model.embed_tokens.weight": embedding,
+        "lm_head.weight": embedding,
+        "model.layers.0.linear_attn._fp32_params.A_log": gate,
+    }
+    destinations = adapter.to_hf(state)
+    destinations["model.language_model.embed_tokens.weight"].fill_(3)
+    destinations["model.language_model.layers.0.linear_attn.A_log"].fill_(7)
+    assert torch.equal(embedding, torch.full_like(embedding, 3))
+    assert torch.equal(gate, torch.full_like(gate, 7))
+    destinations["model.visual.unused.weight"] = torch.ones(4)
+    restored = adapter.from_hf(destinations)
+    assert restored.keys() == state.keys()
+    assert restored["lm_head.weight"] is restored["model.embed_tokens.weight"]
+    assert adapter.supports_low_memory_dcp_load
+
 
 def test_empty_targets_preserve_backward_graph():
     student = torch.randn(1, 3, 7, requires_grad=True)
