@@ -83,7 +83,7 @@ def shard_target_batch(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token
         batch["teacher_logits"] = shard_sequence_for_cp_round_robin(
             cp_mesh, batch["teacher_logits"]
         )[0]
-    context = create_context_parallel_ctx(cp_mesh, [], [], set(), "allgather")
+    context = _attention_context(cp_mesh)
     return (
         get_train_context(False, False, context),
         batch,
@@ -127,6 +127,12 @@ def generation_context(cp_mesh):
     """Use the same CP attention context for standalone generation forwards."""
     if cp_mesh is None:
         return nullcontext()
-    return get_train_context(
-        False, False, create_context_parallel_ctx(cp_mesh, [], [], set(), "allgather")
-    )()
+    return get_train_context(False, False, _attention_context(cp_mesh))()
+
+
+def _attention_context(cp_mesh):
+    # Torch 2.13's public buffer API reads buffers[0].device even when the
+    # model owns sequence sharding. Supply a minimal device anchor, leaving the
+    # real inputs and targets under their explicit, differentiable layouts.
+    anchor = torch.zeros(2 * cp_mesh.size(), device=cp_mesh.device_type)
+    return create_context_parallel_ctx(cp_mesh, [anchor], [0], {anchor}, "allgather")
