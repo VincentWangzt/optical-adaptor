@@ -187,8 +187,10 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         before = list(dataset.rows)
         assigned = range(self._get_dp_rank(), len(dataset), self._get_dp_group_size())
         local = dataset.preflight(self.compiler, assigned)
-        shards = [None] * self._get_dp_group_size()
-        dist.all_gather_object(shards, local, group=self._get_dp_group())
+        shards = [local]
+        if self._get_dp_group_size() > 1:
+            shards = [None] * self._get_dp_group_size()
+            dist.all_gather_object(shards, local, group=self._get_dp_group())
         indices, dropped, lengths = [], Counter(), {}
         for selected, report in shards:
             indices.extend(selected)
