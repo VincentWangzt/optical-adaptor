@@ -14,6 +14,7 @@
 
 from unittest.mock import MagicMock
 
+import torch
 import torch.nn as nn
 
 from nemo_automodel.components.distributed import ddp as ddp_mod
@@ -57,7 +58,7 @@ def test_ddp_manager_reapplies_trainability_before_constructor(monkeypatch):
     monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0, raising=True)
-    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda group=None: 2, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_backend", lambda: "gloo", raising=True)
 
     model = nn.Linear(2, 2)
@@ -84,7 +85,7 @@ def test_ddp_manager_applies_selective_activation_checkpointing(monkeypatch):
     monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0, raising=True)
-    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda group=None: 2, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_backend", lambda: "gloo", raising=True)
 
     ddp_ctor = MagicMock(return_value="wrapped")
@@ -105,7 +106,7 @@ def test_ddp_manager_forwards_activation_checkpointing_scope(monkeypatch):
     monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0, raising=True)
-    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2, raising=True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda group=None: 2, raising=True)
     monkeypatch.setattr(ddp_mod.dist, "get_backend", lambda: "gloo", raising=True)
 
     ddp_ctor = MagicMock(return_value="wrapped")
@@ -122,3 +123,17 @@ def test_ddp_manager_forwards_activation_checkpointing_scope(monkeypatch):
 
     apply_selective_ac.assert_called_once_with(model, activation_checkpointing_scope=("vision",))
     ddp_ctor.assert_called_once()
+
+
+def test_single_worker_preserves_parameter_values_and_precision(monkeypatch):
+    monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(ddp_mod.dist, "get_backend", lambda: "gloo")
+    model = nn.Linear(3, 7)
+    initial = {name: value.detach().clone() for name, value in model.named_parameters()}
+    assert ddp_mod.DDPManager(DDPConfig()).parallelize(model) is model
+    for name, parameter in model.named_parameters():
+        assert parameter.dtype == torch.float32
+        assert torch.equal(parameter, initial[name])

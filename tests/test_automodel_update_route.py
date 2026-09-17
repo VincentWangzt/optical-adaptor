@@ -29,7 +29,7 @@ def digest(tensor):
     return hashlib.sha256(data.tobytes()).hexdigest()
 
 
-def inspect_updates(config_path, output_dir):
+def inspect_updates(config_path, output_dir, require_repeatable):
     # Exercise normal single-worker distributed initialization as well.
     raw = yaml.safe_load(Path(config_path).read_text())
     raw["separate_meshes"] = False
@@ -186,11 +186,20 @@ def inspect_updates(config_path, output_dir):
     recipe.metric_logger_valid.close()
     recipe._finalize_and_close_checkpointer()
     dist.destroy_process_group()
+    if require_repeatable:
+        assert all("error" not in trial for trial in results.values()), results
+        for first, second in (
+            ("strict_default_a", "strict_default_b"),
+            ("strict_math_a", "strict_math_b"),
+        ):
+            assert comparisons[f"{first}:{second}"]["raw_gradient_max_difference"] == 0
+            assert comparisons[f"{first}:{second}"]["updated_parameter_max_difference"] == 0
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--require-repeatable", action="store_true")
     args = parser.parse_args()
-    inspect_updates(args.config, args.output)
+    inspect_updates(args.config, args.output, args.require_repeatable)

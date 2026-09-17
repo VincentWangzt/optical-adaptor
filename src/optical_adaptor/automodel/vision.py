@@ -27,6 +27,16 @@ def image_pixels(images: list[Image.Image], image_size: int) -> torch.Tensor:
     return torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).float().div_(127.5).sub_(1)
 
 
+def quick_gelu(inputs: torch.Tensor) -> torch.Tensor:
+    """DeepSeek's QuickGELU formula on arbitrary-shaped activations.
+
+    Keep eager BF16 rounding stable from the first call. The upstream scripted
+    function switches to a fused graph after profiling, changing encoder features
+    according to warm-up history even with deterministic algorithms enabled.
+    """
+    return inputs * torch.sigmoid(1.702 * inputs)
+
+
 class DeepSeekOCRVision(nn.Module):
     def __init__(
         self,
@@ -53,6 +63,7 @@ class DeepSeekOCRVision(nn.Module):
             raise ImportError(f"Cannot import DeepSeek encoder from {path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        module.quick_gelu = quick_gelu
         self.sam_model = module.build_sam_vit_b()
         self.vision_model = module.build_clip_l()
         # The native module persists this deterministic arange buffer, but the
@@ -85,9 +96,8 @@ class DeepSeekOCRVision(nn.Module):
     @torch.no_grad()
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         pixels = pixels.to(self.image_newline)
-        # Fused vision SDPA was non-repeatable even under strict deterministic
-        # algorithms. Scope math attention to the frozen encoder: the native
-        # text tower still needs AutoModel's CP-compatible attention backend.
+        # Scope the chosen numerical reference to vision: the native text tower
+        # still needs AutoModel's CP-compatible attention backend.
         context = sdpa_kernel(SDPBackend.MATH) if self.sdpa_backend == "math" else nullcontext()
         with context:
             sam = self.sam_model(pixels)
