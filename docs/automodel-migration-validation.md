@@ -2,6 +2,12 @@
 
 Date: 2026-09-17. Branch: `codex/automodel-optical-kd`.
 
+Follow-up: the [integration and weight-update review](automodel-code-review.md)
+identifies three concrete integration bugs and narrows repeated GPU differences
+to computation before the optimizer. Its fixed-input determinism experiments do
+not establish full-run checkpoint reproducibility; the original results below
+remain the record of the migration smoke runs.
+
 The confirmed decisions in `design-decisions-draft.md`, including inherited,
 independent generation budgets (P11), are implemented and synchronized through
 GitHub. Server validation completed: **94 distinct focused tests passed and nine
