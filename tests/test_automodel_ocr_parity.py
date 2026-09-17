@@ -258,11 +258,13 @@ def compare(config_path, output):
         assert pixel_diff["equal"], (name, pixel_diff)
         with sdpa_kernel(SDPBackend.MATH):
             if not report["images"]:
-                stock = [reference_forward(ids, prepared) for _ in range(3)]
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    stock = [reference_forward(ids, prepared) for _ in range(3)]
                 report["stock_scripted_repeats"] = [difference(value, stock[0]) for value in stock]
             # Isolate our documented activation change from encoding-path parity.
             official_encoder.quick_gelu = quick_gelu
-            expected = reference_forward(ids, prepared)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                expected = reference_forward(ids, prepared)
             features = actual(pixels)
             # The official infer method wraps generation (and thus the model
             # prefill) in BF16 autocast. Check that execution contract too.
@@ -316,7 +318,7 @@ def compare(config_path, output):
     ids, prepared = official_inputs(
         namespace, image_path, output / "dynamic", 640, crop_mode=True, base_size=1024
     )
-    with sdpa_kernel(SDPBackend.MATH):
+    with sdpa_kernel(SDPBackend.MATH), torch.autocast("cuda", dtype=torch.bfloat16):
         dynamic = reference_forward(ids, prepared)
     report["official_dynamic_mode"] = {
         "features": list(dynamic.shape),

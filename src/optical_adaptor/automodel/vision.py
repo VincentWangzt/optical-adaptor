@@ -24,7 +24,16 @@ def image_pixels(images: list[Image.Image], image_size: int) -> torch.Tensor:
     arrays = [
         np.asarray(image.convert("RGB").resize((image_size, image_size))).copy() for image in images
     ]
-    return torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).float().div_(127.5).sub_(1)
+    # The official ToTensor path produces contiguous CHW pixels. Under BF16
+    # autocast a different convolution layout changes the encoder's rounding.
+    return (
+        torch.from_numpy(np.stack(arrays))
+        .permute(0, 3, 1, 2)
+        .contiguous()
+        .float()
+        .div_(127.5)
+        .sub_(1)
+    )
 
 
 def quick_gelu(inputs: torch.Tensor) -> torch.Tensor:
@@ -110,14 +119,20 @@ class DeepSeekOCRVision(nn.Module):
             Features [images, tokens_per_image, output_dim], including row
             newlines and the final separator, in the encoder's dtype/device.
         """
-        pixels = pixels.to(self.image_newline)
+        pixels = pixels.to(self.image_newline).contiguous()
         # Scope the chosen numerical reference to vision: the native text tower
         # still needs AutoModel's CP-compatible attention backend.
         context = sdpa_kernel(SDPBackend.MATH) if self.sdpa_backend == "math" else nullcontext()
-        with context:
+        # Official infer wraps the full vision path, including the projector,
+        # in BF16 autocast. Keep that contract independent of recipe wrapping.
+        # An explicitly FP32 encoder remains FP32 for numerical diagnostics.
+        with (
+            context,
+            torch.autocast("cuda", dtype=torch.bfloat16, enabled=pixels.dtype == torch.bfloat16),
+        ):
             sam = self.sam_model(pixels)
             clip = self.vision_model(pixels, sam)
-        features = self.projector(torch.cat([clip[:, 1:], sam.flatten(2).transpose(1, 2)], -1))
+            features = self.projector(torch.cat([clip[:, 1:], sam.flatten(2).transpose(1, 2)], -1))
         batch, count, width = features.shape
         side = math.isqrt(count)
         if side * side != count:
