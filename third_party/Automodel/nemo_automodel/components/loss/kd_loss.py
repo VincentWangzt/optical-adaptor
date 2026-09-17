@@ -252,7 +252,9 @@ class KDLoss(nn.Module):
         if valid_mask.sum() == 0:
             # CP ranks can own only padding. Keep their backward graph alive so
             # differentiable context collectives still run on every rank.
-            local_logits = student_logits.to_local() if isinstance(student_logits, DTensor) else student_logits
+            local_logits = (
+                student_logits.to_local() if _HAVE_DTENSOR and isinstance(student_logits, DTensor) else student_logits
+            )
             if self.fp32_upcast or tp_group is None:
                 local_logits = local_logits.float()
             return local_logits.sum() * 0.0

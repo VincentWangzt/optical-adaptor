@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.distributed as dist
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     ShardLayout,
@@ -16,17 +19,23 @@ from nemo_automodel.components.distributed.context_parallel.utils import (
     create_context_parallel_ctx,
     get_train_context,
 )
-from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh, get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallelizer import (
     ParallelizationStrategy,
     Qwen3_5ParallelizationStrategy,
     register_parallel_strategy,
 )
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.nn.functional import all_reduce
 
+if TYPE_CHECKING:
+    from optical_adaptor.automodel.model import OpticalModel
 
-def select_context_targets(hidden: torch.Tensor, positions: torch.Tensor, cp_mesh) -> torch.Tensor:
+
+def select_context_targets(
+    hidden: torch.Tensor, positions: torch.Tensor, cp_mesh: DeviceMesh | None
+) -> torch.Tensor:
     """Redistribute selected hidden states from input owners to target owners.
 
     Args:
@@ -55,7 +64,14 @@ def select_context_targets(hidden: torch.Tensor, positions: torch.Tensor, cp_mes
     return shard_sequence_for_cp_round_robin(cp_mesh, selected)[0]
 
 
-def shard_target_batch(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+def shard_target_batch(
+    cp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh | None,
+    batch: dict[str, Any],
+    *,
+    loss_mask: torch.Tensor | None = None,
+    padding_token_id: int = 0,
+) -> tuple[Callable[[], AbstractContextManager], dict[str, Any], ShardLayout]:
     """Shard compact supervision while keeping each branch's input coordinates.
 
     Args:
@@ -64,7 +80,7 @@ def shard_target_batch(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token
         batch: Inputs [batch, input_sequence], positions [batch, targets], labels
             [batch, targets], and optional teacher logits [batch, targets, vocab].
             Image tensors remain full and are embedded inside the model forward.
-        loss_mask: Unsupported additional supervision mask.
+        loss_mask: Unsupported supervision mask [batch, targets]; must be None.
         padding_token_id: Unused; input padding belongs to the model forward.
 
     Returns:
@@ -102,8 +118,23 @@ def target_sharder() -> ContextParallelSharder:
 class OpticalParallelizationStrategy(ParallelizationStrategy):
     """Reuse Qwen's TP/FSDP/CP policy, with separate adapter precision ownership."""
 
-    def parallelize(self, model, device_mesh, **kwargs):
+    def parallelize(
+        self, model: OpticalModel, device_mesh: DeviceMesh, **kwargs: Any
+    ) -> OpticalModel:
         """Shard the language model, adapter, and always-executed outer root."""
+        if model.role == "student":
+            # The recipe deliberately seeds model construction by global rank.
+            # Frozen towers are restored from one checkpoint, but the new adapter
+            # has no pretrained state. FSDP does not synchronize initialization:
+            # align it over the existing DP/CP and TP groups before sharding.
+            # Otherwise TP replicas start with different weights and checkpoint
+            # deduplication mixes parameters from different initializations.
+            with torch.no_grad():
+                for mesh in (get_flat_mesh(device_mesh, "dp_cp"), device_mesh["tp"]):
+                    if mesh.size() > 1:
+                        source = int(mesh.mesh.flatten()[0])
+                        for parameter in model.adapter.parameters():
+                            dist.broadcast(parameter, src=source, group=mesh.get_group())
         language = model.resources.language
         Qwen3_5ParallelizationStrategy().parallelize(language, device_mesh, **kwargs)
         model.cp_mesh = language.cp_mesh
@@ -123,7 +154,7 @@ class OpticalParallelizationStrategy(ParallelizationStrategy):
         return fully_shard(model, **shard_options)
 
 
-def generation_context(cp_mesh):
+def generation_context(cp_mesh: DeviceMesh | None) -> AbstractContextManager:
     """Use the same CP attention context for standalone generation forwards."""
     if cp_mesh is None:
         return nullcontext()

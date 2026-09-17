@@ -10,6 +10,7 @@ from nemo_automodel._transformers.registry import register_architecture
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
+from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
 from nemo_automodel.components.models.qwen3_5.state_dict_adapter import Qwen3_5DenseStateDictAdapter
 from torch.distributed.device_mesh import DeviceMesh
@@ -26,7 +27,7 @@ class OpticalTextCheckpointAdapter(Qwen3_5DenseStateDictAdapter):
         super().__init__()
         self.tied_embeddings = tied_embeddings
 
-    def to_hf(self, state_dict: dict, **kwargs) -> dict:
+    def to_hf(self, state_dict: dict, **kwargs: Any) -> dict:
         """Expose native parameter destinations under the VLM checkpoint names.
 
         Args:
@@ -90,7 +91,7 @@ class OpticalTextCheckpointAdapter(Qwen3_5DenseStateDictAdapter):
 class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
     """Keep native weights, layers and checkpoint conversion; select before head."""
 
-    cp_mesh = None
+    cp_mesh: DeviceMesh | None = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -99,7 +100,9 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config, backend=None, **kwargs):
+    def __init__(
+        self, config: Qwen3_5TextConfig, backend: BackendConfig | None = None, **kwargs: Any
+    ) -> None:
         # Checkpoints may advertise an auxiliary MTP head. Optical KD supervises
         # the ordinary next-token head, as in the original HF text-only route.
         super().__init__(config, backend=backend, num_nextn_predict_layers=0, **kwargs)

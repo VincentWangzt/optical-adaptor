@@ -112,6 +112,11 @@ def run(axis, checkpointing):
     recipe._ce_loss_buffer, recipe._kd_loss_buffer = [], []
     model, teacher = tiny_model("student"), tiny_model("teacher")
     reference, reference_teacher = copy.deepcopy(model), copy.deepcopy(teacher)
+    # Model builders use ranked RNG. Deliberately differ before wrapping to test
+    # initialization synchronization, not only gradients from identical weights.
+    with torch.no_grad():
+        for parameter in model.adapter.parameters():
+            parameter.add_(dist.get_rank() * 0.125)
     if axis == "ddp":
         manager = DDPManager(setup.strategy_config)
         model = manager.parallelize(model)
