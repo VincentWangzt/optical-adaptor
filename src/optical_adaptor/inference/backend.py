@@ -300,8 +300,10 @@ class VllmBackend:
         from optical_adaptor.infer_ocr import _shutdown_vllm
 
         _shutdown_vllm(self.llm)
-        if self.vision:
-            self.vision.close()
+        if self.vision is not None:
+            self.vision = None
+            self.adapter = None
+            self.embedding_table = None
 
 
 BACKENDS = {"vllm-native": False, "vllm-adapter": True}
