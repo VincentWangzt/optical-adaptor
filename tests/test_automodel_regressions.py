@@ -4,12 +4,42 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+from nemo_automodel._transformers import model_init
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.recipes.vlm import kd
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from optical_adaptor.automodel.backbone import OpticalTextCheckpointAdapter
+
+
+def test_explicit_native_config_is_consumed_once_and_mtp_is_disabled():
+    config = Qwen3_5TextConfig(
+        vocab_size=16,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=16,
+        layer_types=["full_attention"],
+        num_nextn_predict_layers=1,
+        architectures=["OpticalQwen3_5ForCausalLM"],
+    )
+    custom, model = model_init.__init_model(
+        None,
+        config,
+        "sdpa",
+        torch.float32,
+        None,
+        False,
+        config=config,
+        backend=BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32"),
+    )
+    assert custom and model.config is config
+    assert model.mtp is None
 
 
 def test_native_text_checkpoint_destinations_preserve_storage_and_ties():

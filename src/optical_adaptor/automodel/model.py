@@ -6,6 +6,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
+from huggingface_hub import snapshot_download
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
@@ -54,9 +55,13 @@ class OpticalModel(nn.Module):
             getattr(full_config, llm["text_config_key"]) if llm["text_config_key"] else full_config
         )
         config.architectures = [OpticalQwen3_5ForCausalLM.__name__]
-        language = NeMoAutoModelForCausalLM.from_pretrained(
+        snapshot = snapshot_download(
             pretrained_model_name_or_path,
             revision=llm["revision"],
+            allow_patterns=["*.json", "*.safetensors"],
+        )
+        language = NeMoAutoModelForCausalLM.from_pretrained(
+            snapshot,
             config=config,
             dtype=torch.bfloat16,
             attn_implementation=llm["attn_implementation"],

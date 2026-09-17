@@ -79,9 +79,9 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
         supports_ep: bool = False
 
     def __init__(self, config, backend=None, **kwargs):
-        super().__init__(config, backend=backend, **kwargs)
-        if self.mtp is not None:
-            raise ValueError("Frozen optical KD does not use a trainable MTP head")
+        # Checkpoints may advertise an auxiliary MTP head. Optical KD supervises
+        # the ordinary next-token head, as in the original HF text-only route.
+        super().__init__(config, backend=backend, num_nextn_predict_layers=0, **kwargs)
         # Reuse the HF Qwen TP plan consumed by AutoModel's Qwen strategy.
         self.model._tp_plan = Qwen3_5TextConfig.base_model_tp_plan
         self._tp_plan = {"lm_head": "colwise_rep"}
