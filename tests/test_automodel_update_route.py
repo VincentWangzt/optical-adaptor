@@ -66,12 +66,16 @@ def inspect_updates(config_path, output_dir):
     results, comparisons = {}, {}
     last = {}
 
-    for name, deterministic, checkpointing in (
-        ("default_a", False, True),
-        ("default_b", False, True),
-        ("strict_math_a", True, True),
-        ("strict_math_b", True, True),
-        ("strict_math_no_checkpoint", True, False),
+    for name, deterministic, math_attention, checkpointing in (
+        ("default_a", False, False, True),
+        ("default_b", False, False, True),
+        ("math_only_a", False, True, True),
+        ("math_only_b", False, True, True),
+        ("strict_default_a", True, False, True),
+        ("strict_default_b", True, False, True),
+        ("strict_math_a", True, True, True),
+        ("strict_math_b", True, True, True),
+        ("strict_math_no_checkpoint", True, True, False),
     ):
         model.adapter.load_state_dict(initial)
         optimizer.load_state_dict(copy.deepcopy(optimizer_initial))
@@ -88,7 +92,7 @@ def inspect_updates(config_path, output_dir):
         else:
             model.resources.language.gradient_checkpointing_disable()
         recipe.batch_wait_seconds = 0
-        captured = {"teacher": [], "student": []}
+        captured = {"teacher": [], "student": [], "vision": [], "adapter": [], "hidden": []}
 
         def capture_clip(*args, capture=captured, **kwargs):
             capture["raw_gradient"] = torch.cat(
@@ -117,9 +121,24 @@ def inspect_updates(config_path, output_dir):
                     digest(value.logits)
                 )
             ),
+            model.resources.vision.register_forward_hook(
+                lambda module, args, value, capture=captured: capture["vision"].append(
+                    digest(value)
+                )
+            ),
+            model.adapter.register_forward_hook(
+                lambda module, args, value, capture=captured: capture["adapter"].append(
+                    digest(value)
+                )
+            ),
+            model.resources.language.base_model.register_forward_hook(
+                lambda module, args, value, capture=captured: capture["hidden"].append(
+                    digest(value.last_hidden_state)
+                )
+            ),
             optimizer.register_step_pre_hook(capture_update),
         ]
-        attention = sdpa_kernel(SDPBackend.MATH) if deterministic else nullcontext()
+        attention = sdpa_kernel(SDPBackend.MATH) if math_attention else nullcontext()
         try:
             with attention, patch.object(kd, "scale_grads_and_clip_grad_norm", capture_clip):
                 metrics = recipe._run_train_optim_step(batches, recipe.max_grad_norm).metrics
@@ -145,6 +164,9 @@ def inspect_updates(config_path, output_dir):
                 "grad_norm": float(metrics["grad_norm"]),
                 "teacher_hashes": captured["teacher"],
                 "student_hashes": captured["student"],
+                "vision_hashes": captured["vision"],
+                "adapter_hashes": captured["adapter"],
+                "hidden_hashes": captured["hidden"],
                 "adam_parameter_error": update_error,
                 "adam_state_error": moment_error,
             }
