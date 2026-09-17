@@ -168,6 +168,23 @@ def difference(actual, expected):
     }
 
 
+def encode_stages(model, pixels, chunk_size):
+    """Capture the first stage affected by changing only image batch size."""
+    captured = {name: [] for name in ("sam_model", "vision_model", "projector")}
+    handles = [
+        getattr(model, name).register_forward_hook(
+            lambda module, inputs, output, name=name: captured[name].append(output.detach().clone())
+        )
+        for name in captured
+    ]
+    try:
+        features = torch.cat([model(chunk) for chunk in pixels.split(chunk_size)])
+    finally:
+        for handle in handles:
+            handle.remove()
+    return {**{name: torch.cat(values) for name, values in captured.items()}, "features": features}
+
+
 def fixtures(config):
     y, x = np.indices((193, 257))
     ramp = np.stack([x % 256, y % 256, (x + y) % 256], axis=-1).astype(np.uint8)
@@ -208,7 +225,8 @@ def compare(config_path, output):
         "revision": vision_config["revision"],
         "source_sha256": source_hashes,
         "reference_boundary": "unchanged official infer + OCRModel.forward, before text decoder",
-        "weight_tensors": len(reference.state_dict()),
+        "checkpoint_tensors": len(actual.state_dict()),
+        "official_extra_buffer": "vision_model.embeddings.position_ids",
         "images": {},
     }
 
@@ -258,9 +276,21 @@ def compare(config_path, output):
     expected = torch.cat(expected_features)
     # Match the real image microbatch boundary and compare each image's position.
     chunk_size = config["optical"]["processing"]["image_microbatch_size"]
-    batched = torch.cat([actual(chunk) for chunk in pixels.split(chunk_size)])
-    report["batched_features"] = difference(batched, expected)
-    torch.testing.assert_close(batched, expected, rtol=0, atol=0)
+    single_stages = encode_stages(actual, pixels, 1)
+    batch_stages = encode_stages(actual, pixels, chunk_size)
+    report["bf16_batch_vs_single"] = {
+        name: difference(batch_stages[name], single_stages[name]) for name in single_stages
+    }
+    torch.testing.assert_close(single_stages["features"], expected, rtol=0, atol=0)
+    repeated = encode_stages(actual, pixels, chunk_size)
+    report["bf16_batched_repeat"] = difference(repeated["features"], batch_stages["features"])
+    torch.testing.assert_close(repeated["features"], batch_stages["features"], rtol=0, atol=0)
+    # Reverse within each chunk, keeping each image's batch size fixed, to check
+    # image ownership/order separately from batch-shape numerical sensitivity.
+    permuted = torch.cat([actual(chunk.flip(0)).flip(0) for chunk in pixels.split(chunk_size)])
+    report["bf16_batched_permutation"] = difference(permuted, batch_stages["features"])
+    torch.testing.assert_close(permuted, batch_stages["features"], rtol=0, atol=0)
+    (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 
     # The official dynamic mode is a separate contract: verify its larger token
     # count and encoding boundary, without pretending our fixed path implements it.
@@ -277,8 +307,24 @@ def compare(config_path, output):
         "image_tokens": int(prepared["images_seq_mask"].sum()),
         "supported_by_fixed_optical_path": False,
     }
+
+    # Use identical, already BF16-quantized pixels and weights, changing only
+    # arithmetic precision. This measures numerical error, not a new image path.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    actual.float()
+    fp32_single = encode_stages(actual, pixels.float(), 1)
+    fp32_batch = encode_stages(actual, pixels.float(), chunk_size)
+    report["fp32_batch_vs_single"] = {
+        name: difference(fp32_batch[name], fp32_single[name]) for name in fp32_single
+    }
+    report["bf16_vs_fp32"] = {
+        "single": difference(single_stages["features"], fp32_single["features"]),
+        "batch": difference(batch_stages["features"], fp32_single["features"]),
+    }
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
+    assert report["fp32_batch_vs_single"]["features"]["relative_l2"] < 1e-4
 
 
 if __name__ == "__main__":
