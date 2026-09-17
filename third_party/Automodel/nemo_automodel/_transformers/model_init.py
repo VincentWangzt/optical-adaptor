@@ -1299,6 +1299,9 @@ def __init_model(
                 _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
+            # get_hf_config has already resolved an explicit config override;
+            # native constructors receive it positionally below.
+            kwargs.pop("config", None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)
