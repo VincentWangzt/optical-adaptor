@@ -347,22 +347,28 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         self.timestamp = started
         result = super()._run_train_optim_step(batches, max_grad_norm)
         torch.cuda.synchronize()  # One collection boundary, never synchronize each substep.
-        elapsed = self._dp_allreduce(
-            torch.tensor(time.perf_counter() - started + self.batch_wait_seconds),
-            op=dist.ReduceOp.MAX,
-        ).item()
+        durations = {
+            "step": time.perf_counter() - started + self.batch_wait_seconds,
+            "data_wait": self.batch_wait_seconds,
+            **{
+                name: sum(start.elapsed_time(end) for start, end in events) / 1000
+                for name, events in self.events.items()
+            },
+        }
+        # Timing takes the slowest student worker over DP, TP and CP. Counts
+        # below reduce only over DP because TP/CP workers share the same records.
+        student_group = getattr(self, "_training_process_group", None)
+        seconds = torch.tensor(list(durations.values()), device=self.dist_env.device)
+        dist.all_reduce(seconds, op=dist.ReduceOp.MAX, group=student_group)
+        durations = dict(zip(durations, seconds.tolist(), strict=True))
+        elapsed = durations["step"]
         local_counts = Counter(
             slice_key(record) for batch in batches for record in batch["records"]
         )
         counts = self._dp_allreduce(
             torch.tensor([local_counts[key] for key in self.sampler.ratios])
         ).tolist()
-        metrics = {
-            "timing/step": elapsed,
-            "timing/data_wait": self._dp_allreduce(
-                torch.tensor(self.batch_wait_seconds), op=dist.ReduceOp.MAX
-            ).item(),
-        }
+        metrics = {f"timing/{name}": value for name, value in durations.items()}
         for key, count in zip(self.sampler.ratios, counts, strict=True):
             self.contract.consumed[key] += count
             metrics.update(
@@ -385,12 +391,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         metrics.update({f"batch/{name}": value for name, value in zip(names, totals, strict=True)})
         for name, value in zip(names[1:4], totals[1:4], strict=True):
             metrics[f"throughput/{name}_per_second"] = value / elapsed
-        for name, events in self.events.items():
-            seconds = sum(start.elapsed_time(end) for start, end in events) / 1000
-            metrics[f"timing/{name}"] = self._dp_allreduce(
-                torch.tensor(seconds), op=dist.ReduceOp.MAX
-            ).item()
         metrics["tps"] = totals[3] / elapsed
+        metrics["tps_per_gpu"] = metrics["tps"] / dist.get_world_size(student_group)
         result.metrics.update(metrics)
         return result
 
