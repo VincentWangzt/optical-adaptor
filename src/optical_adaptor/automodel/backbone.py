@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
 from nemo_automodel._transformers.registry import register_architecture
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
