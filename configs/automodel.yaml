@@ -76,6 +76,7 @@ optical:
     output_dim: 1280
     tokens_per_image: 111
     expected_tensors: 476
+    sdpa_backend: math
   adapter: &adapter
     input_dim: 1280
     hidden_dim: 2560

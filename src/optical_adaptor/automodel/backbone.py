@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
+
+import torch
 
 from nemo_automodel._transformers.registry import register_architecture
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -11,6 +12,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
 from nemo_automodel.components.models.qwen3_5.state_dict_adapter import Qwen3_5DenseStateDictAdapter
+from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from optical_adaptor.automodel.parallel import select_context_targets
@@ -90,14 +92,14 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
     def forward(
         self,
         *,
-        attention_mask,
-        position_ids,
-        loss_positions,
-        input_ids=None,
-        inputs_embeds=None,
-        image_embeds=None,
-        image_positions=None,
-    ):
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        loss_positions: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        image_embeds: torch.Tensor | None = None,
+        image_positions: torch.Tensor | None = None,
+    ) -> CausalLMOutput:
         """Decode and project compact targets through the native model.
 
         Args:
@@ -140,7 +142,7 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
             use_cache=False,
         ).last_hidden_state
         selected = select_context_targets(hidden, loss_positions, self.cp_mesh)
-        return SimpleNamespace(logits=self.lm_head(selected))
+        return CausalLMOutput(logits=self.lm_head(selected))
 
 
 register_architecture("OpticalQwen3_5ForCausalLM", OpticalQwen3_5ForCausalLM)

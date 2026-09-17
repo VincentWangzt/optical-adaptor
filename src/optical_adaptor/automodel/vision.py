@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -14,6 +16,7 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from safetensors import safe_open
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def image_pixels(images: list[Image.Image], image_size: int) -> torch.Tensor:
@@ -33,8 +36,12 @@ class DeepSeekOCRVision(nn.Module):
         output_dim: int,
         tokens_per_image: int,
         expected_tensors: int,
+        sdpa_backend: Literal["math", "auto"],
     ):
         super().__init__()
+        if sdpa_backend not in {"math", "auto"}:
+            raise ValueError(f"Unsupported vision SDPA backend: {sdpa_backend}")
+        self.sdpa_backend = sdpa_backend
         # deepencoder.py at this pinned revision imports only torch, einops and
         # easydict. Importing modeling_deepseekocr would load the obsolete HF
         # decoder API, which is incompatible with Transformers 5.
@@ -78,8 +85,13 @@ class DeepSeekOCRVision(nn.Module):
     @torch.no_grad()
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         pixels = pixels.to(self.image_newline)
-        sam = self.sam_model(pixels)
-        clip = self.vision_model(pixels, sam)
+        # Fused vision SDPA was non-repeatable even under strict deterministic
+        # algorithms. Scope math attention to the frozen encoder: the native
+        # text tower still needs AutoModel's CP-compatible attention backend.
+        context = sdpa_kernel(SDPBackend.MATH) if self.sdpa_backend == "math" else nullcontext()
+        with context:
+            sam = self.sam_model(pixels)
+            clip = self.vision_model(pixels, sam)
         features = self.projector(torch.cat([clip[:, 1:], sam.flatten(2).transpose(1, 2)], -1))
         batch, count, width = features.shape
         side = math.isqrt(count)
