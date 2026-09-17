@@ -43,9 +43,10 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
         if self.cp_mesh is not None:
             inputs_embeds = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds)[0]
             position_ids = shard_sequence_for_cp_round_robin(self.cp_mesh, position_ids)[0]
-            # All batches are right-padded; valid causal prefixes never attend to
-            # trailing padding. Native GDN restores global sequence order itself.
-            attention_mask = None
+        # OpticalProcessor right-pads independent rows. Causal valid prefixes
+        # cannot attend to trailing padding; keeping rows dense also avoids
+        # treating padded microbatches as concatenated packed GDN sequences.
+        attention_mask = None
         hidden = self.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
