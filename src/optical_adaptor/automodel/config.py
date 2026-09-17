@@ -95,6 +95,7 @@ class EvaluationConfig(StrictConfig):
 
 
 class OpticalConfig(StrictConfig):
+    deterministic: bool
     render_config: str
     llm: dict
     vision: dict

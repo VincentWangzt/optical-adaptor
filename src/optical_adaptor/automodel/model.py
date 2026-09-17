@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
+from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.distributed.ddp import DDPManager
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.models.common.utils import BackendConfig
+from nemo_automodel.recipes.kd_utils import materialize_teacher_logits
 from torch import nn
+from torch.distributed.tensor import DTensor
 from transformers import AutoConfig, AutoTokenizer
 
 from optical_adaptor.adapters import MLPAdapter
+from optical_adaptor.automodel.backbone import OpticalQwen3_5ForCausalLM
+from optical_adaptor.automodel.parallel import generation_context, target_sharder
 from optical_adaptor.automodel.vision import DeepSeekOCRVision
 
 
@@ -46,22 +53,22 @@ class OpticalModel(nn.Module):
         config = (
             getattr(full_config, llm["text_config_key"]) if llm["text_config_key"] else full_config
         )
+        config.architectures = [OpticalQwen3_5ForCausalLM.__name__]
         language = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path,
             revision=llm["revision"],
             config=config,
             dtype=torch.bfloat16,
             attn_implementation=llm["attn_implementation"],
-            force_hf=True,
+            force_hf=False,
+            backend=BackendConfig(
+                attn=llm["attn_implementation"], linear="torch", rms_norm="torch_fp32"
+            ),
             use_liger_kernel=False,
             use_sdpa_patching=False,
         ).to(device)
         language.requires_grad_(False).eval()
         language.config.use_cache = False
-        if role == "student" and llm["gradient_checkpointing"]:
-            language.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
         encoder = None
         if role == "student":
             encoder = DeepSeekOCRVision(**{k: v for k, v in vision.items() if k != "_target_"})
@@ -71,6 +78,9 @@ class OpticalModel(nn.Module):
             )
         self.resources = FrozenResources(language, encoder)
         self.config = language.config
+        self.cp_mesh = None
+        self.device_mesh = None
+        self.generation_group = None
         self.role = role
         self.image_microbatch_size = image_microbatch_size
         self.stage_timer = lambda name: nullcontext()
@@ -96,12 +106,17 @@ class OpticalModel(nn.Module):
     ):
         if peft_config is not None or freeze_config is not None:
             raise ValueError("Optical trainability is fixed: only the adapter is trainable")
-        if not isinstance(distributed_setup.strategy_config, DDPConfig):
+        strategy = distributed_setup.strategy_config
+        if not isinstance(strategy, (DDPConfig, FSDP2Config)):
+            raise ValueError("Optical KD supports AutoModel DDP and FSDP2 strategies")
+        mesh = distributed_setup.mesh_context
+        if mesh.pp_size > 1 or mesh.ep_size > 1:
+            raise ValueError("Optical KD has no pipeline schedule or experts; PP and EP must be 1")
+        if isinstance(strategy, FSDP2Config) and strategy.sequence_parallel:
             raise ValueError(
-                "The optical Qwen wrapper currently supports DDP; TP/CP/PP are unvalidated"
+                "AutoModel's Qwen3.5 TP plan keeps recurrent layers replicated; "
+                "disable sequence_parallel"
             )
-        if distributed_setup.activation_checkpointing:
-            raise ValueError("Configure language activation checkpointing under optical.llm")
         model = cls(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             llm=llm,
@@ -111,18 +126,23 @@ class OpticalModel(nn.Module):
             image_microbatch_size=image_microbatch_size,
             device=torch.device("cuda", torch.cuda.current_device()),
         )
-        if role == "teacher":
-            return model
-        group = distributed_setup.mesh_context.process_group
-        model = DDPManager(distributed_setup.strategy_config, process_group=group).parallelize(
-            model
-        )
-        # The framework single-rank DDP path casts parameters; retain FP32 master weights.
-        unwrapped = (
-            model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-        )
-        unwrapped.adapter.float()
+        model.device_mesh = mesh.device_mesh
+        if isinstance(strategy, FSDP2Config):
+            model.generation_group = mesh.process_group or dist.group.WORLD
+            model = FSDP2Manager(strategy, device_mesh=mesh.device_mesh).parallelize(model)
+        elif role == "student":
+            model = DDPManager(strategy, process_group=mesh.process_group).parallelize(model)
         return model
+
+    @property
+    def model(self):
+        """Expose native decoder layers to AutoModel activation checkpointing."""
+        return self.resources.language.model
+
+    def prepare_model_inputs_for_cp(self, batch, num_chunks=1):
+        """Keep branch inputs full; shard labels [batch, targets] in target order."""
+        del batch, num_chunks
+        return {"cp_sharder": target_sharder()}
 
     def train(self, mode=True):
         super().train(mode)
@@ -167,33 +187,67 @@ class OpticalModel(nn.Module):
         pixel_values=None,
         image_positions=None,
     ):
-        inputs = self.embed(input_ids, pixel_values, image_positions)
-        hidden = self.resources.language.base_model(
+        with cp_dispatcher_suspended(self.cp_mesh):
+            inputs = self.embed(input_ids, pixel_values, image_positions)
+        return self.resources.language(
             inputs_embeds=inputs,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            use_cache=False,
-        ).last_hidden_state
-        selected = hidden.gather(
-            1, loss_positions.clamp_min(0).unsqueeze(-1).expand(-1, -1, hidden.shape[-1])
+            loss_positions=loss_positions,
         )
-        # One full-vocabulary projection; no target-position chunk/checkpoint loop.
-        logits = self.resources.language.get_output_embeddings()(selected)
-        return SimpleNamespace(logits=logits)
 
     @torch.no_grad()
     def generate(
         self, *, input_ids, attention_mask, pixel_values, image_positions, max_new_tokens, **kwargs
     ):
+        """Greedy generation through the same sharded training model.
+
+        Args:
+            input_ids: Prompt tokens [1, sequence].
+            attention_mask: Prompt validity [1, sequence].
+            pixel_values: Images [images, channels, height, width].
+            image_positions: Image slots [images, image_tokens, 2] in prompt coordinates.
+            max_new_tokens: Local output cap; all FSDP peers remain in lockstep.
+            **kwargs: No additional sampling settings are accepted.
+
+        Returns:
+            Generated tokens [1, generated_sequence], excluding the prompt.
+        """
+        if input_ids.shape[0] != 1 or kwargs:
+            raise ValueError("Optical evaluation uses single-sample greedy generation")
         self.eval()
-        embeddings = self.embed(input_ids, pixel_values, image_positions)
-        return self.resources.language.generate(
-            inputs_embeds=embeddings,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
-            **kwargs,
-        )
+        eos = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        generated = []
+        finished = max_new_tokens == 0
+        while True:
+            active = torch.tensor(int(not finished), device=input_ids.device)
+            if self.generation_group is not None:
+                dist.all_reduce(active, op=dist.ReduceOp.MAX, group=self.generation_group)
+            if not active.item():
+                break
+            positions = attention_mask.long().cumsum(-1) - 1
+            with generation_context(self.cp_mesh):
+                out = self(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=positions,
+                    loss_positions=torch.full(
+                        (1, 1), input_ids.shape[1] - 1, device=input_ids.device
+                    ),
+                    pixel_values=pixel_values,
+                    image_positions=image_positions,
+                )
+            logits = materialize_teacher_logits(
+                out.logits, device_mesh=self.device_mesh, sequence_length=1
+            )
+            if isinstance(logits, DTensor):
+                raise TypeError("Generation requires materialized vocabulary logits")
+            token = logits[:, 0].argmax(-1, keepdim=True)
+            if not finished:
+                generated.append(token)
+                finished = token.item() == eos or len(generated) >= max_new_tokens
+            input_ids = torch.cat((input_ids, token), dim=1)
+            attention_mask = torch.cat(
+                (attention_mask, torch.ones_like(token, dtype=torch.bool)), dim=1
+            )
+        return torch.cat(generated, dim=1) if generated else input_ids[:, :0]

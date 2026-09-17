@@ -320,7 +320,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         ``[batch, sequence, vocab]`` and may use local TP/CP layouts inside the
         step.
         """
-        teacher_inputs = _move_to_device(batch.get("teacher", batch), self.dist_env.device)
+        teacher_inputs = _move_to_device(batch["teacher"], self.dist_env.device) if "teacher" in batch else None
         with self._stage_timer("teacher_forward"):
             separate_teacher_logits = (
                 self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
@@ -369,7 +369,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     torch.no_grad(),
                     self._stage_timer("teacher_forward"),
                 ):
-                    teacher_batch = filter_forward_kwargs(self.teacher_model, teacher_inputs)
+                    teacher_batch = filter_forward_kwargs(
+                        self.teacher_model, batch if teacher_inputs is None else teacher_inputs
+                    )
                     teacher_out = self.teacher_model(**teacher_batch)
                     teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
                     del teacher_out, teacher_batch

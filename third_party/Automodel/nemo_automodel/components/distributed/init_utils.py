@@ -136,7 +136,10 @@ def initialize_distributed(
         if get_world_size_safe() == 1:
             init_pg_kwargs["world_size"] = 1
             init_pg_kwargs["rank"] = 0
-            init_pg_kwargs["backend"] = "gloo"
+            # Keep the requested CUDA backend even for a single worker. Managers
+            # must agree with DistInfo about the device used for model inputs.
+            if device_count == 0:
+                init_pg_kwargs["backend"] = "gloo"
             init_pg_kwargs["store"] = torch.distributed.HashStore()
 
         torch.distributed.init_process_group(**init_pg_kwargs)

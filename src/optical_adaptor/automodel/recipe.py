@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections import Counter
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ import wandb
 from dotenv import load_dotenv
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.kd import KnowledgeDistillationRecipeForVLM
+from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
@@ -65,6 +67,9 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         super().__init__(cfg)
         self.raw = cfg.to_yaml_dict()
         self.optical = OpticalConfig.model_validate(self.raw["optical"])
+        if self.optical.deterministic:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(self.optical.deterministic)
         for name, role in (("model", "student"), ("teacher_model", "teacher")):
             model = self.raw[name]
             expected = {
@@ -268,15 +273,19 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
 
     def save_checkpoint(self, epoch, step, *args, **kwargs):
         super().save_checkpoint(epoch, step, *args, **kwargs)
+        if self.cfg.checkpoint.enabled:
+            state = {
+                key: (value.full_tensor() if isinstance(value, DTensor) else value)
+                .detach()
+                .cpu()
+                .contiguous()
+                for key, value in self.student_model().adapter.state_dict().items()
+            }
         if self.dist_env.is_main and self.cfg.checkpoint.enabled:
             from safetensors.torch import save_file
 
             path = Path(self.cfg.checkpoint.checkpoint_dir) / "exports" / f"step-{step + 1:06d}"
             path.mkdir(parents=True, exist_ok=True)
-            state = {
-                key: value.detach().cpu().contiguous()
-                for key, value in self.student_model().adapter.state_dict().items()
-            }
             save_file(state, path / "adapter.safetensors")
             (path / "optical-model.json").write_text(
                 json.dumps(
@@ -307,6 +316,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
 
     @torch.no_grad()
     def _record_kd_metrics(self, student, teacher, labels, ce_loss, kd_loss, denominator):
+        student = student.full_tensor() if isinstance(student, DTensor) else student
+        teacher = teacher.full_tensor() if isinstance(teacher, DTensor) else teacher
         valid = labels != -100
         count = valid.sum()
         teacher_ce = F.cross_entropy(
@@ -408,17 +419,18 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             valid = batch_index * self._get_dp_group_size() + self._get_dp_rank() < len(
                 self.eval_data
             )
-            if not valid:
-                continue
-            if record["sample_id"] in self.teacher_forced_ids:
+            if valid and record["sample_id"] in self.teacher_forced_ids:
                 totals[index] += self.last_stats.double()
-            if generate and record["sample_id"] in generation_ids:
-                if record["thinking"]:
+            requested = valid and generate and record["sample_id"] in generation_ids
+            model = self.student_model()
+            # Sharded peers must all enter generation, including quota-zero and
+            # padded evaluation rows. generate() synchronizes their stopping.
+            if requested or model.generation_group is not None:
+                if requested and record["thinking"]:
                     raise ValueError(
                         "Generative edit-distance evaluation requires a no-thinking task"
                     )
                 pair = batch["compiled"][0]
-                model = self.student_model()
                 inputs = {
                     key: value.to(self.dist_env.device)
                     for key, value in batch["student"].items()
@@ -427,8 +439,11 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 for key in ("input_ids", "attention_mask"):
                     inputs[key] = inputs[key][:, : pair.generation_prefix_length]
                 ids = model.generate(
-                    **inputs, max_new_tokens=self.generation_limits[slice_key(record)]
+                    **inputs,
+                    max_new_tokens=self.generation_limits[slice_key(record)] if requested else 0,
                 )
+                if not requested:
+                    continue
                 reached_limit = ids[0, -1].item() != model.tokenizer.convert_tokens_to_ids(
                     "<|im_end|>"
                 )
@@ -460,7 +475,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 )
         self._ce_loss_buffer.clear()
         self._kd_loss_buffer.clear()
-        totals = self._dp_allreduce(totals)
+        totals = self._dp_allreduce(totals, include_cp=True)
         generation = self._dp_allreduce(generation)
         metrics = {}
         for key, sums in [
@@ -496,7 +511,13 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                         f"{key}/generation_limit_fraction": (sums[5] / sums[4]).item(),
                     }
                 )
-        if generation_rows:
+        if generation_rows and (
+            self.device_mesh is None
+            or (
+                self.device_mesh["tp"].get_local_rank() == 0
+                and self.device_mesh["cp"].get_local_rank() == 0
+            )
+        ):
             path = Path(self.cfg.checkpoint.checkpoint_dir) / (
                 f"generations-step-{self.step_scheduler.step}-rank-{self._get_dp_rank()}.jsonl"
             )

@@ -245,8 +245,10 @@ class KDLoss(nn.Module):
         # Exclude padding / ignored tokens from the loss.
         valid_mask = (labels != self.ignore_index).view(-1)
         if valid_mask.sum() == 0:
-            # Entire batch contains only padding - return zero to keep gradients finite.
-            return student_logits.new_tensor(0.0)
+            # CP ranks can own only padding. Keep their backward graph alive so
+            # differentiable context collectives still run on every rank.
+            local_logits = student_logits.to_local() if isinstance(student_logits, DTensor) else student_logits
+            return local_logits.sum() * 0.0
 
         if student_logits.ndim > 2:
             student_logits = student_logits.view(-1, student_logits.shape[-1])

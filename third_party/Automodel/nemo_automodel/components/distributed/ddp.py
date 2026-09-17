@@ -114,8 +114,6 @@ class DDPManager:
         if dist.get_world_size(self.process_group) == 1:
             logger.info("World size is 1, skipping parallelization.")
             model = model.to(self.device)
-            if self.device.type == "cuda":
-                model = model.to(torch.bfloat16)
             if self.activation_checkpointing:
                 if is_selective_activation_checkpointing(self.activation_checkpointing):
                     apply_selective_activation_checkpointing(

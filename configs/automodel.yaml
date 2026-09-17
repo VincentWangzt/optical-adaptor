@@ -5,15 +5,18 @@ dist_env:
   backend: nccl
   timeout_minutes: 20
 distributed:
-  strategy: ddp
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
   ep_size: 1
-  activation_checkpointing: false
-  broadcast_buffers: false
-  find_unused_parameters: false
-  static_graph: false
+  activation_checkpointing: true
+  sequence_parallel: false
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
 separate_meshes: false
 step_scheduler:
   global_batch_size: 16
@@ -59,13 +62,13 @@ wandb:
   name: deepseek-ocr-qwen35-4b-online-kd
   mode: online
 optical:
+  deterministic: true
   render_config: configs/render.training.yaml
   llm: &llm
     model_id: Qwen/Qwen3.5-4B
     revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
     text_config_key: text_config
     attn_implementation: sdpa
-    gradient_checkpointing: true
   vision: &vision
     model_id: deepseek-ai/DeepSeek-OCR
     revision: 9f30c71f441d010e5429c532364a86705536c53a
