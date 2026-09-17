@@ -7,9 +7,9 @@ import yaml
 from optical_adaptor.artifacts import (
     PositiveInt,
     Revision,
-    StrictConfig,
     load_pipeline,
 )
+from optical_adaptor.automodel.config import StrictConfig
 
 
 class BackendConfig(StrictConfig):
