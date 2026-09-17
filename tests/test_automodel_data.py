@@ -17,7 +17,7 @@ from optical_adaptor.automodel.data import (
     validate_preparation,
 )
 from optical_adaptor.automodel.prepare import assign_holdouts
-from optical_adaptor.automodel.recipe import RunContract
+from optical_adaptor.automodel.recipe import OpticalKDRecipe, RunContract
 
 
 class IndexedRows(Dataset):
@@ -32,6 +32,17 @@ class IndexedRows(Dataset):
 
     def __getitem__(self, index):
         return index
+
+
+def test_recipe_accepts_standard_cli_config_and_overrides():
+    from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+
+    cfg = parse_args_and_load_config(
+        "configs/automodel.yaml", argv=["--step_scheduler.max_steps", "3"]
+    )
+    recipe = OpticalKDRecipe(cfg)
+    assert recipe.optical.prepare.image_bins[0].name == "1"
+    assert recipe.raw["step_scheduler"]["max_steps"] == 3
 
 
 @pytest.mark.parametrize("workers", [0, 2])

@@ -407,7 +407,10 @@ class ConfigNode:
                 if isinstance(translated, str) and resolved != v:
                     return _OrigValueStr(translated, v)
                 return translated
-            return translate_value(v)
+            # YAML already determines scalar types. Reinterpreting quoted
+            # strings changes identifiers such as bin names "1" into integers.
+            # CLI overrides and environment substitutions are parsed separately.
+            return v
 
     @property
     def raw_config(self) -> dict[str, Any]:
