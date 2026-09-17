@@ -138,13 +138,20 @@ recurrent core replicated. Megatron FSDP is not integrated. These limits are
 checked explicitly; TP and CP use the existing FSDP2 strategy.
 
 `optical.deterministic: true` enables strict PyTorch determinism. The encoder uses
-the eager QuickGELU formula: the pinned DeepSeek TorchScript implementation changed
-BF16 rounding after profiling, making features depend on warm-up history. The
+contiguous NCHW pixels and owns the official BF16 autocast scope, including its
+projector. It retains eager QuickGELU after the earlier standalone TorchScript
+warm-up finding. The [official encoding audit](ocr-encoding-validation.md) shows
+that eager and scripted activation results still differ numerically, and that
+the scripted reference repeats consistently under official autocast. The
 canonical `optical.vision.sdpa_backend: math` fixes the vision attention reference;
 `auto` allows fused selection. Math attention is scoped to vision, leaving the
 language model's CP attention available. These settings are part of the exported
 model and resume contract. Exact repeatability is demonstrated for the canonical
-settings, not equivalence across different backends or mesh layouts.
+settings, not equivalence across different backends or mesh layouts. Changing
+image batch size also changes BF16 vision features (about 2.6–4.0% relative L2
+on the two audited rendered pages). A fixed maximum batch size still permits
+different partial chunks. The current 640×640 encoder implements official Small
+non-crop processing, not the variable-token dynamic-crop mode.
 
 Generation uses the same sharded native model and keeps participating ranks in
 lockstep across differing quotas and EOS. It currently recomputes the prefix and
@@ -188,10 +195,10 @@ optical config and fresh prepared records. Historical training, tensor caches,
 old checkpoint schemas and replay tests have been retired; historical reports
 remain documentation only.
 
-The current [parallel validation report](automodel-parallel-validation.md)
-records mesh tests, full-model optimization, and a fresh-process FSDP resume
-that exactly reproduced the next update's weights, optimizer and scheduler state.
-This is bounded replay evidence, not a long-run convergence or cross-layout
-equivalence claim. The initial migration results remain in the historical report.
-The final initialization-sync fix passed small multi-rank tests and full FSDP DP2
-updates; the subsequent full TP/CP rerun was stopped at the user's request.
+The current [parallel validation report](automodel-parallel-validation.md) records
+full FSDP DP2, TP2 and CP2 runs after the OCR correction, with two updates followed
+by a fresh-process replay of the second update for each layout. Adapter weights,
+optimizer/scheduler state, losses, sample counters and loader state matched
+exactly, and checkpoints matched exports. Thirty focused CPU tests also passed.
+This is bounded replay evidence, not a long-run convergence, 32K capacity or
+cross-layout equivalence claim. The initial migration results remain historical.

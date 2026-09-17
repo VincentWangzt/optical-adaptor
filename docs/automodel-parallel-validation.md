@@ -6,6 +6,54 @@ Date: 2026-09-17 UTC / September 18 Asia/Shanghai. Branch:
 Transformers 5.15.1, FLA 0.5.2. All executable changes were committed locally,
 pushed through GitHub, then pulled before server execution.
 
+## Completed September 18 follow-up
+
+The previously stopped TP/CP runs and DP/TP/CP replay comparisons were resumed
+and passed. The subsequent [official OCR audit](ocr-encoding-validation.md) found
+two additional vision execution mismatches: pixel memory layout and the missing
+BF16 autocast scope. After correcting both at `cb60a114`, the complete two-GPU
+matrix was run again with diagnostics through `9e25dfdf`.
+
+| Layout | Uninterrupted updates | Fresh-process resumed updates | Second-update loss | Evaluation loss | Exact replay |
+| --- | ---: | ---: | ---: | ---: | --- |
+| FSDP DP2 | 2 | 1 | 0.6785058975 | 1.1957744355 | Yes |
+| FSDP TP2 / DP1 | 2 | 1 | 0.6422642469 | 0.9787530499 | Yes |
+| FSDP CP2 / DP1 | 2 | 1 | 0.6378154755 | 0.9696626783 | Yes |
+
+Each replay restores the checkpoint after update one and reproduces update two.
+Exact comparisons cover all six adapter tensors, all 100 leaves of the saved
+optimizer/scheduler state, training/evaluation losses, step counters, the 18-leaf
+data contract/consumption state, and every saved loader state. Every consolidated
+adapter checkpoint also matches its corresponding export exactly. All runs
+completed teacher-forced and generation evaluation and checkpoint/export writing.
+
+These are **nine optimizer updates after the encoder correction**, plus seven
+updates in the resumed validation of the preceding implementation. Thirty focused
+optical CPU tests passed after the correction. Ruff and `git diff --check` passed.
+No new optimizer or replica-synchronization failure was observed. Values differ
+across layouts; exactness compares each layout with its own resumed run. The
+2,048-token/two-image smoke caps and four-token generation limits still apply.
+
+Current artifacts are under
+`/workspace/optical-adaptor/outputs/automodel/ocr-aligned-validation/`:
+`{dp,tp,cp}/`, their `-resume` counterparts, logs, runtime YAMLs and
+`{dp,tp,cp}-comparison.json`. The final job
+`20260917-163600-ocr-aligned-full-validat-33a1a9` completed with exit code 0;
+GPUs 8/9 were idle afterward. The CPU regression job is
+`20260917-163630-optical-encoder-regressi-249c51`.
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run --locked python tests/test_automodel_replay.py \
+  outputs/automodel/ocr-aligned-validation/tp \
+  outputs/automodel/ocr-aligned-validation/tp-resume \
+  outputs/automodel/ocr-aligned-validation/tp-comparison.json
+```
+
+Repeatability does not establish invariance to BF16 backend, image batch size or
+the scripted/eager activation choice. Those differences are quantified in the
+OCR audit. Larger combined meshes, 32K capacity, convergence and inference
+throughput remain unvalidated. The earlier evidence below is retained as history.
+
 ## Implementation
 
 The canonical configuration now uses FSDP2. `OpticalParallelizationStrategy`
@@ -44,7 +92,7 @@ The pinned VLM KD recipe has no optical pipeline schedule; Qwen's current TP pla
 keeps the recurrent core replicated. HSDP and combinations of TP+CP+DP retain the
 framework mesh construction but have not been exercised on four or more GPUs.
 
-## Numerical findings
+## Numerical findings before the OCR audit
 
 Independent AdamW instances receiving the captured gradients reproduce parameters
 and moments exactly. Frozen parameters have no gradients or version changes, and
@@ -89,7 +137,7 @@ differed by 1.87% relative L2 under BF16 native kernels. CPU FP32 attention/targ
 selection has a separate forward and input-gradient parity check; hybrid
 GatedDeltaNet uses the GPU checks because the installed FLA kernels require CUDA.
 
-## Training and checkpoint evidence
+## Initial training and checkpoint evidence
 
 Full-model smoke configurations use global batch 2, local batch 1, a 2,048-token
 cap, at most two images per conversation, activation checkpointing, and two
@@ -156,7 +204,8 @@ failures. No 32K capacity run, long training run, PP, Megatron FSDP, or multi-no
 test was performed. Generation currently recomputes vision and the prefix each
 token, so generation throughput is not optimized.
 
-The DeepSeek investigation isolated scripted-activation execution. It did not
-audit image resizing/padding/normalization, patch and newline ordering, or the
-adapter input against the official full OCR encoding path. That remains a separate
-check; numerical repeatability alone does not establish correct optical encoding.
+The original DeepSeek investigation isolated scripted-activation execution. The
+subsequent [official OCR audit](ocr-encoding-validation.md) now checks image
+preprocessing, patch/newline/separator ordering and the adapter input against the
+official encoding path, and corrects pixel layout and autocast. It distinguishes
+controlled implementation parity from the remaining BF16 numerical differences.

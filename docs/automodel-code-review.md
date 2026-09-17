@@ -1,5 +1,11 @@
 # AutoModel integration and weight-update review
 
+The September 18 [official OCR audit](ocr-encoding-validation.md) additionally
+corrects contiguous pixel layout and the missing vision autocast scope. Its
+controlled parity results and remaining activation/batch-size differences qualify
+the earlier numerical conclusions. See [parallel validation](automodel-parallel-validation.md)
+for the resumed full-model validation matrix.
+
 ## Resolution after implementation
 
 The follow-up implementation fixes the three findings below and replaces the
@@ -14,6 +20,9 @@ microtests passed. The strategy now synchronizes initialization using the existi
 mesh groups, and the regression starts from deliberately different replicas.
 Small DDP/FSDP/TP/CP tests and two full FSDP updates passed after this fix; the
 remaining full TP/CP reruns were stopped when the user requested a status report.
+The September 18 continuation subsequently completed those runs and exact
+DP/TP/CP replay checks, then repeated the full matrix after the OCR execution
+correction. The current evidence is at the top of the parallel-validation report.
 
 The earlier attention-only diagnosis was incomplete. Its fixed trial order did
 not isolate DeepSeek's TorchScript QuickGELU warm-up. An isolated vision test

@@ -8,6 +8,9 @@ checks. The [review](automodel-code-review.md) now explains the TorchScript
 QuickGELU warm-up issue that the initial attention experiments did not isolate.
 The original results below remain the historical migration smoke-run record;
 their unresolved-reproducibility statement does not describe the current code.
+The later [official OCR audit](ocr-encoding-validation.md) also fixes pixel layout
+and vision autocast, and distinguishes repeatability from agreement with the
+official scripted activation and from invariance to image batch size.
 
 The confirmed decisions in `design-decisions-draft.md`, including inherited,
 independent generation budgets (P11), are implemented and synchronized through

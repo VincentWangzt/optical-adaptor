@@ -14,6 +14,9 @@ drift from DeepSeek's scripted activation warm-up. See
 limits, and [migration validation](automodel-migration-validation.md) for the
 initial results. Historical observations below describe the baseline unless
 explicitly marked otherwise.
+The September 18 continuation completed full DP2/TP2/CP2 checkpoint replay and
+the [official OCR encoding audit](ocr-encoding-validation.md), correcting pixel
+layout/autocast and documenting remaining BF16 sensitivity.
 
 ## Decision protocol
 
