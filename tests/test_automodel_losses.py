@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from nemo_automodel.components.loss.kd_loss import KDLoss
 
 from optical_adaptor.automodel.backbone import OpticalQwen3_5ForCausalLM
-from optical_adaptor.automodel.model import FrozenResources, OpticalModel
 
 
 def test_selected_logits_match_dense_projection_and_gradients():
@@ -28,13 +27,13 @@ def test_selected_logits_match_dense_projection_and_gradients():
     language.model = Decoder()
     language.model.embed_tokens = embedding
     language.lm_head = head
-    model = OpticalModel.__new__(OpticalModel)
-    torch.nn.Module.__init__(model)
-    model.resources = FrozenResources(language, None)
-    model.cp_mesh = None
     hidden = torch.randn(2, 6, 7, requires_grad=True)
-    model.embed = lambda *args: hidden
-    actual = model(ids, torch.ones_like(ids), torch.arange(6)[None], positions).logits
+    actual = language(
+        inputs_embeds=hidden,
+        attention_mask=torch.ones_like(ids),
+        position_ids=torch.arange(6)[None],
+        loss_positions=positions,
+    ).logits
     dense = head(hidden.cumsum(1)).gather(1, positions[..., None].expand(-1, -1, 19))
     torch.testing.assert_close(actual, dense)
     teacher = torch.randn_like(actual)

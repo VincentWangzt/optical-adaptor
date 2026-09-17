@@ -154,29 +154,17 @@ class OpticalModel(nn.Module):
             self.resources.vision.eval()
         return self
 
-    def embed(self, input_ids, pixel_values=None, image_positions=None):
-        embeddings = self.resources.language.get_input_embeddings()(input_ids)
-        if pixel_values is not None:
-            if self.role != "student" or image_positions is None:
-                raise ValueError("Only the student accepts pixels, with explicit image positions")
-            with self.stage_timer("vision_adapter"):
-                features = torch.cat(
-                    [
-                        self.resources.vision(pixels)
-                        for pixels in pixel_values.split(self.image_microbatch_size)
-                    ]
-                )
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    adapted = self.adapter(features).to(embeddings.dtype)
-                # [image, token, (batch, position)] preserves original image/target ordering.
-                positions = image_positions.flatten(0, 1)
-                flat_indices = positions[:, 0] * input_ids.shape[1] + positions[:, 1]
-                embeddings = (
-                    embeddings.flatten(0, 1)
-                    .index_copy(0, flat_indices, adapted.flatten(0, 1))
-                    .view(*input_ids.shape, -1)
-                )
-        return embeddings
+    def encode_images(self, pixel_values):
+        """Map images [images, channels, height, width] to [images, tokens, hidden]."""
+        with self.stage_timer("vision_adapter"), cp_dispatcher_suspended(self.cp_mesh):
+            features = torch.cat(
+                [
+                    self.resources.vision(pixels)
+                    for pixels in pixel_values.split(self.image_microbatch_size)
+                ]
+            )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                return self.adapter(features)
 
     def forward(
         self,
@@ -187,10 +175,13 @@ class OpticalModel(nn.Module):
         pixel_values=None,
         image_positions=None,
     ):
-        with cp_dispatcher_suspended(self.cp_mesh):
-            inputs = self.embed(input_ids, pixel_values, image_positions)
+        if pixel_values is not None and (self.role != "student" or image_positions is None):
+            raise ValueError("Only the student accepts pixels, with explicit image positions")
+        images = self.encode_images(pixel_values) if pixel_values is not None else None
         return self.resources.language(
-            inputs_embeds=inputs,
+            input_ids=input_ids,
+            image_embeds=images,
+            image_positions=image_positions,
             attention_mask=attention_mask,
             position_ids=position_ids,
             loss_positions=loss_positions,

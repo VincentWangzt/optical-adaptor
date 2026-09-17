@@ -35,11 +35,27 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
         self.model._tp_plan = Qwen3_5TextConfig.base_model_tp_plan
         self._tp_plan = {"lm_head": "colwise_rep"}
 
-    def forward(self, *, inputs_embeds, attention_mask, position_ids, loss_positions):
+    def forward(
+        self,
+        *,
+        attention_mask,
+        position_ids,
+        loss_positions,
+        input_ids=None,
+        inputs_embeds=None,
+        image_embeds=None,
+        image_positions=None,
+    ):
         """Decode and project compact targets through the native model.
 
         Args:
             inputs_embeds: Full embeddings [batch, input_sequence, hidden].
+                Optional alternative to input_ids, primarily for parity checks.
+            input_ids: Token IDs [batch, input_sequence], embedded inside the
+                FSDP root so tied embedding/head weights are materialized.
+            image_embeds: Optional visual embeddings [images, image_tokens, hidden].
+            image_positions: Optional slots [images, image_tokens, 2], with final
+                axis storing batch and input-position coordinates.
             attention_mask: Right-padding validity [batch, input_sequence].
             position_ids: Full token positions [batch, input_sequence].
             loss_positions: Input prediction positions [batch, targets], -1 padded.
@@ -48,6 +64,16 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
             Logits [batch, targets, vocab], or [batch, padded_targets / CP, vocab]
             under CP. TP uses a vocabulary-sharded DTensor with that global shape.
         """
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+        if image_embeds is not None:
+            positions = image_positions.flatten(0, 1)
+            flat = positions[:, 0] * inputs_embeds.shape[1] + positions[:, 1]
+            inputs_embeds = (
+                inputs_embeds.flatten(0, 1)
+                .index_copy(0, flat, image_embeds.to(inputs_embeds.dtype).flatten(0, 1))
+                .view_as(inputs_embeds)
+            )
         if self.cp_mesh is not None:
             inputs_embeds = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds)[0]
             position_ids = shard_sequence_for_cp_round_robin(self.cp_mesh, position_ids)[0]

@@ -44,7 +44,7 @@ def tiny_model(role):
         linear_value_head_dim=16,
         layer_types=["linear_attention", "full_attention"],
         max_position_embeddings=256,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,
     )
     language = OpticalQwen3_5ForCausalLM(
         config, backend=BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32")
