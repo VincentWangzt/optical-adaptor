@@ -29,7 +29,7 @@ from PIL import Image, ImageOps
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from optical_adaptor.automodel.vision import DeepSeekOCRVision, image_pixels, quick_gelu
+from optical_adaptor.automodel.vision import DeepSeekOCRVision, image_pixels
 from optical_adaptor.renderer import load_render_config, render_pages
 
 
@@ -217,8 +217,7 @@ def compare(config_path, output):
     output.mkdir(parents=True, exist_ok=False)
     config = yaml.safe_load(config_path.read_text())
     vision_config = config["optical"]["vision"]
-    namespace, official_encoder, source_hashes = official_reference(vision_config)
-    scripted_quick_gelu = official_encoder.quick_gelu
+    namespace, _, source_hashes = official_reference(vision_config)
     actual = DeepSeekOCRVision(**vision_config).cuda().bfloat16().eval()
     reference = namespace["DeepseekOCRModel"](SimpleNamespace())
     # This deterministic buffer is registered persistently upstream but absent
@@ -235,8 +234,20 @@ def compare(config_path, output):
         "reference_boundary": "unchanged official infer + OCRModel.forward, before text decoder",
         "checkpoint_tensors": len(actual.state_dict()),
         "official_extra_buffer": "vision_model.embeddings.position_ids",
+        "activation": "unmodified_official_scripted_quick_gelu",
         "images": {},
     }
+    activation_dtypes = []
+    # fc2 sees QuickGELU's result before the linear layer's own autocast. Guard
+    # the actual CLIP precision boundary, not just the activation's formula.
+    activation_handles = [
+        module.fc2.register_forward_pre_hook(
+            lambda module, inputs: activation_dtypes.append(str(inputs[0].dtype))
+        )
+        for module in actual.vision_model.modules()
+        if type(module).__name__ == "NoTPFeedForward"
+    ]
+    assert activation_handles
 
     def reference_forward(ids, prepared):
         result = reference(
@@ -258,7 +269,6 @@ def compare(config_path, output):
         pixel_diff = difference(pixels, expected_pixels)
         assert pixel_diff["equal"], (name, pixel_diff)
         with sdpa_kernel(SDPBackend.MATH):
-            official_encoder.quick_gelu = scripted_quick_gelu
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 stock = [
                     reference_forward(ids, prepared)
@@ -266,11 +276,13 @@ def compare(config_path, output):
                 ]
             if not report["images"]:
                 report["stock_scripted_repeats"] = [difference(value, stock[0]) for value in stock]
-            # Isolate our documented activation change from encoding-path parity.
-            official_encoder.quick_gelu = quick_gelu
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                expected = reference_forward(ids, prepared)
-            features = actual(pixels)
+                assert all(torch.equal(value, stock[0]) for value in stock)
+            expected = stock[-1]
+            ours = [actual(pixels) for _ in range(3 if not report["images"] else 1)]
+            features = ours[-1]
+            if not report["images"]:
+                report["optical_cold_repeats"] = [difference(value, ours[0]) for value in ours]
+                assert all(torch.equal(value, ours[0]) for value in ours)
             # The official infer method wraps generation (and thus the model
             # prefill) in BF16 autocast. Check that execution contract too.
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -294,6 +306,10 @@ def compare(config_path, output):
         }
         prepared_images.append(pixels)
         expected_features.append(expected)
+    report["clip_activation_dtypes"] = sorted(set(activation_dtypes))
+    assert report["clip_activation_dtypes"] == ["torch.float32"]
+    for handle in activation_handles:
+        handle.remove()
     pixels = torch.cat(prepared_images)
     expected = torch.cat(expected_features)
     # Match the real image microbatch boundary and compare each image's position.

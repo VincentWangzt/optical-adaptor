@@ -36,22 +36,6 @@ def image_pixels(images: list[Image.Image], image_size: int) -> torch.Tensor:
     )
 
 
-def quick_gelu(inputs: torch.Tensor) -> torch.Tensor:
-    """DeepSeek's QuickGELU formula with stable eager rounding.
-
-    Keep eager BF16 rounding stable from the first call. The upstream scripted
-    function switches to a fused graph after profiling, changing encoder features
-    according to warm-up history even with deterministic algorithms enabled.
-
-    Args:
-        inputs: Activations of arbitrary shape and floating-point dtype.
-
-    Returns:
-        Activations of the same shape and dtype, without mutating inputs.
-    """
-    return inputs * torch.sigmoid(1.702 * inputs)
-
-
 class DeepSeekOCRVision(nn.Module):
     def __init__(
         self,
@@ -78,7 +62,8 @@ class DeepSeekOCRVision(nn.Module):
             raise ImportError(f"Cannot import DeepSeek encoder from {path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        module.quick_gelu = quick_gelu
+        # Preserve the official scripted activation. Under official autocast,
+        # TorchScript promotes QuickGELU to FP32; an eager replacement does not.
         self.sam_model = module.build_sam_vit_b()
         self.vision_model = module.build_clip_l()
         # The native module persists this deterministic arange buffer, but the
