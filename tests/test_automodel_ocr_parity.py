@@ -188,17 +188,24 @@ def encode_stages(model, pixels, chunk_size):
 def fixtures(config):
     y, x = np.indices((193, 257))
     ramp = np.stack([x % 256, y % 256, (x + y) % 256], axis=-1).astype(np.uint8)
-    pages, _, truncated = render_pages(
-        "\n".join(f"def function_{i}(value): return value + {i}  # OCR parity" for i in range(50)),
-        config=load_render_config(config["optical"]["render_config"]),
-    )
-    assert not truncated and len(pages) == 1
+    rendered = {}
+    for name, lines in (("rendered_training_page", 50), ("rendered_short_page", 8)):
+        pages, _, truncated = render_pages(
+            "\n".join(
+                f"def function_{i}(value): return value + {i}  # OCR parity" for i in range(lines)
+            ),
+            config=load_render_config(config["optical"]["render_config"]),
+        )
+        assert not truncated and len(pages) == 1
+        rendered[name] = pages[0]
+    # Six inputs create 4/2 image chunks, exercising rendered pages in a real
+    # batch and a non-singleton partial chunk.
     return {
+        **rendered,
         "color_landscape": Image.fromarray(ramp),
         "color_portrait": Image.fromarray(ramp).transpose(Image.Transpose.ROTATE_90),
         "grayscale": Image.fromarray(ramp[:, :, 0]),
         "rgba": Image.fromarray(ramp).convert("RGBA"),
-        "rendered_training_page": pages[0],
     }
 
 
@@ -280,6 +287,10 @@ def compare(config_path, output):
     batch_stages = encode_stages(actual, pixels, chunk_size)
     report["bf16_batch_vs_single"] = {
         name: difference(batch_stages[name], single_stages[name]) for name in single_stages
+    }
+    report["bf16_batch_per_image"] = {
+        name: difference(batch_stages["features"][index], single_stages["features"][index])
+        for index, name in enumerate(report["images"])
     }
     torch.testing.assert_close(single_stages["features"], expected, rtol=0, atol=0)
     repeated = encode_stages(actual, pixels, chunk_size)
