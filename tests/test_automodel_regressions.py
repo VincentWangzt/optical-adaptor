@@ -11,8 +11,64 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.recipes.vlm import kd
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
-from optical_adaptor.automodel.backbone import OpticalTextCheckpointAdapter
+from optical_adaptor.automodel.backbone import (
+    OpticalQwen3_5ForCausalLM,
+    OpticalTextCheckpointAdapter,
+)
+
+
+def test_native_cpu_float32_hybrid_forward_and_input_gradient_parity():
+    torch.manual_seed(17)
+    config = Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        tie_word_embeddings=True,
+    )
+    native = OpticalQwen3_5ForCausalLM(
+        config, backend=BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32")
+    )
+    native.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    native.requires_grad_(False).eval()
+    reference = Qwen3_5ForCausalLM(config).requires_grad_(False).eval()
+    state = {
+        key.replace("model.language_model.", "model."): value
+        for key, value in native.state_dict_adapter.to_hf(native.state_dict()).items()
+    }
+    state["lm_head.weight"] = state["model.embed_tokens.weight"]
+    reference.load_state_dict(state, strict=True)
+    embeddings = torch.randn(2, 12, 32)
+    positions = torch.tensor([[1, 5, 10], [2, 4, 6]])
+    mask = torch.arange(12)[None] < torch.tensor([[12], [8]])
+    outputs, gradients = [], []
+    for model in (reference, native):
+        inputs = embeddings.clone().requires_grad_()
+        if model is native:
+            logits = model(
+                inputs_embeds=inputs,
+                attention_mask=mask,
+                position_ids=torch.arange(12)[None].expand(2, -1),
+                loss_positions=positions,
+            ).logits
+        else:
+            all_logits = model(inputs_embeds=inputs, attention_mask=mask, use_cache=False).logits
+            logits = all_logits.gather(1, positions[..., None].expand(-1, -1, config.vocab_size))
+        logits.square().mean().backward()
+        outputs.append(logits)
+        gradients.append(inputs.grad)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(gradients[0], gradients[1], rtol=1e-4, atol=1e-7)
 
 
 def test_explicit_native_config_is_consumed_once_and_mtp_is_disabled():
@@ -61,6 +117,11 @@ def test_native_text_checkpoint_destinations_preserve_storage_and_ties():
     assert restored.keys() == state.keys()
     assert restored["lm_head.weight"] is restored["model.embed_tokens.weight"]
     assert adapter.supports_low_memory_dcp_load
+    for name, tensor in state.items():
+        assert (
+            dict(adapter.convert_single_tensor_to_hf(name, tensor)).keys()
+            == adapter.to_hf({name: tensor}).keys()
+        )
 
 
 def test_empty_targets_preserve_backward_graph():

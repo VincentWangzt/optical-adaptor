@@ -184,6 +184,12 @@ def run(axis, checkpointing):
             for a, b in zip(plain.adapter.parameters(), reference.adapter.parameters(), strict=True)
         )
         assert delta < 0.00004, (axis, step, delta)
+        # Full adapter values must agree exactly across DP/TP/CP ranks, even
+        # where BF16 distributed arithmetic differs slightly from serial.
+        weights = torch.cat([full(p).detach().flatten() for p in plain.adapter.parameters()])
+        replicas = [torch.empty_like(weights) for _ in range(world)]
+        dist.all_gather(replicas, weights)
+        assert all(torch.equal(weights, replica) for replica in replicas)
         assert all(p.dtype == torch.float32 for p in plain.adapter.parameters())
         assert all(p.grad is None for p in plain.adapter.parameters())
         results.append(
@@ -192,6 +198,7 @@ def run(axis, checkpointing):
                 "gradient_relative_l2": relative,
                 "reference_grad_norm": norm.item(),
                 "parameter_max_difference": delta,
+                "replicas_bitwise_equal": True,
                 "metrics": report.metrics,
             }
         )

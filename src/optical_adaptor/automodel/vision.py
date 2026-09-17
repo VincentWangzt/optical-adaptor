@@ -28,11 +28,17 @@ def image_pixels(images: list[Image.Image], image_size: int) -> torch.Tensor:
 
 
 def quick_gelu(inputs: torch.Tensor) -> torch.Tensor:
-    """DeepSeek's QuickGELU formula on arbitrary-shaped activations.
+    """DeepSeek's QuickGELU formula with stable eager rounding.
 
     Keep eager BF16 rounding stable from the first call. The upstream scripted
     function switches to a fused graph after profiling, changing encoder features
     according to warm-up history even with deterministic algorithms enabled.
+
+    Args:
+        inputs: Activations of arbitrary shape and floating-point dtype.
+
+    Returns:
+        Activations of the same shape and dtype, without mutating inputs.
     """
     return inputs * torch.sigmoid(1.702 * inputs)
 
@@ -95,6 +101,15 @@ class DeepSeekOCRVision(nn.Module):
 
     @torch.no_grad()
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Encode frozen image features in the pinned checkpoint's token order.
+
+        Args:
+            pixels: Normalized images [images, channels, height, width].
+
+        Returns:
+            Features [images, tokens_per_image, output_dim], including row
+            newlines and the final separator, in the encoder's dtype/device.
+        """
         pixels = pixels.to(self.image_newline)
         # Scope the chosen numerical reference to vision: the native text tower
         # still needs AutoModel's CP-compatible attention backend.

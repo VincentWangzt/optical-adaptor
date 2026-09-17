@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from nemo_automodel._transformers.registry import register_architecture
@@ -11,6 +12,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
 from nemo_automodel.components.models.qwen3_5.state_dict_adapter import Qwen3_5DenseStateDictAdapter
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -20,7 +22,7 @@ from optical_adaptor.automodel.parallel import select_context_targets
 class OpticalTextCheckpointAdapter(Qwen3_5DenseStateDictAdapter):
     """Read the text tower of a Qwen VLM using native Qwen dtype/key conversion."""
 
-    def __init__(self, tied_embeddings: bool):
+    def __init__(self, tied_embeddings: bool) -> None:
         super().__init__()
         self.tied_embeddings = tied_embeddings
 
@@ -44,12 +46,15 @@ class OpticalTextCheckpointAdapter(Qwen3_5DenseStateDictAdapter):
             if key != "lm_head.weight" or not self.tied_embeddings
         }
 
-    def from_hf(self, hf_state_dict: dict, **kwargs) -> dict:
+    def from_hf(
+        self, hf_state_dict: dict, device_mesh: DeviceMesh | None = None, **kwargs: Any
+    ) -> dict:
         """Restore native text names; ignore the unused Qwen vision tower.
 
         Args:
             hf_state_dict: Checkpoint parameter tensors of arbitrary shape.
                 Only names change; the existing Qwen adapter handles FP32 SSMs.
+            device_mesh: Optional checkpoint destination mesh.
             **kwargs: Shared checkpoint conversion options.
 
         Returns:
@@ -64,7 +69,22 @@ class OpticalTextCheckpointAdapter(Qwen3_5DenseStateDictAdapter):
             text["lm_head.weight"] = text["model.embed_tokens.weight"]
         elif "lm_head.weight" in hf_state_dict:
             text["lm_head.weight"] = hf_state_dict["lm_head.weight"]
-        return super().from_hf(text, **kwargs)
+        return super().from_hf(text, device_mesh=device_mesh, **kwargs)
+
+    def convert_single_tensor_to_hf(
+        self, fqn: str, tensor: torch.Tensor, **kwargs: Any
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Apply the same VLM naming and tie policy to a single parameter.
+
+        Args:
+            fqn: Native parameter name.
+            tensor: Parameter of arbitrary shape, unchanged by conversion.
+            **kwargs: Shared checkpoint conversion options.
+
+        Returns:
+            Named tensors with the same shape, or no tensor for a tied head alias.
+        """
+        return list(self.to_hf({fqn: tensor}, **kwargs).items())
 
 
 class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
