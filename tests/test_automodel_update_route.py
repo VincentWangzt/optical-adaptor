@@ -9,6 +9,7 @@ import argparse
 import copy
 import hashlib
 import json
+import traceback
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
@@ -157,7 +158,7 @@ def inspect_updates(config_path, output_dir):
             last[name] = (gradients, updated)
         except RuntimeError as error:
             # Keep backend determinism errors visible in this diagnostic report.
-            results[name] = {"error": str(error)}
+            results[name] = {"error": str(error), "traceback": traceback.format_exc()}
             optimizer.zero_grad(set_to_none=True)
             recipe._ce_loss_buffer.clear()
             recipe._kd_loss_buffer.clear()
