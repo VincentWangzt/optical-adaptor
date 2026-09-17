@@ -127,9 +127,19 @@ def test_full_swe_record_preserves_complete_history_and_split(settings):
         )
     messages.append({"role": "assistant", "content": "done", "reasoning_content": "last thought"})
     row = {"repo": "example/repository", "trajectory_id": "trajectory", "tools": []}
-    records = list(
+    limited = list(
         swe_records(row, messages, settings.prepare.sources[1], settings.prepare, 42, 100)
     )
+    assert limited
+    assert all(record["task"] in {"reconstruction", "continuation"} for record in limited)
+    assert all(record["image_count"] <= 2 for record in limited)
+    prepare = settings.prepare.model_copy(
+        update={
+            "tasks": ["reconstruction", "continuation", "next_action"],
+            "max_images": None,
+        }
+    )
+    records = list(swe_records(row, messages, settings.prepare.sources[1], prepare, 42, 100))
     full = next(record for record in records if record["origin"]["view"] == "full")
     assert parse_visual_areas(full["messages"])[0] == messages
     assert full["turn_count"] == 5 and full["image_count"] == 10

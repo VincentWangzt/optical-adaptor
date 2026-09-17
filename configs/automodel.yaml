@@ -109,6 +109,8 @@ optical:
         thinking: false
         max_records: 100000
     eval_fraction: 0.05
+    tasks: [reconstruction, continuation]
+    max_images: 2
     min_observation_chars: 256
     lines_per_image: 50
     stack_image_counts: [1, 2]

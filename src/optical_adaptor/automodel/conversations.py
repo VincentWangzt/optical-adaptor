@@ -248,6 +248,8 @@ def stack_records(
     pages = visual_spans(text, config.lines_per_image, line_width)
     rng = random.Random(fingerprint([seed, source.name, origin_id]))
     for images in config.stack_image_counts:
+        if config.max_images is not None and images > config.max_images:
+            continue
         if len(pages) < images:
             continue
         # Front and middle variants have the same supervised SFT structure.
@@ -259,6 +261,8 @@ def stack_records(
             visual = text[start:end]
             following = text[end:].removeprefix("\n").splitlines()[: config.continuation_lines]
             for task in ("reconstruction", "continuation"):
+                if task not in config.tasks:
+                    continue
                 if task == "continuation" and len(following) < config.continuation_lines:
                     continue
                 target = visual if task == "reconstruction" else "\n".join(following)
@@ -315,60 +319,68 @@ def swe_records(
     usable_areas = [a for a in areas if a["message"] < last_assistant]
     if not usable_areas:
         return
-    turns = {owner_by_message[a["message"]] for a in usable_areas}
-    # Keep every original message in the full record, including any trailing tool
-    # responses. Processing stops after the last supervised action, not mid-turn.
-    yield make_record(
-        messages=messages,
-        tools=tools,
-        areas=usable_areas,
-        source=source,
-        group=group,
-        origin_id=origin_id,
-        task="next_action",
-        view="full",
-        thinking=source.thinking,
-        turn_count=len(turns),
-        seed=seed,
-        config=config,
-    )
-    targets = [
-        i
-        for i, m in enumerate(messages)
-        if m["role"] == "assistant" and any(a["message"] < i for a in usable_areas)
-    ]
-    if config.max_actions_per_trajectory is not None:
-        targets = sorted(rng.sample(targets, min(len(targets), config.max_actions_per_trajectory)))
-    first_assistant = next(i for i, m in enumerate(messages) if m["role"] == "assistant")
-    for target in targets:
-        before = [a for a in usable_areas if a["message"] < target]
-        owners = sorted({owner_by_message[a["message"]] for a in before})
-        if owners[0] < 0:
-            raise ValueError("Tool observations must follow an assistant action")
-        for window in config.window_turns:
-            if len(owners) < window:
-                continue
-            start = owners[-window]
-            selected_indices = list(range(first_assistant)) + list(range(start, target + 1))
-            remap = {old: new for new, old in enumerate(selected_indices)}
-            selected_areas = [
-                {**a, "message": remap[a["message"]]} for a in before if a["message"] >= start
-            ]
-            selected_messages = [messages[i] for i in selected_indices]
+    if "next_action" in config.tasks:
+        turns = {owner_by_message[a["message"]] for a in usable_areas}
+        # Keep every original message in the full record, including any trailing tool
+        # responses. Processing stops after the last supervised action, not mid-turn.
+        if config.max_images is None or len(usable_areas) <= config.max_images:
             yield make_record(
-                messages=selected_messages,
+                messages=messages,
                 tools=tools,
-                areas=selected_areas,
+                areas=usable_areas,
                 source=source,
                 group=group,
                 origin_id=origin_id,
                 task="next_action",
-                view=f"window_{window}_action_{target}",
+                view="full",
                 thinking=source.thinking,
-                turn_count=window,
+                turn_count=len(turns),
                 seed=seed,
                 config=config,
             )
+        targets = [
+            i
+            for i, m in enumerate(messages)
+            if m["role"] == "assistant" and any(a["message"] < i for a in usable_areas)
+        ]
+        if config.max_actions_per_trajectory is not None:
+            targets = sorted(
+                rng.sample(targets, min(len(targets), config.max_actions_per_trajectory))
+            )
+        first_assistant = next(i for i, m in enumerate(messages) if m["role"] == "assistant")
+        for target in targets:
+            before = [a for a in usable_areas if a["message"] < target]
+            owners = sorted({owner_by_message[a["message"]] for a in before})
+            if owners[0] < 0:
+                raise ValueError("Tool observations must follow an assistant action")
+            for window in config.window_turns:
+                if len(owners) < window:
+                    continue
+                start = owners[-window]
+                selected_indices = list(range(first_assistant)) + list(range(start, target + 1))
+                remap = {old: new for new, old in enumerate(selected_indices)}
+                selected_areas = [
+                    {**a, "message": remap[a["message"]]} for a in before if a["message"] >= start
+                ]
+                if config.max_images is not None and len(selected_areas) > config.max_images:
+                    continue
+                selected_messages = [messages[i] for i in selected_indices]
+                yield make_record(
+                    messages=selected_messages,
+                    tools=tools,
+                    areas=selected_areas,
+                    source=source,
+                    group=group,
+                    origin_id=origin_id,
+                    task="next_action",
+                    view=f"window_{window}_action_{target}",
+                    thinking=source.thinking,
+                    turn_count=window,
+                    seed=seed,
+                    config=config,
+                )
+    if not {"reconstruction", "continuation"}.intersection(config.tasks):
+        return
     observations = sorted({a["message"] for a in usable_areas})
     observations = rng.sample(
         observations, min(len(observations), config.reconstruction_observations_per_trajectory)
@@ -376,6 +388,8 @@ def swe_records(
     for index in observations:
         text = messages[index]["content"]
         for task in ("reconstruction", "continuation"):
+            if task not in config.tasks:
+                continue
             if task == "continuation":
                 lines = text.splitlines()
                 if len(lines) <= config.continuation_lines + 4:
@@ -387,6 +401,8 @@ def swe_records(
             naive, naive_tools, naive_areas = naive_messages(
                 visual, target, task, config, rng, line_width
             )
+            if config.max_images is not None and len(naive_areas) > config.max_images:
+                continue
             yield make_record(
                 messages=naive,
                 tools=naive_tools,

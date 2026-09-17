@@ -43,6 +43,8 @@ class PrepareConfig(StrictConfig):
     output_dir: str
     sources: list[Source]
     eval_fraction: float = Field(gt=0, lt=1)
+    tasks: list[Literal["reconstruction", "continuation", "next_action"]] = Field(min_length=1)
+    max_images: int | None = Field(gt=0)
     min_observation_chars: int = Field(gt=0)
     lines_per_image: int = Field(gt=0)
     stack_image_counts: list[int]
