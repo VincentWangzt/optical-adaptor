@@ -155,6 +155,8 @@ def test_primary_bin_filters_do_not_create_a_cross_product(tmp_path):
         ),
     ]
     pl.DataFrame(rows).write_parquet(tmp_path / "manifest.parquet")
-    filters = optical.data.eval_filter.model_copy(update={"image_bins": ["1"], "turn_bins": ["1"]})
+    filters = optical.data.eval_filter.model_copy(
+        update={"tasks": None, "image_bins": ["1"], "turn_bins": ["1"], "max_images": None}
+    )
     dataset = ConversationDataset(str(tmp_path), "eval", filters)
     assert {row["sample_id"] for row in dataset.rows} == {"r", "n"}
