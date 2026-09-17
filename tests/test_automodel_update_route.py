@@ -30,6 +30,10 @@ def digest(tensor):
 
 
 def inspect_updates(config_path, output_dir):
+    # Isolate GPU numerics from the known single-worker launcher/Gloo placement
+    # mismatch: the production DDP manager chooses CPU when its backend is Gloo.
+    torch.cuda.set_device(0)
+    dist.init_process_group("nccl")
     raw = yaml.safe_load(Path(config_path).read_text())
     raw["separate_meshes"] = False
     raw["distributed"]["dp_size"] = 1
