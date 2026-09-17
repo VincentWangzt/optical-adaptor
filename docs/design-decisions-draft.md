@@ -17,6 +17,8 @@ explicitly marked otherwise.
 The September 18 continuation completed full DP2/TP2/CP2 checkpoint replay and
 the [official OCR encoding audit](ocr-encoding-validation.md), correcting pixel
 layout/autocast and documenting remaining BF16 sensitivity.
+The subsequent activation correction removes our eager override and preserves
+the official script's FP32 QuickGELU computation under BF16 autocast.
 
 ## Decision protocol
 

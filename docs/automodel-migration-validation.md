@@ -11,6 +11,8 @@ their unresolved-reproducibility statement does not describe the current code.
 The later [official OCR audit](ocr-encoding-validation.md) also fixes pixel layout
 and vision autocast, and distinguishes repeatability from agreement with the
 official scripted activation and from invariance to image batch size.
+The eager activation override was subsequently removed at `c7341327`; the encoder
+now preserves the official scripted FP32 activation under BF16 autocast.
 
 The confirmed decisions in `design-decisions-draft.md`, including inherited,
 independent generation budgets (P11), are implemented and synchronized through

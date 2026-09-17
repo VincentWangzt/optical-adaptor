@@ -139,10 +139,12 @@ checked explicitly; TP and CP use the existing FSDP2 strategy.
 
 `optical.deterministic: true` enables strict PyTorch determinism. The encoder uses
 contiguous NCHW pixels and owns the official BF16 autocast scope, including its
-projector. It retains eager QuickGELU after the earlier standalone TorchScript
-warm-up finding. The [official encoding audit](ocr-encoding-validation.md) shows
-that eager and scripted activation results still differ numerically, and that
-the scripted reference repeats consistently under official autocast. The
+projector. The official scripted QuickGELU is imported unchanged: under autocast
+it computes in FP32. The eager override was removed because it changed activation
+precision to BF16. Preserve the official encoder precision policy. The
+[official encoding audit](ocr-encoding-validation.md) verifies FP32 activation
+outputs in the actual CLIP blocks and exact features against the unmodified
+official reference under the same attention backend. The
 canonical `optical.vision.sdpa_backend: math` fixes the vision attention reference;
 `auto` allows fused selection. Math attention is scoped to vision, leaving the
 language model's CP attention available. These settings are part of the exported
@@ -196,8 +198,9 @@ old checkpoint schemas and replay tests have been retired; historical reports
 remain documentation only.
 
 The current [parallel validation report](automodel-parallel-validation.md) records
-full FSDP DP2, TP2 and CP2 runs after the OCR correction, with two updates followed
-by a fresh-process replay of the second update for each layout. Adapter weights,
+full FSDP DP2, TP2 and CP2 runs after restoring the official scripted activation,
+with two updates followed by a fresh-process replay of the second update for each
+layout. Adapter weights,
 optimizer/scheduler state, losses, sample counters and loader state matched
 exactly, and checkpoints matched exports. Thirty focused CPU tests also passed.
 This is bounded replay evidence, not a long-run convergence, 32K capacity or

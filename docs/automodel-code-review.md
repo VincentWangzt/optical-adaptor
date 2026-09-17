@@ -2,11 +2,15 @@
 
 The September 18 [official OCR audit](ocr-encoding-validation.md) additionally
 corrects contiguous pixel layout and the missing vision autocast scope. Its
-controlled parity results and remaining activation/batch-size differences qualify
+parity results and remaining batch-size differences qualify
 the earlier numerical conclusions. See [parallel validation](automodel-parallel-validation.md)
 for the resumed full-model validation matrix.
+The later `c7341327` correction removes the eager activation override entirely:
+the official script promotes QuickGELU to FP32 under autocast, whereas the eager
+replacement retained BF16. The official scripted path now passes exact feature
+parity and repeated-call checks.
 
-## Resolution after implementation
+## Initial resolution before the official precision audit
 
 The follow-up implementation fixes the three findings below and replaces the
 DDP-only optical route with AutoModel's native Qwen strategy for FSDP2, TP and CP.

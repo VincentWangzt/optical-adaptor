@@ -6,7 +6,43 @@ Date: 2026-09-17 UTC / September 18 Asia/Shanghai. Branch:
 Transformers 5.15.1, FLA 0.5.2. All executable changes were committed locally,
 pushed through GitHub, then pulled before server execution.
 
-## Completed September 18 follow-up
+## Current results with the official activation restored
+
+Commit `c7341327` removes the eager QuickGELU override and preserves the official
+script's FP32 activation inside BF16 autocast. The complete two-GPU matrix was
+rerun with this implementation. The separate [OCR audit](ocr-encoding-validation.md)
+matches all six fixtures exactly against the unmodified official image path under
+the same math SDPA backend, and verifies FP32 activation outputs in the CLIP blocks.
+
+| Layout | Uninterrupted updates | Fresh-process resumed updates | Second-update loss | Evaluation loss | Exact replay |
+| --- | ---: | ---: | ---: | ---: | --- |
+| FSDP DP2 | 2 | 1 | 0.6363494396 | 0.9685762638 | Yes |
+| FSDP TP2 / DP1 | 2 | 1 | 0.6389020681 | 0.9882174854 | Yes |
+| FSDP CP2 / DP1 | 2 | 1 | 0.6326806545 | 0.9758040024 | Yes |
+
+Each replay restores the first checkpoint and reproduces the second update.
+All six adapter tensors, all 100 optimizer/scheduler state leaves, losses, step
+counters, the 18-leaf data contract/consumption state, and every saved loader
+state match exactly. Each consolidated checkpoint also matches its export.
+All six runs complete teacher-forced and generation evaluation, checkpointing
+and export. Thirty focused CPU tests pass with the restored activation.
+
+Artifacts are under
+`/workspace/optical-adaptor/outputs/automodel/official-activation-validation/`:
+`{dp,tp,cp}/`, their `-resume` counterparts, logs, runtime YAMLs and
+`{dp,tp,cp}-comparison.json`. GPU job
+`20260917-171849-official-activation-mesh-d4c471` completed with exit code 0 at
+17:28:58 UTC; CPU job `20260917-171849-official-activation-cpu--598dbc` also
+completed with exit code 0.
+
+These nine optimizer updates use the same code and mesh within each comparison.
+They do not establish exact continuation from checkpoints produced with the
+removed eager activation, or equivalence across layouts. The 2,048-token,
+two-image and four-generated-token smoke caps still apply. Official BF16 batch-size
+sensitivity remains as quantified in the OCR audit. Larger combined meshes,
+32K capacity, convergence and inference throughput remain unvalidated.
+
+## Intermediate September 18 follow-up with eager activation
 
 The previously stopped TP/CP runs and DP/TP/CP replay comparisons were resumed
 and passed. The subsequent [official OCR audit](ocr-encoding-validation.md) found
@@ -34,7 +70,7 @@ No new optimizer or replica-synchronization failure was observed. Values differ
 across layouts; exactness compares each layout with its own resumed run. The
 2,048-token/two-image smoke caps and four-token generation limits still apply.
 
-Current artifacts are under
+Artifacts for this intermediate implementation are under
 `/workspace/optical-adaptor/outputs/automodel/ocr-aligned-validation/`:
 `{dp,tp,cp}/`, their `-resume` counterparts, logs, runtime YAMLs and
 `{dp,tp,cp}-comparison.json`. The final job
@@ -118,8 +154,10 @@ QuickGELU switches its BF16 rounding after profiling. Replacing it with the same
 eager formula made three repeated vision calls bitwise identical, with either
 math or automatic SDPA selection in that isolated check.
 
-The canonical run uses eager QuickGELU, strict PyTorch determinism and math SDPA
-scoped to vision. Text retains its native attention path for CP.
+The then-canonical run used eager QuickGELU, strict PyTorch determinism and math
+SDPA scoped to vision. The later official precision audit removed the eager
+override; see the current results above. Text retains its native attention path
+for CP.
 
 | Full-model repeated setting | Loss in both trials | Gradient norm | Gradient/update maximum difference |
 | --- | --- | --- | --- |
