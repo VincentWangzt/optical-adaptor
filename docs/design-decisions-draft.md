@@ -5,8 +5,12 @@ Baseline inspected: optical-adaptor `f6ba90f`; AutoModel `2c0df17efff1fc9d5128a9
 
 This preserves the design discussion at the inspected baseline. On September 17,
 the user requested implementation of the confirmed decisions. The migration is
-now implemented locally; server validation is pending the GitHub sync. Historical
-observations below describe the baseline unless explicitly marked otherwise.
+implemented and synchronized through GitHub. Server validation passed 94 focused
+tests and completed nine GPU optimizer updates, including shared/separate
+placement and checkpoint continuation. GPU numerical reproducibility remains
+unresolved; see [the validation report](automodel-migration-validation.md) for
+evidence and limits. Historical observations below describe the baseline unless
+explicitly marked otherwise.
 
 ## Decision protocol
 

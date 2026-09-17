@@ -23,6 +23,9 @@ Choose devices that are idle immediately before launch. GPU IDs above are an
 example, not a reservation. `scripts/launch_optical_training.sh --smoke` builds a
 small effective configuration; normal CLI dotted overrides work without a custom
 training parser. The server needs `NCCL_P2P_DISABLE=1` for its GPU 8/9 pair.
+YAML scalars retain their declared types: write numeric settings as numbers and
+quote strings such as bin identifiers. The fork does not coerce quoted numeric
+strings during object instantiation.
 
 ## Data and weighting
 
@@ -152,3 +155,8 @@ for retained live inference/benchmark entry points. They now use the canonical
 optical config and fresh prepared records. Historical training, tensor caches,
 old checkpoint schemas and replay tests have been retired; historical reports
 remain documentation only.
+
+The migration's [server validation report](automodel-migration-validation.md)
+records successful checkpoint restoration and continuation. GPU runs currently
+show numerical differences on both replay and fresh repetition; exact CPU
+checkpoint continuation passed, but exact GPU replay is not established.
