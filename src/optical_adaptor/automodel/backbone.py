@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from nemo_automodel._transformers.registry import register_architecture
@@ -18,6 +19,13 @@ class OpticalQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
     """Keep native weights, layers and checkpoint conversion; select before head."""
 
     cp_mesh = None
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        supports_tp: bool = True
+        supports_cp: bool = True
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config, backend=None, **kwargs):
         super().__init__(config, backend=backend, **kwargs)

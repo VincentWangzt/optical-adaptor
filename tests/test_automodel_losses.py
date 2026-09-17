@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from nemo_automodel.components.loss.kd_loss import KDLoss
 
+from optical_adaptor.automodel.backbone import OpticalQwen3_5ForCausalLM
 from optical_adaptor.automodel.model import FrozenResources, OpticalModel
 
 
@@ -17,22 +18,20 @@ def test_selected_logits_match_dense_projection_and_gradients():
     ids = torch.randint(0, 40, (2, 6))
     labels = torch.randint(0, 19, (2, 2))
 
-    class Language:
-        config = SimpleNamespace()
-
-        def get_input_embeddings(self):
-            return embedding
-
-        def get_output_embeddings(self):
-            return head
-
-        def base_model(self, **kwargs):
+    class Decoder(torch.nn.Module):
+        def forward(self, **kwargs):
             # Causal dependence provides a gradient path from image embeddings.
             return SimpleNamespace(last_hidden_state=kwargs["inputs_embeds"].cumsum(1))
 
+    language = OpticalQwen3_5ForCausalLM.__new__(OpticalQwen3_5ForCausalLM)
+    torch.nn.Module.__init__(language)
+    language.model = Decoder()
+    language.model.embed_tokens = embedding
+    language.lm_head = head
     model = OpticalModel.__new__(OpticalModel)
     torch.nn.Module.__init__(model)
-    model.resources = FrozenResources(Language(), None)
+    model.resources = FrozenResources(language, None)
+    model.cp_mesh = None
     hidden = torch.randn(2, 6, 7, requires_grad=True)
     model.embed = lambda *args: hidden
     actual = model(ids, torch.ones_like(ids), torch.arange(6)[None], positions).logits

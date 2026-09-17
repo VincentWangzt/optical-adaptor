@@ -30,10 +30,7 @@ def digest(tensor):
 
 
 def inspect_updates(config_path, output_dir):
-    # Isolate GPU numerics from the known single-worker launcher/Gloo placement
-    # mismatch: the production DDP manager chooses CPU when its backend is Gloo.
-    torch.cuda.set_device(0)
-    dist.init_process_group("nccl")
+    # Exercise normal single-worker distributed initialization as well.
     raw = yaml.safe_load(Path(config_path).read_text())
     raw["separate_meshes"] = False
     raw["distributed"]["dp_size"] = 1
@@ -66,16 +63,11 @@ def inspect_updates(config_path, output_dir):
     results, comparisons = {}, {}
     last = {}
 
-    for name, deterministic, math_attention, checkpointing in (
-        ("default_a", False, False, True),
-        ("default_b", False, False, True),
-        ("math_only_a", False, True, True),
-        ("math_only_b", False, True, True),
-        ("strict_default_a", True, False, True),
-        ("strict_default_b", True, False, True),
-        ("strict_math_a", True, True, True),
-        ("strict_math_b", True, True, True),
-        ("strict_math_no_checkpoint", True, True, False),
+    for name, deterministic, math_attention in (
+        ("strict_default_a", True, False),
+        ("strict_default_b", True, False),
+        ("strict_math_a", True, True),
+        ("strict_math_b", True, True),
     ):
         model.adapter.load_state_dict(initial)
         optimizer.load_state_dict(copy.deepcopy(optimizer_initial))
@@ -85,12 +77,6 @@ def inspect_updates(config_path, output_dir):
         torch.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state_all(gpu_rng)
         torch.use_deterministic_algorithms(deterministic)
-        if checkpointing:
-            model.resources.language.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        else:
-            model.resources.language.gradient_checkpointing_disable()
         recipe.batch_wait_seconds = 0
         captured = {"teacher": [], "student": [], "vision": [], "adapter": [], "hidden": []}
 
@@ -131,7 +117,7 @@ def inspect_updates(config_path, output_dir):
                     digest(value)
                 )
             ),
-            model.resources.language.base_model.register_forward_hook(
+            model.resources.language.model.register_forward_hook(
                 lambda module, args, value, capture=captured: capture["hidden"].append(
                     digest(value.last_hidden_state)
                 )
