@@ -1,5 +1,34 @@
 # AutoModel integration and weight-update review
 
+## Resolution after implementation
+
+The follow-up implementation fixes the three findings below and replaces the
+DDP-only optical route with AutoModel's native Qwen strategy for FSDP2, TP and CP.
+See [parallel validation](automodel-parallel-validation.md) for the current
+implementation, numerical checks and remaining supported-layout limits.
+
+The new TP integration also required an initial adapter broadcast: the recipe
+uses rank-dependent seeds, and FSDP does not synchronize new replicated weights.
+TP checkpoint replay exposed this issue after the initial identical-weight
+microtests passed. The strategy now synchronizes initialization using the existing
+mesh groups, and the regression starts from deliberately different replicas.
+Small DDP/FSDP/TP/CP tests and two full FSDP updates passed after this fix; the
+remaining full TP/CP reruns were stopped when the user requested a status report.
+
+The earlier attention-only diagnosis was incomplete. Its fixed trial order did
+not isolate DeepSeek's TorchScript QuickGELU warm-up. An isolated vision test
+found identical SAM outputs but changing CLIP features between first and later
+calls, even with math attention. Replacing scripted QuickGELU with the same eager
+formula made the isolated calls and full repeated optimizer updates bitwise
+identical. Fresh-process FSDP resume also reproduced weights, optimizer moments,
+scheduler, loss and gradient norm exactly for the tested next update.
+
+These results supersede the historical reproducibility conclusions below.
+Different BF16 backends and mesh layouts still need not produce identical
+gradients; repeatability within one execution contract is a different claim.
+
+## Historical review before fixes
+
 Reviewed 2026-09-17. Production code: `75ca63fe`; review diagnostics through
 `655ebf69`. This review adds diagnostics and extends existing mesh tests; it does
 not change production behavior or fix the findings below.

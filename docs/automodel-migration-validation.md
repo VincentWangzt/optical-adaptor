@@ -2,11 +2,12 @@
 
 Date: 2026-09-17. Branch: `codex/automodel-optical-kd`.
 
-Follow-up: the [integration and weight-update review](automodel-code-review.md)
-identifies three concrete integration bugs and narrows repeated GPU differences
-to computation before the optimizer. Its fixed-input determinism experiments do
-not establish full-run checkpoint reproducibility; the original results below
-remain the record of the migration smoke runs.
+Follow-up: [parallel validation](automodel-parallel-validation.md) records the
+fixes, native FSDP2/TP/CP integration, and exact repeated-update and FSDP resume
+checks. The [review](automodel-code-review.md) now explains the TorchScript
+QuickGELU warm-up issue that the initial attention experiments did not isolate.
+The original results below remain the historical migration smoke-run record;
+their unresolved-reproducibility statement does not describe the current code.
 
 The confirmed decisions in `design-decisions-draft.md`, including inherited,
 independent generation budgets (P11), are implemented and synchronized through

@@ -24,16 +24,28 @@ Local extensions:
   need not live inside the AutoModel checkout.
 - YAML scalar types, including quoted numeric identifiers, are preserved through
   loading and instantiation; explicit CLI/env parsing is handled separately.
+- Ordinary shared-batch CP forwards the teacher's sharded inputs; paired optical
+  branches use their own model-owned input-to-target mappings.
+- Single-worker CUDA launch retains NCCL, and DDP placement preserves parameter
+  precision. Empty CP supervision retains its backward graph and FP32 loss scalar.
+- Explicit native configs are consumed once; the Qwen causal-convolution fallback
+  accepts the Transformers 5.15 argument convention.
 
-The optical wrapper currently validates DDP only. It rejects FSDP/TP/CP/PP rather
-than claiming untested sharding support. The original upstream mesh-backed routes
-remain available for other supported models. Packing and adaptive grouping are
-explicitly deferred.
+The optical addon registers a native Qwen text architecture and an optical
+strategy through existing registration hooks. Its strategy delegates to
+`Qwen3_5ParallelizationStrategy`, synchronizes new adapter initialization over
+existing mesh groups, adds FP32 adapter ownership, and supplies the
+compact-target CP sharder. It uses the existing FSDP2 manager, mesh bridge,
+accumulation, reductions, optimizer and checkpoint engine. DDP remains available.
+PP, EP, sequence parallelism and Megatron FSDP are explicit unsupported cases for
+this optical model. Packing and adaptive grouping remain deferred.
 
 `tests/test_automodel_mesh.py` in the parent repository passed with both
 2-student/1-teacher and 1-student/2-teacher CPU process layouts, unequal target
 counts, and two accumulation microbatches against a serial gradient reference.
 Affected upstream launcher/config tests also passed. The parent
 [`docs/automodel-migration-validation.md`](../../docs/automodel-migration-validation.md)
-records GPU optimization, checkpoint continuation and its unresolved numerical
-reproducibility limit. Unrelated upstream suites were not run.
+records the initial migration. The current
+[`parallel validation`](../../docs/automodel-parallel-validation.md) records
+FSDP/TP/CP optimization, weight/gradient checks and the reproducibility fix.
+Unrelated upstream suites were not run.

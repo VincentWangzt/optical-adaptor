@@ -7,9 +7,12 @@ This preserves the design discussion at the inspected baseline. On September 17,
 the user requested implementation of the confirmed decisions. The migration is
 implemented and synchronized through GitHub. Server validation passed 94 focused
 tests and completed nine GPU optimizer updates, including shared/separate
-placement and checkpoint continuation. GPU numerical reproducibility remains
-unresolved; see [the validation report](automodel-migration-validation.md) for
-evidence and limits. Historical observations below describe the baseline unless
+placement and checkpoint continuation. The subsequent review/fix now integrates
+the existing native FSDP2/TP/CP strategy and resolves the observed repeated-update
+drift from DeepSeek's scripted activation warm-up. See
+[parallel validation](automodel-parallel-validation.md) for current evidence and
+limits, and [migration validation](automodel-migration-validation.md) for the
+initial results. Historical observations below describe the baseline unless
 explicitly marked otherwise.
 
 ## Decision protocol

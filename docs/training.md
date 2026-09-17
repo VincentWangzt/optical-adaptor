@@ -102,23 +102,55 @@ Sampling epochs round up to complete global batches. Packing and adaptive
 regrouping are deferred. Unchunked logits can be large; set sequence/image limits
 and batch sizes to fit the chosen placement.
 
-For independent placement, configure disjoint DDP meshes:
+The default is FSDP2. The optical strategy delegates language parallelization to
+AutoModel's existing `Qwen3_5ParallelizationStrategy`; it adds adapter precision
+ownership and the mapping between input positions and compact targets. Configure
+`distributed.tp_size` or `distributed.cp_size` to use tensor or context
+parallelism. The remaining ranks form the data-parallel mesh. DDP remains an
+option. Activation checkpointing belongs to `distributed.activation_checkpointing`.
+
+For independent placement, configure disjoint student and teacher meshes, for
+example one FSDP2 worker each:
 
 ```yaml
 separate_meshes: true
 distributed:
-  strategy: ddp
+  strategy: fsdp2
   dp_size: 1
 teacher_distributed:
-  strategy: ddp
+  strategy: fsdp2
   dp_size: 1
 ```
 
-The two DP sizes must sum to the launcher process count. The official bridge
-routes whole paired requests and selected logits, including unequal DP sizes.
-This optical wrapper currently supports DDP only; FSDP/TP/CP/PP are explicit
-errors pending model-specific integration. It does not silently ignore those
-settings. Different adaptive teacher/student microbatch partitions are deferred.
+Each mesh uses `DP * TP * CP` workers; the two mesh sizes must sum to the launcher
+process count. The official bridge routes paired requests and selected logits,
+including unequal DP sizes. Each branch shards its own input sequence; CP shards
+supervision on the common target axis, and TP shards the vocabulary projection.
+The framework handles gradient reduction, normalization, clipping and AdamW.
+The adapter keeps FP32 master parameters and uses BF16 compute. Its newly
+initialized weights are synchronized over the existing student mesh groups before
+FSDP sharding, so rank-dependent construction seeds cannot split TP replicas.
+Different adaptive teacher/student microbatch partitions remain deferred.
+
+PP and EP must be 1, and `sequence_parallel` must be false. There is no optical
+pipeline schedule or expert model, and the existing Qwen TP plan keeps the
+recurrent core replicated. Megatron FSDP is not integrated. These limits are
+checked explicitly; TP and CP use the existing FSDP2 strategy.
+
+`optical.deterministic: true` enables strict PyTorch determinism. The encoder uses
+the eager QuickGELU formula: the pinned DeepSeek TorchScript implementation changed
+BF16 rounding after profiling, making features depend on warm-up history. The
+canonical `optical.vision.sdpa_backend: math` fixes the vision attention reference;
+`auto` allows fused selection. Math attention is scoped to vision, leaving the
+language model's CP attention available. These settings are part of the exported
+model and resume contract. Exact repeatability is demonstrated for the canonical
+settings, not equivalence across different backends or mesh layouts.
+
+Generation uses the same sharded native model and keeps participating ranks in
+lockstep across differing quotas and EOS. It currently recomputes the prefix and
+vision features for every generated token: the native text route has no KV-cache
+generation integration. Use small evaluation caps when checking training; this
+is a correctness path, not a generation throughput optimization.
 
 ## Evaluation, metrics and recovery
 
@@ -156,7 +188,10 @@ optical config and fresh prepared records. Historical training, tensor caches,
 old checkpoint schemas and replay tests have been retired; historical reports
 remain documentation only.
 
-The migration's [server validation report](automodel-migration-validation.md)
-records successful checkpoint restoration and continuation. GPU runs currently
-show numerical differences on both replay and fresh repetition; exact CPU
-checkpoint continuation passed, but exact GPU replay is not established.
+The current [parallel validation report](automodel-parallel-validation.md)
+records mesh tests, full-model optimization, and a fresh-process FSDP resume
+that exactly reproduced the next update's weights, optimizer and scheduler state.
+This is bounded replay evidence, not a long-run convergence or cross-layout
+equivalence claim. The initial migration results remain in the historical report.
+The final initialization-sync fix passed small multi-rank tests and full FSDP DP2
+updates; the subsequent full TP/CP rerun was stopped at the user's request.
