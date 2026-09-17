@@ -152,6 +152,9 @@ def _kl_forward_chunked(
     t_logits: torch.Tensor,
     s_logits: torch.Tensor,
     chunk_size: int,
+    *,
+    fp32_upcast: bool = True,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """Compute per-token forward KL in chunks to reduce peak memory.
 
@@ -162,6 +165,8 @@ def _kl_forward_chunked(
         t_logits: Tensor of shape ``[tokens, vocab]`` containing teacher logits.
         s_logits: Tensor of shape ``[tokens, vocab]`` containing student logits.
         chunk_size: Number of tokens per chunk.
+        fp32_upcast: Whether to up-cast each chunk before applying temperature scaling.
+        temperature: Softmax temperature applied within each chunk.
 
     Returns:
         Tensor of shape ``[tokens]`` containing per-token forward KL.
@@ -172,6 +177,13 @@ def _kl_forward_chunked(
         end = min(start + chunk_size, num_tokens)
         t_chunk = t_logits[start:end]
         s_chunk = s_logits[start:end]
+        if fp32_upcast:
+            t_chunk = t_chunk.float()
+            s_chunk = s_chunk.float()
+        if temperature != 1.0:
+            inverse_temperature = 1.0 / temperature
+            t_chunk = t_chunk.mul(inverse_temperature)
+            s_chunk = s_chunk.mul(inverse_temperature)
         teacher_logprob = F.log_softmax(t_chunk, dim=-1, dtype=torch.float32)
         student_logprob = F.log_softmax(s_chunk, dim=-1, dtype=torch.float32)
         kl_parts.append(_forward_kl_from_log_probs(teacher_logprob, student_logprob))
@@ -284,21 +296,33 @@ class KDLoss(nn.Module):
         t_logits = teacher_logits[valid_mask]
         s_logits = student_logits[valid_mask]
 
-        # Up-cast to fp32 for numerical stability and apply temperature scaling.
-        if self.fp32_upcast:
-            t_logits = t_logits.float()
-            s_logits = s_logits.float()
-
-        if self.temperature != 1.0:
-            t_logits = t_logits.mul(1.0 / self.temperature)
-            s_logits = s_logits.mul(1.0 / self.temperature)
-
         # Compute per-token forward KL: sum(P * (log P - log Q)).
         if tp_group is not None:
+            if self.fp32_upcast:
+                t_logits = t_logits.float()
+                s_logits = s_logits.float()
+            if self.temperature != 1.0:
+                t_logits = t_logits.mul(1.0 / self.temperature)
+                s_logits = s_logits.mul(1.0 / self.temperature)
             kl_per_token = _kl_forward_tp(t_logits, s_logits, tp_group)
         elif self.chunk_size > 0:
-            kl_per_token = _kl_forward_chunked(t_logits, s_logits, self.chunk_size)
+            # Keep the selected logits in their source precision and only up-cast one
+            # position chunk at a time. Up-casting the complete tensors here defeats
+            # the peak-memory purpose of chunking for large vocabularies.
+            kl_per_token = _kl_forward_chunked(
+                t_logits,
+                s_logits,
+                self.chunk_size,
+                fp32_upcast=self.fp32_upcast,
+                temperature=self.temperature,
+            )
         else:
+            if self.fp32_upcast:
+                t_logits = t_logits.float()
+                s_logits = s_logits.float()
+            if self.temperature != 1.0:
+                t_logits = t_logits.mul(1.0 / self.temperature)
+                s_logits = s_logits.mul(1.0 / self.temperature)
             teacher_logprob = F.log_softmax(t_logits, dim=-1, dtype=torch.float32)
             student_logprob = F.log_softmax(s_logits, dim=-1, dtype=torch.float32)
             kl_per_token = _forward_kl_from_log_probs(teacher_logprob, student_logprob).view(-1)

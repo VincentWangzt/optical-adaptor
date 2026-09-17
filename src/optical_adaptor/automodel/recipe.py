@@ -83,8 +83,10 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             for key, value in expected.items():
                 if model[key] != value:
                     raise ValueError(f"{name}.{key} differs from the canonical optical config")
-        if not 0 <= self.raw["kd_ratio"] <= 1 or self.raw["kd_loss_fn"]["chunk_size"] != 0:
-            raise ValueError("KD ratio must be in [0,1] and position chunking must be disabled")
+        if not 0 <= self.raw["kd_ratio"] <= 1:
+            raise ValueError("KD ratio must be in [0,1]")
+        if self.raw["kd_loss_fn"]["chunk_size"] < 0:
+            raise ValueError("KD position chunk size must be non-negative")
         self.events = {}
 
     def setup(self):

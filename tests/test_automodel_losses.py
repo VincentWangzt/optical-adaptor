@@ -1,4 +1,4 @@
-"""Selected projection and unchunked KD must preserve values and input gradients."""
+"""Selected projection and KD must preserve values and input gradients."""
 
 from types import SimpleNamespace
 
@@ -65,4 +65,32 @@ def test_unequal_target_counts_use_global_denominator():
     torch.testing.assert_close(
         torch.autograd.grad(whole, student, retain_graph=True)[0],
         torch.autograd.grad(parts, student)[0],
+    )
+
+
+def test_chunked_bfloat16_kd_matches_fp32_reference_and_gradients():
+    torch.manual_seed(41)
+    student = torch.randn(7, 23, dtype=torch.bfloat16, requires_grad=True)
+    teacher = torch.randn_like(student)
+    labels = torch.tensor([0, 1, -100, 3, 4, 5, 6])
+    actual = KDLoss(temperature=1.7, fp32_upcast=True, chunk_size=2)(
+        student, teacher, labels
+    )
+
+    reference_student = student.float().detach().requires_grad_(True)
+    valid = labels != -100
+    expected = (
+        F.kl_div(
+            (reference_student[valid] / 1.7).log_softmax(-1),
+            (teacher[valid].float() / 1.7).softmax(-1),
+            reduction="batchmean",
+        )
+        * 1.7**2
+    )
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual, student)[0].float(),
+        torch.autograd.grad(expected, reference_student)[0],
+        atol=2e-3,
+        rtol=2e-2,
     )
