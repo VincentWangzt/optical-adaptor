@@ -218,6 +218,7 @@ def compare(config_path, output):
     config = yaml.safe_load(config_path.read_text())
     vision_config = config["optical"]["vision"]
     namespace, official_encoder, source_hashes = official_reference(vision_config)
+    scripted_quick_gelu = official_encoder.quick_gelu
     actual = DeepSeekOCRVision(**vision_config).cuda().bfloat16().eval()
     reference = namespace["DeepseekOCRModel"](SimpleNamespace())
     # This deterministic buffer is registered persistently upstream but absent
@@ -257,9 +258,13 @@ def compare(config_path, output):
         pixel_diff = difference(pixels, expected_pixels)
         assert pixel_diff["equal"], (name, pixel_diff)
         with sdpa_kernel(SDPBackend.MATH):
+            official_encoder.quick_gelu = scripted_quick_gelu
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                stock = [
+                    reference_forward(ids, prepared)
+                    for _ in range(3 if not report["images"] else 1)
+                ]
             if not report["images"]:
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    stock = [reference_forward(ids, prepared) for _ in range(3)]
                 report["stock_scripted_repeats"] = [difference(value, stock[0]) for value in stock]
             # Isolate our documented activation change from encoding-path parity.
             official_encoder.quick_gelu = quick_gelu
@@ -282,6 +287,7 @@ def compare(config_path, output):
             "original_size": list(image.size),
             "pixels": pixel_diff,
             "features": feature_diff,
+            "unmodified_official_features": difference(features, stock[-1]),
             "official_autocast_vs_optical": difference(features, official_autocast),
             "matched_autocast_paths": difference(actual_autocast, official_autocast),
             "official_image_tokens": int(prepared["images_seq_mask"].sum()),
