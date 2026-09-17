@@ -5,22 +5,19 @@ dist_env:
   backend: nccl
   timeout_minutes: 20
 distributed:
-  strategy: fsdp2
+  strategy: ddp
   tp_size: 1
   cp_size: 1
   pp_size: 1
   ep_size: 1
   activation_checkpointing: true
-  sequence_parallel: false
-  mp_policy:
-    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
-    param_dtype: bfloat16
-    reduce_dtype: float32
-    output_dtype: bfloat16
+  broadcast_buffers: false
+  find_unused_parameters: false
+  static_graph: false
 separate_meshes: false
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 16
+  local_batch_size: 1
   num_epochs: 1
   max_steps: null
   ckpt_every_steps: 500
@@ -144,8 +141,8 @@ optical:
       - Complete this excerpt with its next {lines} lines, preserving the formatting.
   processing:
     assistant_loss: all
-    max_teacher_tokens: 32768
-    max_student_tokens: 32768
+    max_teacher_tokens: 3072
+    max_student_tokens: 2048
     overlength: drop
     vision_start: '<|vision_start|>'
     vision_end: '<|vision_end|>'
