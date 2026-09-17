@@ -89,6 +89,9 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
 
     def setup(self):
         super().setup()
+        clip_config = self.raw.get("clip_grad_norm")
+        if clip_config is not None and clip_config.get("max_norm", False) is None:
+            self.max_grad_norm = None
         if self._should_setup_training_components():
             model = self.student_model()
             model.stage_timer = self._stage_timer

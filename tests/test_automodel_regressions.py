@@ -17,6 +17,17 @@ from optical_adaptor.automodel.backbone import (
     OpticalQwen3_5ForCausalLM,
     OpticalTextCheckpointAdapter,
 )
+from optical_adaptor.automodel.recipe import OpticalKDRecipe
+
+
+def test_explicit_null_disables_gradient_clipping(monkeypatch):
+    recipe = object.__new__(OpticalKDRecipe)
+    recipe.raw = {"clip_grad_norm": {"max_norm": None}}
+    recipe.max_grad_norm = 1.0
+    monkeypatch.setattr(kd.KnowledgeDistillationRecipeForVLM, "setup", lambda self: None)
+    monkeypatch.setattr(OpticalKDRecipe, "_should_setup_training_components", lambda self: False)
+    recipe.setup()
+    assert recipe.max_grad_norm is None
 
 
 def test_native_cpu_float32_attention_forward_and_input_gradient_parity():
