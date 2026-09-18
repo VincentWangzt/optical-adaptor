@@ -10,11 +10,13 @@ from typing import Any
 import yaml
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
-_GLYPH_VERTICAL_OVERFLOW_TOLERANCE = 2
-
 
 class RenderConfigError(ValueError):
     """Raised when a render YAML is invalid."""
+
+
+class GlyphOverflowWarning(RuntimeWarning):
+    """Warn that a sample will render with glyphs outside the nominal text cell."""
 
 
 @dataclass(frozen=True)
@@ -416,6 +418,7 @@ def render_pages(
     source: str,
     *,
     config: RenderConfig,
+    overflow_warnings: set[str] | None = None,
 ) -> tuple[list[Image.Image], int, bool]:
     """Render in memory; file and training workflows share identical pixels."""
     font = FontChain(config.text)
@@ -465,16 +468,17 @@ def render_pages(
         for line in rendered_lines:
             left, top, right, bottom = font.getbbox(line)
             if right > usable_width or left < -margins.left:
-                raise RenderConfigError("actual glyph extents exceed drawable width")
-            vertical_overflow = max(-top, bottom - text_config.line_height, 0)
-            if vertical_overflow:
-                if vertical_overflow > _GLYPH_VERTICAL_OVERFLOW_TOLERANCE:
-                    raise RenderConfigError("actual glyph extents exceed line height")
-                warnings.warn(
-                    "glyph extents exceed line height by at most 2px; rendering with overlap",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+                message = "actual glyph extents exceed drawable width"
+                if overflow_warnings is None:
+                    warnings.warn(message, GlyphOverflowWarning, stacklevel=2)
+                else:
+                    overflow_warnings.add(message)
+            if top < 0 or bottom > text_config.line_height:
+                message = "actual glyph extents exceed line height"
+                if overflow_warnings is None:
+                    warnings.warn(message, GlyphOverflowWarning, stacklevel=2)
+                else:
+                    overflow_warnings.add(message)
 
     required_pages = math.ceil(len(lines) / lines_per_page)
     rendered_pages = min(required_pages, pages.max_pages or required_pages)

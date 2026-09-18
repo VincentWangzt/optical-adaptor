@@ -2,6 +2,7 @@
 
 import copy
 import random
+from types import SimpleNamespace
 
 import pytest
 from transformers import AutoTokenizer
@@ -16,7 +17,8 @@ from optical_adaptor.automodel.conversations import (
     swe_records,
     visual_spans,
 )
-from optical_adaptor.automodel.processing import ConversationCompiler, RejectedSample
+from optical_adaptor.automodel.processing import ConversationCompiler, RejectedSample, render_batch
+from optical_adaptor.renderer import GlyphOverflowWarning, load_render_config
 
 
 @pytest.fixture(scope="module")
@@ -102,6 +104,18 @@ def test_overlength_rejects_whole_record(settings, tokenizer):
     with pytest.raises(RejectedSample, match="teacher_length"):
         ConversationCompiler(tokenizer, config, 111).compile(record)
     assert record == before
+
+
+def test_render_batch_attributes_overflow_warning_to_sample():
+    pair = SimpleNamespace(visual_texts=["     ┌─┴─┐\nq_1: ┤ X ├\n     └───┘"])
+    with pytest.warns(GlyphOverflowWarning, match="sample box-drawing-sample"):
+        images = render_batch(
+            [pair],
+            load_render_config("configs/render.training.yaml"),
+            ["box-drawing-sample"],
+        )
+
+    assert len(images) == 1
 
 
 def test_visual_offsets_cover_every_non_newline_character():

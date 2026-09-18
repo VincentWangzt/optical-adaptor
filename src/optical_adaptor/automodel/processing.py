@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 
 import torch
 
 from optical_adaptor.automodel.config import ProcessingConfig
 from optical_adaptor.automodel.conversations import parse_visual_areas, validate_record
-from optical_adaptor.renderer import RenderConfig, render_pages
+from optical_adaptor.renderer import GlyphOverflowWarning, RenderConfig, render_pages
 
 
 class RejectedSample(ValueError):
@@ -258,7 +259,12 @@ class OpticalProcessor:
                 ),
             }
         batch["student"]["pixel_values"] = image_pixels(
-            render_batch(pairs, self.render_config), self.image_size
+            render_batch(
+                pairs,
+                self.render_config,
+                [record["sample_id"] for record in records],
+            ),
+            self.image_size,
         )
         batch["student"]["image_positions"] = torch.tensor(
             [
@@ -270,12 +276,30 @@ class OpticalProcessor:
         return batch
 
 
-def render_batch(compiled: list[PairedTokens], render_config: RenderConfig):
+def render_batch(
+    compiled: list[PairedTokens],
+    render_config: RenderConfig,
+    sample_ids: list[str] | None = None,
+):
+    if sample_ids is not None and len(sample_ids) != len(compiled):
+        raise ValueError("sample_ids must align with compiled records")
     images = []
-    for pair in compiled:
+    identifiers = sample_ids if sample_ids is not None else [None] * len(compiled)
+    for pair, sample_id in zip(compiled, identifiers, strict=True):
+        overflows = set() if sample_id is not None else None
         for text in pair.visual_texts:
-            pages, _, truncated = render_pages(text, config=render_config)
+            pages, _, truncated = render_pages(
+                text,
+                config=render_config,
+                overflow_warnings=overflows,
+            )
             if truncated or len(pages) != 1:
                 raise ValueError("Each visual area must render to exactly one complete image")
             images.append(pages[0])
+        if overflows:
+            warnings.warn(
+                f"sample {sample_id}: {'; '.join(sorted(overflows))}",
+                GlyphOverflowWarning,
+                stacklevel=2,
+            )
     return images

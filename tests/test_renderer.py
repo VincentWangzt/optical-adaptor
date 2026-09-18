@@ -4,6 +4,7 @@ import pytest
 from PIL import Image
 
 from optical_adaptor.renderer import (
+    GlyphOverflowWarning,
     Margins,
     OutputConfig,
     PagesConfig,
@@ -59,7 +60,7 @@ def test_default_bundled_font_renders(tmp_path: Path) -> None:
 
 def test_small_box_drawing_overhang_warns_and_renders(tmp_path: Path) -> None:
     config = load_render_config(Path("configs/render.training.yaml"))
-    with pytest.warns(RuntimeWarning, match="glyph extents exceed line height"):
+    with pytest.warns(GlyphOverflowWarning, match="glyph extents exceed line height"):
         result = render_source(
             "     ┌─┴─┐\nq_1: ┤ X ├\n     └───┘",
             stem="box-drawing",
