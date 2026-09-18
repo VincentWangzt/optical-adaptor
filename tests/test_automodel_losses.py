@@ -66,3 +66,32 @@ def test_unequal_target_counts_use_global_denominator():
         torch.autograd.grad(whole, student, retain_graph=True)[0],
         torch.autograd.grad(parts, student)[0],
     )
+
+
+def test_temperature_one_bfloat16_kd_matches_explicit_fp32_reference():
+    torch.manual_seed(31)
+    student = torch.randn(7, 23, dtype=torch.bfloat16, requires_grad=True)
+    teacher = torch.randn(7, 23, dtype=torch.bfloat16)
+    labels = torch.tensor([3, -100, 7, 4, -100, 1, 9])
+    valid = labels != -100
+
+    actual = KDLoss(temperature=1.0, fp32_upcast=True, chunk_size=0)(
+        student,
+        teacher,
+        labels,
+        num_batch_labels=5,
+    )
+    teacher_logprob = F.log_softmax(teacher[valid], dim=-1, dtype=torch.float32)
+    student_logprob = F.log_softmax(student[valid], dim=-1, dtype=torch.float32)
+    expected = F.kl_div(
+        student_logprob,
+        teacher_logprob,
+        reduction="sum",
+        log_target=True,
+    ) / 5
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual, student, retain_graph=True)[0],
+        torch.autograd.grad(expected, student)[0],
+    )

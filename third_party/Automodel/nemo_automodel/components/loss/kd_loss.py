@@ -178,6 +178,33 @@ def _kl_forward_chunked(
     return torch.cat(kl_parts, dim=0)
 
 
+def _kl_forward_non_tp_sum(
+    t_logits: torch.Tensor,
+    s_logits: torch.Tensor,
+    *,
+    fp32_upcast: bool,
+) -> torch.Tensor:
+    """Compute a sum-reduced forward KL without full-vocabulary intermediates.
+
+    ``log_softmax(..., dtype=torch.float32)`` casts inside the operation, so the
+    selected BF16 logits do not need separate full-size FP32 copies.  The native
+    sum-reduced KL also avoids materializing the manual probability, log-ratio,
+    boolean-mask, and ``where`` tensors.
+
+    Args:
+        t_logits: Tensor of shape ``[tokens, vocab]`` containing unscaled teacher logits.
+        s_logits: Tensor of shape ``[tokens, vocab]`` containing unscaled student logits.
+        fp32_upcast: Compute log probabilities in FP32 when true.
+
+    Returns:
+        Scalar tensor containing the sum of ``KL(P_teacher || P_student)`` over tokens.
+    """
+    compute_dtype = torch.float32 if fp32_upcast else None
+    teacher_logprob = F.log_softmax(t_logits, dim=-1, dtype=compute_dtype)
+    student_logprob = F.log_softmax(s_logits, dim=-1, dtype=compute_dtype)
+    return F.kl_div(student_logprob, teacher_logprob, reduction="sum", log_target=True)
+
+
 class KDLoss(nn.Module):
     """Forward KL divergence loss for knowledge distillation.
 
@@ -283,6 +310,20 @@ class KDLoss(nn.Module):
 
         t_logits = teacher_logits[valid_mask]
         s_logits = student_logits[valid_mask]
+
+        # The ordinary unchunked, temperature-one path can let log_softmax cast
+        # directly from the selected BF16 logits and use PyTorch's reduced KL
+        # kernel. This avoids several simultaneous [tokens, vocab] FP32
+        # allocations. TP keeps its distributed softmax, while non-unit
+        # temperature and explicit chunking retain the existing implementation.
+        if tp_group is None and self.chunk_size == 0 and self.temperature == 1.0:
+            kl_sum = _kl_forward_non_tp_sum(
+                t_logits,
+                s_logits,
+                fp32_upcast=self.fp32_upcast,
+            )
+            denominator = num_batch_labels if num_batch_labels is not None else t_logits.shape[0]
+            return kl_sum / denominator
 
         # Up-cast to fp32 for numerical stability and apply temperature scaling.
         if self.fp32_upcast:
