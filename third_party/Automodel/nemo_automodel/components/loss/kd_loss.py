@@ -184,12 +184,13 @@ def _kl_forward_non_tp_sum(
     *,
     fp32_upcast: bool,
 ) -> torch.Tensor:
-    """Compute a sum-reduced forward KL without full-vocabulary intermediates.
+    """Compute a sum-reduced forward KL with fewer full-vocabulary intermediates.
 
     ``log_softmax(..., dtype=torch.float32)`` casts inside the operation, so the
-    selected BF16 logits do not need separate full-size FP32 copies.  The native
-    sum-reduced KL also avoids materializing the manual probability, log-ratio,
-    boolean-mask, and ``where`` tensors.
+    selected BF16 logits do not need separate full-size FP32 copies. The two FP32
+    log-probability tensors are still materialized; the native sum-reduced KL
+    avoids the additional manual probability, log-ratio, boolean-mask, and
+    ``where`` tensors.
 
     Args:
         t_logits: Tensor of shape ``[tokens, vocab]`` containing unscaled teacher logits.
