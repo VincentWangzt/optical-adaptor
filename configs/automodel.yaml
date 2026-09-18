@@ -16,13 +16,13 @@ distributed:
   static_graph: false
 separate_meshes: false
 step_scheduler:
-  global_batch_size: 64
+  global_batch_size: 32
   local_batch_size: 1
-  num_epochs: 1
-  max_steps: null
+  num_epochs: null
+  max_steps: 1000
   ckpt_every_steps: 500
   val_every_steps: 500
-  save_checkpoint_every_epoch: true
+  save_checkpoint_every_epoch: false
   validate_on_checkpoint: true
   log_remote_every_steps: 1
   gc_every_steps: 100
@@ -163,10 +163,11 @@ optical:
       turn_bins: null
       min_images: 1
       max_images: 2
-    weights: {"": 1.0}
+    sampling: uniform
+    weights: null
     samples_per_epoch: null
     eval_samples: {"": 16}
-    num_workers: 0
+    num_workers: 8
   evaluation:
     generation_every: 500
     generation_samples: {"": 2}

@@ -83,10 +83,19 @@ class ProcessingConfig(StrictConfig):
 class DataConfig(StrictConfig):
     train_filter: FilterConfig
     eval_filter: FilterConfig
-    weights: dict[str, float]
+    sampling: Literal["uniform", "weighted"]
+    weights: dict[str, float] | None
     samples_per_epoch: int | None
     eval_samples: dict[str, int]
     num_workers: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def check_sampling(self):
+        if self.sampling == "uniform" and self.weights is not None:
+            raise ValueError("Uniform sampling does not accept hierarchical weights")
+        if self.sampling == "weighted" and self.weights is None:
+            raise ValueError("Weighted sampling requires hierarchical weights")
+        return self
 
 
 class EvaluationConfig(StrictConfig):

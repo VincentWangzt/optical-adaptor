@@ -11,9 +11,10 @@ DATA_DIR="outputs/automodel/data-100k-5pct"
 PREPARE_DATA=1
 INSTALL_ENVIRONMENT=1
 SOURCE_LIMIT=""                  # Empty: use each source's limit in the YAML.
-MAX_STEPS=""                     # Empty: use the YAML's complete epoch schedule.
-GLOBAL_BATCH_SIZE=64
+MAX_STEPS=1000                   # Explicit preliminary optimizer-step budget.
+GLOBAL_BATCH_SIZE=32
 LOCAL_BATCH_SIZE=1
+NUM_WORKERS=8
 MAX_TEACHER_TOKENS=3072
 MAX_STUDENT_TOKENS=2048
 MAX_IMAGES=2
@@ -30,6 +31,7 @@ if [[ "${1:-}" == "--smoke" ]]; then
     SOURCE_LIMIT=64
     MAX_STEPS=3
     GLOBAL_BATCH_SIZE=2
+    NUM_WORKERS=2
     MAX_TEACHER_TOKENS=4096
     MAX_STUDENT_TOKENS=4096
     MAX_IMAGES=4
@@ -56,7 +58,8 @@ EFFECTIVE_CONFIG="$RUN_DIR/config.yaml"
 uv run --no-sync python - "$CONFIG" "$EFFECTIVE_CONFIG" "$RUN_DIR" "$DATA_DIR" \
     "$MAX_STEPS" "$GLOBAL_BATCH_SIZE" "$LOCAL_BATCH_SIZE" "$MAX_TEACHER_TOKENS" \
     "$MAX_STUDENT_TOKENS" "$MAX_IMAGES" "$ASSISTANT_LOSS" "$WANDB_MODE" "$RESUME_FROM" \
-    "$EVAL_SAMPLES_PER_SLICE" "$GENERATION_SAMPLES_PER_SLICE" "$MAX_NEW_TOKENS" "$SOURCE_LIMIT" <<'PY'
+    "$EVAL_SAMPLES_PER_SLICE" "$GENERATION_SAMPLES_PER_SLICE" "$MAX_NEW_TOKENS" "$SOURCE_LIMIT" \
+    "$NUM_WORKERS" <<'PY'
 import sys
 from pathlib import Path
 import yaml
@@ -64,7 +67,7 @@ from optical_adaptor.automodel.config import OpticalConfig
 
 (source, output, run, data, steps, global_batch, local_batch, teacher_tokens,
  student_tokens, max_images, assistant_loss, mode, resume, eval_per_slice,
- generation_per_slice, max_new_tokens, source_limit) = sys.argv[1:]
+ generation_per_slice, max_new_tokens, source_limit, num_workers) = sys.argv[1:]
 config = yaml.safe_load(Path(source).read_text())
 config['checkpoint']['checkpoint_dir'] = str(Path(run) / 'checkpoints')
 config['checkpoint']['restore_from'] = resume or None
@@ -72,6 +75,7 @@ config['step_scheduler']['global_batch_size'] = int(global_batch)
 config['step_scheduler']['local_batch_size'] = int(local_batch)
 if steps:
     config['step_scheduler']['max_steps'] = int(steps)
+    config['step_scheduler']['num_epochs'] = None
     config['lr_scheduler']['lr_warmup_steps'] = min(
         config['lr_scheduler']['lr_warmup_steps'], max(0, int(steps) - 1)
     )
@@ -87,6 +91,7 @@ optical['processing'].update(assistant_loss=assistant_loss,
 for split in ('train_filter', 'eval_filter'):
     optical['data'][split]['max_images'] = int(max_images) if max_images else None
 optical['data']['eval_samples'] = {'': int(eval_per_slice)}
+optical['data']['num_workers'] = int(num_workers)
 optical['evaluation']['generation_samples'] = {'': int(generation_per_slice)}
 optical['evaluation']['max_new_tokens'] = {'': int(max_new_tokens)}
 OpticalConfig.model_validate(optical)

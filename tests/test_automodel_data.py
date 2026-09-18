@@ -70,6 +70,24 @@ def test_loader_resume_accounts_for_prefetch(workers, rank):
     assert torch.equal(torch.cat(list(restored)), expected)
 
 
+def test_uniform_sampler_visits_every_row_before_repeating():
+    _, optical = read_config("configs/automodel.yaml")
+    data = IndexedRows()
+    samplers = [MixtureSampler(data, optical.data, 42, rank, 2, 4) for rank in range(2)]
+    rank_indices = [list(sampler) for sampler in samplers]
+    global_indices = [
+        index
+        for pair in zip(*rank_indices, strict=True)
+        for index in pair
+    ]
+
+    assert sorted(global_indices) == list(range(len(data)))
+    assert samplers[0].ratios == {
+        "A/reconstruction/images-1": 0.5,
+        "B/continuation/images-2": 0.5,
+    }
+
+
 def test_nearest_weight_is_copied_to_leaves_then_normalized():
     leaves = ["A/x/1", "A/x/2", "B/y/1", "B/y/2", "B/y/3"]
     values = inherited_values({"": 1, "A": 3}, leaves)
@@ -111,7 +129,7 @@ def test_consumed_counters_resume_and_identity_fails_closed():
         RunContract("b").load_state_dict(contract.state_dict())
 
 
-def test_preparation_identity_excludes_runtime_weights(tmp_path):
+def test_preparation_identity_excludes_runtime_sampling(tmp_path):
     raw, optical = read_config("configs/automodel.yaml")
     optical = optical.model_copy(
         update={"prepare": optical.prepare.model_copy(update={"output_dir": str(tmp_path)})}
@@ -120,7 +138,11 @@ def test_preparation_identity_excludes_runtime_weights(tmp_path):
         json.dumps({"preparation_fingerprint": preparation_fingerprint(optical, raw["seed"])})
     )
     weighted = optical.model_copy(
-        update={"data": optical.data.model_copy(update={"weights": {"": 3}})}
+        update={
+            "data": optical.data.model_copy(
+                update={"sampling": "weighted", "weights": {"": 3}}
+            )
+        }
     )
     validate_preparation(weighted, raw["seed"])
     limited = optical.model_copy(

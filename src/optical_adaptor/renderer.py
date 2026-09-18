@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -8,6 +9,8 @@ from typing import Any
 
 import yaml
 from PIL import Image, ImageColor, ImageDraw, ImageFont
+
+_GLYPH_VERTICAL_OVERFLOW_TOLERANCE = 2
 
 
 class RenderConfigError(ValueError):
@@ -463,8 +466,15 @@ def render_pages(
             left, top, right, bottom = font.getbbox(line)
             if right > usable_width or left < -margins.left:
                 raise RenderConfigError("actual glyph extents exceed drawable width")
-            if top < 0 or bottom > text_config.line_height:
-                raise RenderConfigError("actual glyph extents exceed line height")
+            vertical_overflow = max(-top, bottom - text_config.line_height, 0)
+            if vertical_overflow:
+                if vertical_overflow > _GLYPH_VERTICAL_OVERFLOW_TOLERANCE:
+                    raise RenderConfigError("actual glyph extents exceed line height")
+                warnings.warn(
+                    "glyph extents exceed line height by at most 2px; rendering with overlap",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     required_pages = math.ceil(len(lines) / lines_per_page)
     rendered_pages = min(required_pages, pages.max_pages or required_pages)

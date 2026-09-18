@@ -196,7 +196,7 @@ class ConversationDataset(Dataset):
 
 
 class MixtureSampler(Sampler[int]):
-    """Deterministic global draws, divided across DP ranks; all ranks take equal steps."""
+    """Deterministic global sample order divided evenly across data-parallel ranks."""
 
     def __init__(
         self,
@@ -208,16 +208,24 @@ class MixtureSampler(Sampler[int]):
         global_batch_size: int,
     ):
         counts = Counter(row["slice"] for row in dataset.rows)
-        resolved = inherited_values(config.weights, dataset.all_leaves)
-        total = sum(resolved[key] for key in counts)
-        if total <= 0:
-            raise ValueError("No eligible positive training weight")
-        self.ratios = {key: resolved[key] / total for key in sorted(counts)}
+        self.population_size = len(dataset)
+        self.sampling = config.sampling
+        if self.sampling == "uniform":
+            self.ratios = {
+                key: counts[key] / self.population_size for key in sorted(counts)
+            }
+            self.weights = None
+        else:
+            resolved = inherited_values(config.weights, dataset.all_leaves)
+            total = sum(resolved[key] for key in counts)
+            if total <= 0:
+                raise ValueError("No eligible positive training weight")
+            self.ratios = {key: resolved[key] / total for key in sorted(counts)}
+            weights = [self.ratios[row["slice"]] / counts[row["slice"]] for row in dataset.rows]
+            self.weights = torch.tensor(weights, dtype=torch.double)
+            if not torch.isfinite(self.weights).all() or (self.weights < 0).any():
+                raise ValueError("Mixture weights must be nonnegative and finite")
         self.counts = dict(counts)
-        weights = [self.ratios[row["slice"]] / counts[row["slice"]] for row in dataset.rows]
-        self.weights = torch.tensor(weights, dtype=torch.double)
-        if not torch.isfinite(self.weights).all() or (self.weights < 0).any():
-            raise ValueError("Mixture weights must be nonnegative and finite")
         requested = config.samples_per_epoch or len(dataset)
         if global_batch_size % world_size:
             raise ValueError("Global batch must be divisible by student DP size")
@@ -233,9 +241,16 @@ class MixtureSampler(Sampler[int]):
 
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        global_indices = torch.multinomial(
-            self.weights, self.num_samples * self.world_size, replacement=True, generator=generator
-        ).tolist()
+        requested = self.num_samples * self.world_size
+        if self.sampling == "uniform":
+            global_indices = []
+            while len(global_indices) < requested:
+                permutation = torch.randperm(self.population_size, generator=generator).tolist()
+                global_indices.extend(permutation[: requested - len(global_indices)])
+        else:
+            global_indices = torch.multinomial(
+                self.weights, requested, replacement=True, generator=generator
+            ).tolist()
         indices = global_indices[self.rank :: self.world_size]
         while self.cursor < len(indices):
             index = indices[self.cursor]
