@@ -77,13 +77,14 @@ class HFGenerationBackend:
             .index_copy(0, flat, image_embeds.to(embeddings.dtype).flatten(0, 1))
             .view_as(embeddings)
         )
+        config = copy.deepcopy(generation_config)
+        config.max_new_tokens = max_new_tokens
+        config.pad_token_id = pad_token_id
+        config.eos_token_id = eos_token_id
         return self.language.generate(
             inputs_embeds=embeddings,
             attention_mask=attention_mask,
-            generation_config=generation_config,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=pad_token_id,
-            eos_token_id=eos_token_id,
+            generation_config=config,
         )
 
 
