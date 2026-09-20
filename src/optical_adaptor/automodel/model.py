@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import nullcontext
 
 import torch
@@ -13,14 +14,12 @@ from nemo_automodel.components.distributed.context_parallel.utils import cp_disp
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.models.common.utils import BackendConfig
-from nemo_automodel.recipes.kd_utils import materialize_teacher_logits
 from torch import nn
-from torch.distributed.tensor import DTensor
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
 from optical_adaptor.adapters import MLPAdapter
 from optical_adaptor.automodel.backbone import OpticalQwen3_5ForCausalLM
-from optical_adaptor.automodel.parallel import generation_context, target_sharder
+from optical_adaptor.automodel.parallel import target_sharder
 from optical_adaptor.automodel.vision import DeepSeekOCRVision
 
 
@@ -31,6 +30,61 @@ class FrozenResources(nn.Module):
         super().__init__()
         self.language = language
         self.vision = vision
+
+
+class HFGenerationBackend:
+    """Unsharded cached HF decoder, loaded only while generative evaluation runs."""
+
+    def __init__(self, pretrained_model_name_or_path, llm, device):
+        full_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, revision=llm["revision"]
+        )
+        config = (
+            getattr(full_config, llm["text_config_key"])
+            if llm["text_config_key"]
+            else full_config
+        )
+        self.language = NeMoAutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path,
+            revision=llm["revision"],
+            config=config,
+            dtype=torch.bfloat16,
+            attn_implementation=llm["attn_implementation"],
+            force_hf=True,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+        ).to(device)
+        self.language.requires_grad_(False).eval()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        *,
+        input_ids,
+        attention_mask,
+        image_embeds,
+        image_positions,
+        generation_config,
+        max_new_tokens,
+        pad_token_id,
+        eos_token_id,
+    ):
+        embeddings = self.language.get_input_embeddings()(input_ids)
+        positions = image_positions.flatten(0, 1)
+        flat = positions[:, 0] * embeddings.shape[1] + positions[:, 1]
+        embeddings = (
+            embeddings.flatten(0, 1)
+            .index_copy(0, flat, image_embeds.to(embeddings.dtype).flatten(0, 1))
+            .view_as(embeddings)
+        )
+        return self.language.generate(
+            inputs_embeds=embeddings,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+        )
 
 
 class OpticalModel(nn.Module):
@@ -89,6 +143,12 @@ class OpticalModel(nn.Module):
         self.role = role
         self.image_microbatch_size = image_microbatch_size
         self.stage_timer = lambda name: nullcontext()
+        self._generation_backend = None
+        self._generation_backend_args = (
+            pretrained_model_name_or_path,
+            copy.deepcopy(llm),
+            device,
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, revision=llm["revision"]
         )
@@ -194,56 +254,50 @@ class OpticalModel(nn.Module):
 
     @torch.no_grad()
     def generate(
-        self, *, input_ids, attention_mask, pixel_values, image_positions, max_new_tokens, **kwargs
+        self,
+        *,
+        input_ids,
+        attention_mask,
+        pixel_values,
+        image_positions,
+        generation_config: GenerationConfig,
+        max_new_tokens,
     ):
-        """Greedy generation through the same sharded training model.
+        """Generate with the ordinary cache-enabled Hugging Face implementation.
 
         Args:
             input_ids: Prompt tokens [1, sequence].
             attention_mask: Prompt validity [1, sequence].
             pixel_values: Images [images, channels, height, width].
             image_positions: Image slots [images, image_tokens, 2] in prompt coordinates.
-            max_new_tokens: Local output cap; all FSDP peers remain in lockstep.
-            **kwargs: No additional sampling settings are accepted.
+            generation_config: Standard Hugging Face generation configuration.
+            max_new_tokens: Output-token cap for this evaluation slice.
 
         Returns:
             Generated tokens [1, generated_sequence], excluding the prompt.
         """
-        if input_ids.shape[0] != 1 or kwargs:
-            raise ValueError("Optical evaluation uses single-sample greedy generation")
+        if input_ids.shape[0] != 1:
+            raise ValueError("Optical evaluation uses single-sample generation")
+        if self.generation_group is not None:
+            raise ValueError(
+                "The unsharded Hugging Face generation backend requires DDP evaluation"
+            )
         self.eval()
-        eos = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        generated = []
-        finished = max_new_tokens == 0
-        while True:
-            active = torch.tensor(int(not finished), device=input_ids.device)
-            if self.generation_group is not None:
-                dist.all_reduce(active, op=dist.ReduceOp.MAX, group=self.generation_group)
-            if not active.item():
-                break
-            positions = attention_mask.long().cumsum(-1) - 1
-            with generation_context(self.cp_mesh):
-                out = self(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=positions,
-                    loss_positions=torch.full(
-                        (1, 1), input_ids.shape[1] - 1, device=input_ids.device
-                    ),
-                    pixel_values=pixel_values,
-                    image_positions=image_positions,
-                )
-            logits = materialize_teacher_logits(
-                out.logits, device_mesh=self.device_mesh, sequence_length=1
-            )
-            if isinstance(logits, DTensor):
-                raise TypeError("Generation requires materialized vocabulary logits")
-            token = logits[:, 0].argmax(-1, keepdim=True)
-            if not finished:
-                generated.append(token)
-                finished = token.item() == eos or len(generated) >= max_new_tokens
-            input_ids = torch.cat((input_ids, token), dim=1)
-            attention_mask = torch.cat(
-                (attention_mask, torch.ones_like(token, dtype=torch.bool)), dim=1
-            )
-        return torch.cat(generated, dim=1) if generated else input_ids[:, :0]
+        if self._generation_backend is None:
+            self._generation_backend = HFGenerationBackend(*self._generation_backend_args)
+        images = self.encode_images(pixel_values)
+        return self._generation_backend.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            image_embeds=images,
+            image_positions=image_positions,
+            generation_config=generation_config,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+        )
+
+    def release_generation_backend(self):
+        """Release the temporary full HF decoder before training resumes."""
+        self._generation_backend = None
+        torch.cuda.empty_cache()

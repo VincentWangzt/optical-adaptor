@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from transformers import GenerationConfig
 
 
 class StrictConfig(BaseModel):
@@ -103,6 +104,19 @@ class EvaluationConfig(StrictConfig):
     generation_samples: dict[str, int]
     max_new_tokens: dict[str, int]
     tasks: list[str]
+    generation_config: dict[str, Any]
+
+
+def build_generation_config(values: dict[str, Any]) -> GenerationConfig:
+    """Validate and construct the canonical Hugging Face decoding config."""
+    unknown = values.keys() - GenerationConfig().to_dict().keys()
+    if unknown:
+        raise ValueError(f"Unknown Hugging Face generation settings: {sorted(unknown)}")
+    config = GenerationConfig(**values)
+    config.validate()
+    if not config.use_cache:
+        raise ValueError("Optical evaluation requires cache-enabled Hugging Face generation")
+    return config
 
 
 class OpticalConfig(StrictConfig):

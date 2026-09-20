@@ -22,7 +22,11 @@ from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
-from optical_adaptor.automodel.config import OpticalConfig, fingerprint
+from optical_adaptor.automodel.config import (
+    OpticalConfig,
+    build_generation_config,
+    fingerprint,
+)
 from optical_adaptor.automodel.conversations import slice_key
 from optical_adaptor.automodel.data import (
     ConversationDataset,
@@ -67,6 +71,9 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         super().__init__(cfg)
         self.raw = cfg.to_yaml_dict()
         self.optical = OpticalConfig.model_validate(self.raw["optical"])
+        self.generation_config = build_generation_config(
+            self.optical.evaluation.generation_config
+        )
         if self.optical.deterministic:
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         torch.use_deterministic_algorithms(self.optical.deterministic)
@@ -447,6 +454,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                     inputs[key] = inputs[key][:, : pair.generation_prefix_length]
                 ids = model.generate(
                     **inputs,
+                    generation_config=self.generation_config,
                     max_new_tokens=self.generation_limits[slice_key(record)] if requested else 0,
                 )
                 if not requested:
@@ -480,6 +488,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                         "reached_generation_limit": reached_limit,
                     }
                 )
+        if generate:
+            self.student_model().release_generation_backend()
         self._ce_loss_buffer.clear()
         self._kd_loss_buffer.clear()
         totals = self._dp_allreduce(totals, include_cp=True)

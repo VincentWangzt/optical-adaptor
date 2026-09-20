@@ -173,6 +173,14 @@ optical:
     generation_samples: {"": 2}
     max_new_tokens: {"": 4096}
     tasks: [reconstruction, continuation]
+    generation_config:
+      do_sample: true
+      use_cache: true
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 20
+      min_p: 0.0
+      repetition_penalty: 1.0
 model:
   _target_: optical_adaptor.automodel.model.OpticalModel.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-4B

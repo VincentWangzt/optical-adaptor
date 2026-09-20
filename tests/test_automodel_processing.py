@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from transformers import AutoTokenizer
 
-from optical_adaptor.automodel.config import read_config
+from optical_adaptor.automodel.config import build_generation_config, read_config
 from optical_adaptor.automodel.conversations import (
     make_record,
     naive_messages,
@@ -31,6 +31,23 @@ def tokenizer(settings):
     return AutoTokenizer.from_pretrained(
         settings.llm["model_id"], revision=settings.llm["revision"]
     )
+
+
+def test_generation_config_uses_hugging_face_sampling(settings):
+    config = build_generation_config(settings.evaluation.generation_config)
+    assert config.do_sample and config.use_cache
+    assert config.temperature == 1.0
+    assert config.top_p == 0.95
+    assert config.top_k == 20
+    assert config.min_p == 0.0
+    assert config.repetition_penalty == 1.0
+
+
+def test_generation_config_rejects_typos_and_disabled_cache():
+    with pytest.raises(ValueError, match="Unknown Hugging Face generation settings"):
+        build_generation_config({"use_cache": True, "temprature": 1.0})
+    with pytest.raises(ValueError, match="cache-enabled"):
+        build_generation_config({"use_cache": False})
 
 
 def naive(settings, seed=42):
