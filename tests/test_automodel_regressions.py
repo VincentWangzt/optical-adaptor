@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 from nemo_automodel._transformers import model_init
 from nemo_automodel.components.config.loader import ConfigNode
@@ -18,6 +19,36 @@ from optical_adaptor.automodel.backbone import (
     OpticalTextCheckpointAdapter,
 )
 from optical_adaptor.automodel.recipe import OpticalKDRecipe
+
+
+@pytest.mark.parametrize(
+    ("step", "generation_ids", "error", "message"),
+    [
+        (0, {"selected"}, RuntimeError, "validation batch reached"),
+        (499, set(), RuntimeError, "validation batch reached"),
+        (499, {"selected"}, ValueError, "Inline generation evaluation requires DDP"),
+    ],
+)
+def test_fsdp_inline_generation_preflight_only_for_selected_samples(
+    step, generation_ids, error, message
+):
+    model = SimpleNamespace(eval=lambda: None, supports_inline_generation=False)
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        eval_data=SimpleNamespace(rows=[{"slice": "stack/reconstruction"}]),
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        generation_ids=generation_ids,
+        step_scheduler=SimpleNamespace(step=step, is_last_step=False),
+        optical=SimpleNamespace(evaluation=SimpleNamespace(generation_every=500)),
+        student_model=lambda: model,
+    )
+
+    class StopAtBatch:
+        def __iter__(self):
+            raise RuntimeError("validation batch reached")
+
+    with pytest.raises(error, match=message):
+        OpticalKDRecipe._run_validation_epoch(recipe, StopAtBatch())
 
 
 def test_explicit_null_disables_gradient_clipping(monkeypatch):

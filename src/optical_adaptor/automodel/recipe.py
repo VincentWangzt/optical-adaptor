@@ -71,9 +71,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         super().__init__(cfg)
         self.raw = cfg.to_yaml_dict()
         self.optical = OpticalConfig.model_validate(self.raw["optical"])
-        self.generation_config = build_generation_config(
-            self.optical.evaluation.generation_config
-        )
+        self.generation_config = build_generation_config(self.optical.evaluation.generation_config)
         if self.optical.deterministic:
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         torch.use_deterministic_algorithms(self.optical.deterministic)
@@ -418,6 +416,11 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         generate = self.step_scheduler.is_last_step or (
             (self.step_scheduler.step + 1) % self.optical.evaluation.generation_every == 0
         )
+        model = self.student_model()
+        if generate and generation_ids and not model.supports_inline_generation:
+            raise ValueError(
+                "Inline generation evaluation requires DDP; use a separate evaluator for FSDP2"
+            )
         generation_rows = []
         for batch_index, batch in enumerate(val_dataloader):
             record = batch["records"][0]
@@ -436,11 +439,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
             if valid and record["sample_id"] in self.teacher_forced_ids:
                 totals[index] += self.last_stats.double()
             requested = valid and generate and record["sample_id"] in generation_ids
-            model = self.student_model()
-            # Sharded peers must all enter generation, including quota-zero and
-            # padded evaluation rows. generate() synchronizes their stopping.
-            if requested or model.generation_group is not None:
-                if requested and record["thinking"]:
+            if requested:
+                if record["thinking"]:
                     raise ValueError(
                         "Generative edit-distance evaluation requires a no-thinking task"
                     )
@@ -455,10 +455,8 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 ids = model.generate(
                     **inputs,
                     generation_config=self.generation_config,
-                    max_new_tokens=self.generation_limits[slice_key(record)] if requested else 0,
+                    max_new_tokens=self.generation_limits[slice_key(record)],
                 )
-                if not requested:
-                    continue
                 reached_limit = ids[0, -1].item() != model.tokenizer.convert_tokens_to_ids(
                     "<|im_end|>"
                 )

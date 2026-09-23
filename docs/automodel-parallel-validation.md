@@ -5,6 +5,8 @@ Date: 2026-09-17 UTC / September 18 Asia/Shanghai. Branch:
 `/workspace/optical-adaptor`, A6000 GPUs 8/9, PyTorch 2.13.0+cu130,
 Transformers 5.15.1, FLA 0.5.2. All executable changes were committed locally,
 pushed through GitHub, then pulled before server execution.
+This is a historical mesh validation report. The current cached-HF inline
+generation path requires DDP; see [training.md](training.md).
 
 ## Current results with the official activation restored
 
@@ -92,8 +94,8 @@ throughput remain unvalidated. The earlier evidence below is retained as history
 
 ## Implementation
 
-The canonical configuration now uses FSDP2. `OpticalParallelizationStrategy`
-delegates language sharding to AutoModel's existing
+At this validated revision, the canonical configuration used FSDP2.
+`OpticalParallelizationStrategy` delegates language sharding to AutoModel's existing
 `Qwen3_5ParallelizationStrategy`, preserving its TP plan, mixed-dtype FSDP,
 context-parallel GatedDeltaNet and activation checkpointing. The optical strategy
 owns only the adapter/vision wrapping and the model-specific target mapping.
@@ -119,9 +121,9 @@ The other fixes are:
   replicated TP adapters different; FSDP does not perform DDP's initial broadcast.
 - Empty CP target shards keep the gradient graph and use a consistent FP32 loss
   scalar. Singleton DP preflight stays local inside larger TP/CP meshes.
-- Exports gather adapter DTensors collectively. Generation keeps sharded peers
-  in lockstep across quotas and EOS. Timing reduces over the complete student
-  mesh; data counts reduce over DP only.
+- Exports gather adapter DTensors collectively. The historical greedy generator
+  kept sharded peers in lockstep across quotas and EOS. Timing reduces over the
+  complete student mesh; data counts reduce over DP only.
 
 PP/EP, Megatron FSDP and sequence parallelism remain explicit unsupported cases.
 The pinned VLM KD recipe has no optical pipeline schedule; Qwen's current TP plan
@@ -239,8 +241,8 @@ Server artifacts under `outputs/automodel/parallel-validation/` include
 `dp-eager/`, `dp-resume/`, `dp-synced/`, `separate-fsdp/`, and TP/CP run directories. The original
 `update-route/` and `stable-update-route/` reports preserve the pre-QuickGELU-fix
 failures. No 32K capacity run, long training run, PP, Megatron FSDP, or multi-node
-test was performed. Generation currently recomputes vision and the prefix each
-token, so generation throughput is not optimized.
+test was performed. The historical generator recomputed vision and the prefix each
+token, so those short runs did not validate long-generation throughput.
 
 The original DeepSeek investigation isolated scripted-activation execution. The
 subsequent [official OCR audit](ocr-encoding-validation.md) now checks image

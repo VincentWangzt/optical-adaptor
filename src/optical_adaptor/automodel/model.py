@@ -6,7 +6,6 @@ import copy
 from contextlib import nullcontext
 
 import torch
-import torch.distributed as dist
 from huggingface_hub import snapshot_download
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
@@ -142,7 +141,7 @@ class OpticalModel(nn.Module):
         self.config = language.config
         self.cp_mesh = None
         self.device_mesh = None
-        self.generation_group = None
+        self.supports_inline_generation = True
         self.role = role
         self.image_microbatch_size = image_microbatch_size
         self.stage_timer = lambda name: nullcontext()
@@ -196,7 +195,7 @@ class OpticalModel(nn.Module):
         )
         model.device_mesh = mesh.device_mesh
         if isinstance(strategy, FSDP2Config):
-            model.generation_group = mesh.process_group or dist.group.WORLD
+            model.supports_inline_generation = False
             model = FSDP2Manager(strategy, device_mesh=mesh.device_mesh).parallelize(model)
         elif role == "student":
             model = DDPManager(strategy, process_group=mesh.process_group).parallelize(model)
@@ -281,7 +280,7 @@ class OpticalModel(nn.Module):
         """
         if input_ids.shape[0] != 1:
             raise ValueError("Optical evaluation uses single-sample generation")
-        if self.generation_group is not None:
+        if not self.supports_inline_generation:
             raise ValueError(
                 "The unsharded Hugging Face generation backend requires DDP evaluation"
             )

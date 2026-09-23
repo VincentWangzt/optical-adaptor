@@ -102,12 +102,14 @@ Sampling epochs round up to complete global batches. Packing and adaptive
 regrouping are deferred. Unchunked logits can be large; set sequence/image limits
 and batch sizes to fit the chosen placement.
 
-The default is FSDP2. The optical strategy delegates language parallelization to
-AutoModel's existing `Qwen3_5ParallelizationStrategy`; it adds adapter precision
-ownership and the mapping between input positions and compact targets. Configure
+The canonical configuration currently uses DDP for inline generation evaluation.
+For FSDP2 training and teacher-forced evaluation, the optical strategy delegates
+language parallelization to AutoModel's existing
+`Qwen3_5ParallelizationStrategy`; it adds adapter precision ownership and the
+mapping between input positions and compact targets. Configure
 `distributed.tp_size` or `distributed.cp_size` to use tensor or context
-parallelism. The remaining ranks form the data-parallel mesh. DDP remains an
-option. Activation checkpointing belongs to `distributed.activation_checkpointing`.
+parallelism with FSDP2. The remaining ranks form the data-parallel mesh.
+Activation checkpointing belongs to `distributed.activation_checkpointing`.
 
 For independent placement, configure disjoint student and teacher meshes, for
 example one FSDP2 worker each:
@@ -131,6 +133,9 @@ The adapter keeps FP32 master parameters and uses BF16 compute. Its newly
 initialized weights are synchronized over the existing student mesh groups before
 FSDP sharding, so rank-dependent construction seeds cannot split TP replicas.
 Different adaptive teacher/student microbatch partitions remain deferred.
+For an FSDP2 run, set `optical.evaluation.generation_samples: {"": 0}` to retain
+teacher-forced inline validation. Nonzero inline generation quotas require DDP;
+evaluate FSDP2 adapter exports in a separate inference job.
 
 PP and EP must be 1, and `sequence_parallel` must be false. There is no optical
 pipeline schedule or expert model, and the existing Qwen TP plan keeps the
@@ -155,11 +160,11 @@ on the two audited rendered pages). A fixed maximum batch size still permits
 different partial chunks. The current 640×640 encoder implements official Small
 non-crop processing, not the variable-token dynamic-crop mode.
 
-Generation uses the same sharded native model and keeps participating ranks in
-lockstep across differing quotas and EOS. It currently recomputes the prefix and
-vision features for every generated token: the native text route has no KV-cache
-generation integration. Use small evaluation caps when checking training; this
-is a correctness path, not a generation throughput optimization.
+Inline generation uses a temporary, full Hugging Face Qwen decoder with a KV
+cache. The live vision encoder and adapter supply its image embeddings. This
+path requires DDP and adds a full decoder copy to each participating GPU during
+evaluation. The native FSDP2/TP/CP model still handles teacher-forced metrics;
+its earlier lockstep generation loop is no longer used.
 
 ## Evaluation, metrics and recovery
 

@@ -36,8 +36,10 @@ bash scripts/launch_optical_training.sh          # Configured training schedule
 The launcher prepares conversation slices, renders/encodes images online, starts
 AutoModel DDP, logs to W&B, evaluates by slice, and writes resumable adapter checkpoints.
 See [docs/training.md](docs/training.md) for data, masks, losses, resume, and limitations.
-Measured results and validation scope are in
-[docs/automodel-validation.md](docs/automodel-validation.md).
+Mesh validation and its limits are in
+[docs/automodel-parallel-validation.md](docs/automodel-parallel-validation.md).
+The initial DDP smoke run is retained as a
+[historical report](docs/automodel-validation.md).
 
 ## Render code into images
 

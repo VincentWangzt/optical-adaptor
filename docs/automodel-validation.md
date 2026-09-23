@@ -1,5 +1,10 @@
 # AutoModel pipeline validation
 
+Historical DDP smoke-run record from September 16. The current training mesh and
+generation limits are described in [training.md](training.md); later FSDP2/TP/CP
+training checks are recorded in [automodel-parallel-validation.md](automodel-parallel-validation.md).
+The results below describe the implementation at the listed commits.
+
 Validated on 2026-09-16 (Asia/Shanghai), using two NVIDIA RTX A6000 GPUs, physical
 IDs 8 and 9. Other devices were left alone. The main smoke and accumulation runs
 used `95fc9a0`; the distributed preflight follow-up used `d8c2caa`.
@@ -110,6 +115,6 @@ The affected processing/data checks were rerun successfully after that change.
 This validates execution, masking/loss arithmetic, and checkpoint mechanics, not
 convergence, exact bitwise GPU replay, or downstream SWE success. The smoke profile
 does not train on the long full trajectories, although it stores them intact.
-The default 32K context limits and larger image bins still need memory/throughput
-measurement before a long production run. Current distribution is shared-setup
-DDP; TP/CP/PP and separate teacher/student meshes are explicitly unsupported.
+The default 32K context limits and larger image bins still needed memory/throughput
+measurement before a long production run. At this revision, distribution was
+shared-setup DDP; TP/CP/PP and separate teacher/student meshes were unsupported.

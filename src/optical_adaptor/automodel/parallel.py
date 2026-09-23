@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -152,13 +152,6 @@ class OpticalParallelizationStrategy(ParallelizationStrategy):
         # Frozen vision belongs to this root: variable image microbatch counts do
         # not create a different sequence of collectives across DP ranks.
         return fully_shard(model, **shard_options)
-
-
-def generation_context(cp_mesh: DeviceMesh | None) -> AbstractContextManager:
-    """Use the same CP attention context for standalone generation forwards."""
-    if cp_mesh is None:
-        return nullcontext()
-    return get_train_context(False, False, _attention_context(cp_mesh))()
 
 
 def _attention_context(cp_mesh):

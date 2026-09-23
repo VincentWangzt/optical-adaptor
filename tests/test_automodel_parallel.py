@@ -57,7 +57,8 @@ def tiny_model(role):
     if role == "student":
         model.adapter = MLPAdapter(8, 64, 64).cuda()
     model.config, model.role = config, role
-    model.cp_mesh = model.device_mesh = model.generation_group = None
+    model.cp_mesh = model.device_mesh = None
+    model.supports_inline_generation = True
     model.image_microbatch_size = 2
     model.stage_timer = lambda name: nullcontext()
     return model

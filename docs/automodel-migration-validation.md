@@ -24,7 +24,7 @@ fresh repeated GPU runs diverged. The cause remains unresolved.
 GPU runs used the implementation through `c149b64b`; the final configuration
 instantiation adjustment and affected upstream regression tests passed at
 `675da4f0`. Subsequent report edits do not change executable code. Historical
-results in `automodel-validation.md` describe the earlier implementation.
+results in `automodel-validation.md` describe the earlier DDP-only implementation.
 
 ## Implemented scope
 
