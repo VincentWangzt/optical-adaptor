@@ -16,6 +16,7 @@ from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.models.common.utils import BackendConfig
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer, GenerationConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 from optical_adaptor.adapters import MLPAdapter
 from optical_adaptor.automodel.backbone import OpticalQwen3_5ForCausalLM
@@ -40,19 +41,20 @@ class HFGenerationBackend:
             pretrained_model_name_or_path, revision=llm["revision"]
         )
         config = (
-            getattr(full_config, llm["text_config_key"])
-            if llm["text_config_key"]
-            else full_config
+            getattr(full_config, llm["text_config_key"]) if llm["text_config_key"] else full_config
         )
-        self.language = NeMoAutoModelForCausalLM.from_pretrained(
+        snapshot = snapshot_download(
             pretrained_model_name_or_path,
             revision=llm["revision"],
+            allow_patterns=["*.json", "*.safetensors"],
+        )
+        # Generation is selected per DDP rank; NeMo's loader would enter DCP
+        # collectives on the training process group, which ranks cannot match.
+        self.language = Qwen3_5ForCausalLM.from_pretrained(
+            snapshot,
             config=config,
             dtype=torch.bfloat16,
             attn_implementation=llm["attn_implementation"],
-            force_hf=True,
-            use_liger_kernel=False,
-            use_sdpa_patching=False,
         ).to(device)
         self.language.requires_grad_(False).eval()
 

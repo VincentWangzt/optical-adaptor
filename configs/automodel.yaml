@@ -48,7 +48,7 @@ kd_loss_fn:
   chunk_size: 0
 checkpoint:
   enabled: true
-  checkpoint_dir: outputs/automodel/checkpoints
+  checkpoint_dir: outputs/automodel/reconstruct-continuation-3000-steps/checkpoints
   model_save_format: safetensors
   save_consolidated: true
   is_async: false
@@ -56,7 +56,7 @@ checkpoint:
 wandb:
   project: optical-adaptor-automodel
   entity: 2162681069-peking-university
-  name: deepseek-ocr-qwen35-4b-online-kd
+  name: reconstruct-continuation-3000-steps
   mode: online
 optical:
   deterministic: true
@@ -79,7 +79,7 @@ optical:
     hidden_dim: 2560
     output_dim: 2560
   prepare:
-    output_dir: outputs/automodel/data
+    output_dir: outputs/automodel/data-100k-5pct
     sources:
       - name: stack
         kind: stack
