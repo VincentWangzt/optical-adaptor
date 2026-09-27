@@ -268,18 +268,16 @@ class OpticalModel(nn.Module):
         """Generate with the ordinary cache-enabled Hugging Face implementation.
 
         Args:
-            input_ids: Prompt tokens [1, sequence].
-            attention_mask: Prompt validity [1, sequence].
+            input_ids: Left-padded prompt tokens [batch, sequence].
+            attention_mask: Prompt validity [batch, sequence].
             pixel_values: Images [images, channels, height, width].
             image_positions: Image slots [images, image_tokens, 2] in prompt coordinates.
             generation_config: Standard Hugging Face generation configuration.
             max_new_tokens: Output-token cap for this evaluation slice.
 
         Returns:
-            Generated tokens [1, generated_sequence], excluding the prompt.
+            Generated tokens [batch, generated_sequence], excluding the prompt.
         """
-        if input_ids.shape[0] != 1:
-            raise ValueError("Optical evaluation uses single-sample generation")
         if not self.supports_inline_generation:
             raise ValueError(
                 "The unsharded Hugging Face generation backend requires DDP evaluation"

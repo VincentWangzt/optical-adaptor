@@ -164,7 +164,11 @@ Inline generation uses a temporary, full Hugging Face Qwen decoder with a KV
 cache. The live vision encoder and adapter supply its image embeddings. This
 path requires DDP and adds a full decoder copy to each participating GPU during
 evaluation. The native FSDP2/TP/CP model still handles teacher-forced metrics;
-its earlier lockstep generation loop is no longer used.
+its earlier lockstep generation loop is no longer used. Generation prompts are
+left-padded and decoded in batches of up to
+`optical.evaluation.generation_batch_size` (8 in the canonical config). Samples
+with different `max_new_tokens` limits use separate batches. Reduce this size
+if the full decoder plus generation KV cache does not fit on a GPU.
 
 ## Evaluation, metrics and recovery
 

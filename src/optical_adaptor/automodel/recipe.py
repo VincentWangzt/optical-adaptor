@@ -36,7 +36,7 @@ from optical_adaptor.automodel.data import (
     select_evaluation,
     validate_preparation,
 )
-from optical_adaptor.automodel.processing import OpticalProcessor
+from optical_adaptor.automodel.processing import OpticalProcessor, collate_generation_inputs
 from optical_adaptor.edit_distance import levenshtein_distance
 from optical_adaptor.renderer import load_render_config
 
@@ -405,6 +405,47 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
         return result
 
     @torch.no_grad()
+    def _run_generation_batch(
+        self, model, requests, max_new_tokens, generation, offsets, generation_rows
+    ):
+        inputs = collate_generation_inputs(
+            [sample for _, sample in requests], model.tokenizer.pad_token_id
+        )
+        ids = model.generate(
+            **{key: value.to(self.dist_env.device) for key, value in inputs.items()},
+            generation_config=self.generation_config,
+            max_new_tokens=max_new_tokens,
+        )
+        eos_token_id = model.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        for row, (record, _) in enumerate(requests):
+            reached_limit = not (ids[row] == eos_token_id).any().item()
+            prediction = model.tokenizer.decode(ids[row], skip_special_tokens=True)
+            reference = next(
+                m["content"] for m in reversed(record["messages"]) if m["role"] == "assistant"
+            )
+            reference_lines = reference.splitlines()
+            generation[offsets[slice_key(record)]] += torch.tensor(
+                [
+                    levenshtein_distance(reference, prediction),
+                    len(reference),
+                    levenshtein_distance(reference_lines, prediction.splitlines()),
+                    len(reference_lines),
+                    1,
+                    int(reached_limit),
+                ],
+                device=self.dist_env.device,
+            )
+            generation_rows.append(
+                {
+                    "sample_id": record["sample_id"],
+                    "slice": slice_key(record),
+                    "reference": reference,
+                    "prediction": prediction,
+                    "reached_generation_limit": reached_limit,
+                }
+            )
+
+    @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
         for model in self.model_parts:
             model.eval()
@@ -422,6 +463,7 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                 "Inline generation evaluation requires DDP; use a separate evaluator for FSDP2"
             )
         generation_rows = []
+        pending_generations = {}
         for batch_index, batch in enumerate(val_dataloader):
             record = batch["records"][0]
             index = offsets[slice_key(record)]
@@ -446,45 +488,24 @@ class OpticalKDRecipe(KnowledgeDistillationRecipeForVLM):
                     )
                 pair = batch["compiled"][0]
                 inputs = {
-                    key: value.to(self.dist_env.device)
+                    key: value
                     for key, value in batch["student"].items()
                     if key in {"input_ids", "attention_mask", "pixel_values", "image_positions"}
                 }
                 for key in ("input_ids", "attention_mask"):
                     inputs[key] = inputs[key][:, : pair.generation_prefix_length]
-                ids = model.generate(
-                    **inputs,
-                    generation_config=self.generation_config,
-                    max_new_tokens=self.generation_limits[slice_key(record)],
-                )
-                reached_limit = ids[0, -1].item() != model.tokenizer.convert_tokens_to_ids(
-                    "<|im_end|>"
-                )
-                prediction = model.tokenizer.decode(ids[0], skip_special_tokens=True)
-                reference = next(
-                    m["content"] for m in reversed(record["messages"]) if m["role"] == "assistant"
-                )
-                char_edits = levenshtein_distance(reference, prediction)
-                line_edits = levenshtein_distance(reference.splitlines(), prediction.splitlines())
-                generation[index] += torch.tensor(
-                    [
-                        char_edits,
-                        len(reference),
-                        line_edits,
-                        len(reference.splitlines()),
-                        1,
-                        int(reached_limit),
-                    ],
-                    device=self.dist_env.device,
-                )
-                generation_rows.append(
-                    {
-                        "sample_id": record["sample_id"],
-                        "slice": slice_key(record),
-                        "reference": reference,
-                        "prediction": prediction,
-                        "reached_generation_limit": reached_limit,
-                    }
+                max_new_tokens = self.generation_limits[slice_key(record)]
+                pending = pending_generations.setdefault(max_new_tokens, [])
+                pending.append((record, inputs))
+                if len(pending) == self.optical.evaluation.generation_batch_size:
+                    self._run_generation_batch(
+                        model, pending, max_new_tokens, generation, offsets, generation_rows
+                    )
+                    pending.clear()
+        for max_new_tokens, pending in pending_generations.items():
+            if pending:
+                self._run_generation_batch(
+                    model, pending, max_new_tokens, generation, offsets, generation_rows
                 )
         if generate:
             self.student_model().release_generation_backend()

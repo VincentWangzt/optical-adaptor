@@ -101,6 +101,7 @@ class DataConfig(StrictConfig):
 
 class EvaluationConfig(StrictConfig):
     generation_every: int = Field(gt=0)
+    generation_batch_size: int = Field(gt=0)
     generation_samples: dict[str, int]
     max_new_tokens: dict[str, int]
     tasks: list[str]

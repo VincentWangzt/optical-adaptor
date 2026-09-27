@@ -225,6 +225,29 @@ def pad_tokens(sequences, value):
     )
 
 
+def collate_generation_inputs(samples: list[dict], pad_token_id: int) -> dict:
+    """Left-pad singleton prompts and shift their image slots into batch coordinates."""
+    max_length = max(sample["input_ids"].shape[1] for sample in samples)
+    input_ids = torch.full((len(samples), max_length), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((len(samples), max_length), dtype=torch.bool)
+    image_positions = []
+    for index, sample in enumerate(samples):
+        length = sample["input_ids"].shape[1]
+        offset = max_length - length
+        input_ids[index, offset:] = sample["input_ids"][0]
+        attention_mask[index, offset:] = sample["attention_mask"][0]
+        positions = sample["image_positions"].clone()
+        positions[:, :, 0] = index
+        positions[:, :, 1] += offset
+        image_positions.append(positions)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": torch.cat([sample["pixel_values"] for sample in samples]),
+        "image_positions": torch.cat(image_positions),
+    }
+
+
 class OpticalProcessor:
     """CPU-only rendering, pixels, tokenization and paired padded batch construction."""
 
