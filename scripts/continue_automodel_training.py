@@ -63,8 +63,12 @@ class ContinuedOpticalKDRecipe(OpticalKDRecipe):
             self.lr_scheduler,
             optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
         )
+        optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         optimizer_steps = {
-            int(value["step"]) for value in self.optimizer.state.values() if "step" in value
+            int(value["step"])
+            for optimizer in optimizers
+            for value in optimizer.state.values()
+            if "step" in value
         }
         if optimizer_steps != {step}:
             raise ValueError(f"Restored AdamW step counts differ: {optimizer_steps}")
