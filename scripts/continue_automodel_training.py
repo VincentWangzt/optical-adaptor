@@ -1,9 +1,10 @@
-"""Continue optical KD across a DDP world-size change from a full checkpoint.
+"""Continue optical KD from a full checkpoint with explicit generation tasks.
 
 Launch with ``uv run --no-sync torchrun --standalone --nproc-per-node=N``.
 The optimizer and scheduler are restored. The deterministic global sampler
 stream resumes at the consumed-sample offset, redistributed across the new DP
-ranks. Rank-local RNG streams are newly seeded for the new topology.
+ranks. An unchanged topology restores rank-local RNG and dataloader state;
+a changed topology uses newly seeded rank-local RNG streams.
 """
 
 from __future__ import annotations
@@ -75,6 +76,14 @@ class ContinuedOpticalKDRecipe(OpticalKDRecipe):
         self.step_scheduler.load_state_dict(state)
         self.sampler.load_state_dict({"epoch": epoch, "cursor": consumed // world_size})
         self.contract.consumed = Counter(contract["consumed"])
+        if world_size == self.source_world_size:
+            self.checkpointer.load_on_dp_ranks(
+                self.dataloader, "dataloader", str(self.source_checkpoint)
+            )
+            self.checkpointer.load_on_global_ranks(self.rng, "rng", str(self.source_checkpoint))
+            rng_policy = "restored checkpoint rank-local RNG and dataloader state"
+        else:
+            rng_policy = "new rank-seeded streams; source RNG is not portable across DP sizes"
         if self.dist_env.is_main:
             output = Path(self.cfg.checkpoint.checkpoint_dir).parent
             (output / "continuation.json").write_text(
@@ -90,9 +99,7 @@ class ContinuedOpticalKDRecipe(OpticalKDRecipe):
                         "optimizer_steps": sorted(optimizer_steps),
                         "source_contract_identity": contract["identity"],
                         "new_contract_identity": self.contract.identity,
-                        "rng_policy": (
-                            "new rank-seeded streams; source RNG is not portable across DP sizes"
-                        ),
+                        "rng_policy": rng_policy,
                     },
                     indent=2,
                 )
@@ -115,6 +122,9 @@ def main():
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--generation-samples-per-slice", type=int, required=True)
     parser.add_argument("--generation-batch-size", type=int, required=True)
+    parser.add_argument(
+        "--generation-tasks", nargs="+", choices=["reconstruction", "continuation"], required=True
+    )
     args = parser.parse_args()
     source = yaml.safe_load(args.source_config.read_text(encoding="utf-8"))
     saved = yaml.safe_load((args.checkpoint / "config.yaml").read_text(encoding="utf-8"))
@@ -152,6 +162,7 @@ def main():
     source["optical"]["evaluation"].update(
         generation_samples={"": args.generation_samples_per_slice},
         generation_batch_size=args.generation_batch_size,
+        tasks=args.generation_tasks,
     )
     OpticalConfig.model_validate(source["optical"])
     if rank == 0:

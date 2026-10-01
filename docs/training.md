@@ -200,6 +200,13 @@ Checkpoints persist the registered adapter submodule, optimizer, RNG, loader,
 scheduler, data contract and consumed counters through AutoModel. Frozen modules
 are reconstructed from pinned model revisions. Incompatible contracts fail.
 Set `checkpoint.restore_from` to `LATEST` or a checkpoint directory to resume.
+To extend a completed DDP run while changing generation tasks, use
+`scripts/continue_automodel_training.py` with the source config, checkpoint,
+adapter export, fresh output directory, and explicit evaluation arguments.
+`--generation-tasks reconstruction` excludes continuation from generation while
+retaining its teacher-forced evaluation and training examples. An unchanged DDP
+size restores checkpoint RNG and dataloader state; a changed size redistributes
+the consumed-sample offset and starts new rank-seeded RNG streams.
 Each save also writes `exports/step-NNNNNN/{adapter.safetensors,optical-model.json}`
 for retained live inference/benchmark entry points. They now use the canonical
 optical config and fresh prepared records. Historical training, tensor caches,
